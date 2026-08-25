@@ -168,9 +168,7 @@ export function promptPayload(
       : {}),
     ...(options.commandRunShell ? { command_run_shell: options.commandRunShell } : {}),
     ...(options.jspaceContract ? { jspace_contract: options.jspaceContract } : {}),
-    ...(options.taskContextCapsule
-      ? { task_context_capsule: options.taskContextCapsule }
-      : {}),
+    ...(options.taskContextCapsule ? { task_context_capsule: options.taskContextCapsule } : {}),
     source: options.source,
   };
 }
@@ -297,7 +295,7 @@ async function completionResult(
   const hasNewAssistant = hasUserFacingAssistantText(messages, initialCount);
   const status = sessionStatusText(session?.status);
   if (status === "busy") return undefined;
-  if (status === "error" && hasNewAssistant) {
+  if (status === "error") {
     return buildRunResult(sessionID, messages, "failed");
   }
   if (status === "idle" && hasNewAssistant) {

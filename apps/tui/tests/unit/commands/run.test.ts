@@ -117,3 +117,39 @@ test("stream transport detaches without aborting the accepted execution", async 
   assert.equal(abortCount, 0);
   assert.equal(streamReturnCount, 1);
 });
+
+test("stream transport returns a failed cancellation before assistant output", async () => {
+  let streamReturnCount = 0;
+  const messages: Message[] = [
+    { id: "user-1", role: "user", parts: [{ id: "part-1", type: "text", text: "work" }] },
+  ];
+  const session: Session = { id: "session-cancelled", status: "error" };
+  const iterator = {
+    next(): Promise<IteratorResult<never>> {
+      return new Promise(() => undefined);
+    },
+    async return(): Promise<IteratorResult<never>> {
+      streamReturnCount += 1;
+      return { done: true, value: undefined };
+    },
+  };
+  const client = {
+    directory: "/workspace",
+    streamEvents(): AsyncIterable<never> {
+      return { [Symbol.asyncIterator]: () => iterator };
+    },
+    async getSession(): Promise<Session> {
+      return session;
+    },
+    async listMessages(): Promise<Message[]> {
+      return messages;
+    },
+  } as unknown as GatewayClient;
+
+  const result = await waitWithEvents(client, session, messages.length, 3, undefined, undefined);
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.sessionID, session.id);
+  assert.equal(result.finalText, "");
+  assert.equal(streamReturnCount, 1);
+});
