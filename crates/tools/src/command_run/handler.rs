@@ -1,4 +1,4 @@
-use crate::runtime::tool::{CommandRouter, ToolCall, ToolContext, ToolPayload};
+use crate::runtime::tool::{CancellationToken, CommandRouter, ToolCall, ToolContext, ToolPayload};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -145,13 +145,35 @@ pub async fn execute_async_value_with_allowed_lock_scope_and_sandbox(
     lock_scope: Option<String>,
     sandbox: bool,
 ) -> Value {
+    execute_async_value_with_allowed_lock_scope_sandbox_and_cancellation(
+        arguments,
+        session_dir,
+        allowed_commands,
+        lock_scope,
+        sandbox,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+pub async fn execute_async_value_with_allowed_lock_scope_sandbox_and_cancellation(
+    arguments: Value,
+    session_dir: std::path::PathBuf,
+    allowed_commands: Option<BTreeSet<String>>,
+    lock_scope: Option<String>,
+    sandbox: bool,
+    cancellation: CancellationToken,
+) -> Value {
     let mut args = match parse_args(&arguments) {
         Ok(args) => args,
         Err(message) => return error_payload(message),
     };
     args.allowed_commands = allowed_commands;
     args.sandbox = sandbox;
-    execute_async_args_with_lock_scope(args, session_dir, lock_scope).await
+    let ctx =
+        ToolContext::new_with_lock_scope_and_cancellation(session_dir, lock_scope, cancellation);
+    let output = execute_async(args, ctx).await;
+    serde_json::to_value(output).unwrap_or_else(|err| error_payload(err.to_string()))
 }
 
 pub async fn execute_streamed_command_value(

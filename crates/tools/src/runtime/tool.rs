@@ -45,9 +45,21 @@ impl ToolContext {
     }
 
     pub fn new_with_lock_scope(session_dir: PathBuf, lock_scope: Option<String>) -> Self {
+        Self::new_with_lock_scope_and_cancellation(
+            session_dir,
+            lock_scope,
+            CancellationToken::new(),
+        )
+    }
+
+    pub fn new_with_lock_scope_and_cancellation(
+        session_dir: PathBuf,
+        lock_scope: Option<String>,
+        cancellation: CancellationToken,
+    ) -> Self {
         Self {
             session_dir,
-            cancellation: CancellationToken::new(),
+            cancellation,
             execution_gate: Arc::new(RwLock::new(())),
             events: Arc::new(std::sync::Mutex::new(Vec::new())),
             hooks: Arc::new(std::sync::Mutex::new(ToolHooks::default())),

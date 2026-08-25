@@ -211,8 +211,17 @@ impl ExecutionService {
         ) {
             Ok(delivery) => delivery,
             Err(error) => {
-                self.retain_runtime_slot(&request.session_id, permit);
-                active_guard.retain();
+                match self.retain_runtime_slot_if_current(
+                    &request.session_id,
+                    &request.runtime_id,
+                    permit,
+                ) {
+                    Ok(()) => active_guard.retain(),
+                    Err(permit) => {
+                        active_guard.finish();
+                        drop(permit);
+                    }
+                }
                 return Err(anyhow!("TERMINAL_RECEIPT_NOT_DURABLE:{error:#}"));
             }
         };
@@ -231,7 +240,19 @@ impl ExecutionService {
                 drop(permit);
             }
             ReclaimOutcome::Retained { blocker } => {
-                self.retain_runtime_slot(&request.session_id, permit);
+                if let Err(permit) = self.retain_runtime_slot_if_current(
+                    &request.session_id,
+                    &request.runtime_id,
+                    permit,
+                ) {
+                    active_guard.finish();
+                    drop(permit);
+                    return Err(anyhow!(
+                        "RUNTIME_CANCELLED_BEFORE_SLOT_RETAIN:session={},runtime={}",
+                        request.session_id,
+                        request.runtime_id
+                    ));
+                }
                 self.spawn_retained_reclaimer(
                     state.clone(),
                     request.session_id.clone(),
@@ -411,6 +432,42 @@ impl ExecutionService {
         };
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
+        let owns_current_lease = self
+            .sessions
+            .lock()
+            .get(&session_id)
+            .is_some_and(|lease| lease.runtime_id == runtime_id);
+        if !owns_current_lease {
+            return json!({
+                "status": "idle",
+                "session_id": session_id,
+                "runtime_id": runtime_id,
+                "stopped_worker": false,
+                "active_command_runs_cancelled": 0,
+            });
+        }
+        let stopped_worker = state
+            .manager
+            .stop_worker_by_key(&format!("runtime_worker:{session_id}"))
+            .await;
+        let active_command_runs_cancelled = state.command_run.cancel_session(&session_id);
+        let command_runs_drained = tokio::time::timeout(
+            Duration::from_secs(10),
+            state.command_run.wait_for_session_idle(&session_id),
+        )
+        .await
+        .is_ok();
+        if !command_runs_drained {
+            return json!({
+                "status": "error",
+                "error": "TURA_SESSION_ACTIVE_COMMAND_CANCELLATION_DID_NOT_DRAIN",
+                "session_id": session_id,
+                "runtime_id": runtime_id,
+                "stopped_worker": stopped_worker,
+                "active_command_runs_cancelled": active_command_runs_cancelled,
+                "active_command_runs_remaining": state.command_run.active_count_for_session(&session_id),
+            });
+        }
         let retained_process_scopes_terminated =
             code_tools::shell_executor::terminate_retained_shell_process_scopes_for_scope(
                 &session_id,
@@ -426,23 +483,19 @@ impl ExecutionService {
                 false
             }
         };
-        let stopped_worker = if removed {
+        if removed {
             self.retained_slots.lock().remove(&session_id);
             if let Some(notify) = self.retained_watchers.lock().remove(&session_id) {
                 notify.notify_one();
             }
-            state
-                .manager
-                .stop_worker_by_key(&format!("runtime_worker:{session_id}"))
-                .await
-        } else {
-            false
-        };
+        }
         json!({
             "status": if removed || stopped_worker { "cancelling" } else { "idle" },
             "session_id": session_id,
             "runtime_id": runtime_id,
             "stopped_worker": stopped_worker,
+            "active_command_runs_cancelled": active_command_runs_cancelled,
+            "active_command_runs_remaining": state.command_run.active_count_for_session(&session_id),
             "retained_process_scopes_terminated": retained_process_scopes_terminated
         })
     }
@@ -479,6 +532,17 @@ impl ExecutionService {
         };
 
         let active_turn_removed = self.sessions.lock().remove(&session_id).is_some();
+        let stopped_worker = state
+            .manager
+            .stop_worker_by_key(&format!("runtime_worker:{session_id}"))
+            .await;
+        let active_command_runs_cancelled = state.command_run.cancel_session(&session_id);
+        let command_runs_drained = tokio::time::timeout(
+            Duration::from_secs(10),
+            state.command_run.wait_for_session_idle(&session_id),
+        )
+        .await
+        .is_ok();
         let retained_process_scopes_terminated =
             code_tools::shell_executor::terminate_retained_shell_process_scopes_for_scope(
                 &session_id,
@@ -487,16 +551,14 @@ impl ExecutionService {
         if let Some(notify) = self.retained_watchers.lock().remove(&session_id) {
             notify.notify_one();
         }
-        let stopped_worker = state
-            .manager
-            .stop_worker_by_key(&format!("runtime_worker:{session_id}"))
-            .await;
         json!({
-            "status": "stopped",
+            "status": if command_runs_drained { "stopped" } else { "error" },
             "session_id": session_id,
             "stopped": usize::from(stopped_worker),
             "stopped_worker": stopped_worker,
             "active_turn_removed": active_turn_removed,
+            "active_command_runs_cancelled": active_command_runs_cancelled,
+            "active_command_runs_remaining": state.command_run.active_count_for_session(&session_id),
             "retained_process_scopes_terminated": retained_process_scopes_terminated
         })
     }
@@ -729,10 +791,23 @@ impl ExecutionService {
         }
     }
 
-    fn retain_runtime_slot(&self, session_id: &str, permit: RuntimeSlotPermit) {
+    fn retain_runtime_slot_if_current(
+        &self,
+        session_id: &str,
+        runtime_id: &str,
+        permit: RuntimeSlotPermit,
+    ) -> std::result::Result<(), RuntimeSlotPermit> {
+        let sessions = self.sessions.lock();
+        if !sessions
+            .get(session_id)
+            .is_some_and(|lease| lease.runtime_id == runtime_id)
+        {
+            return Err(permit);
+        }
         self.retained_slots
             .lock()
             .insert(session_id.to_string(), permit);
+        Ok(())
     }
 
     async fn live_effect_evidence(&self, state: &AppState, session_id: &str) -> LiveEffectEvidence {
@@ -1315,6 +1390,7 @@ mod tests {
         TerminalState,
     };
     use session_log_contract::{SessionFeedEntry, SessionFeedEvent};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn failed_session_registration_reuses_exact_latest_runtime_lineage() {
@@ -1795,6 +1871,100 @@ mod tests {
         assert_eq!(response["session_id"], "active-session");
         assert_eq!(response["stopped_worker"], false);
         assert!(!service.sessions.lock().contains_key("active-session"));
+    }
+
+    #[tokio::test]
+    async fn cancel_active_turn_drains_router_owned_command_run() {
+        let state = build_state();
+        let service = ExecutionService::new();
+        service.set_session_lease_for_test("command-session", true);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let command = if cfg!(windows) {
+            "Test-Path .; Start-Sleep -Seconds 5".to_string()
+        } else {
+            "find . -maxdepth 0; sleep 5".to_string()
+        };
+        let request = json!({
+            "session_id": "command-session",
+            "runtime_id": "runtime-command-session",
+            "session_directory": workspace.path().display().to_string(),
+            "arguments": {
+                "commands": [{
+                    "command": "shell_command",
+                    "command_line": json!({
+                        "command": command,
+                        "timeout_ms": 30_000
+                    }).to_string()
+                }]
+            }
+        });
+        let running = {
+            let command_run = state.command_run.clone();
+            tokio::spawn(async move {
+                command_run
+                    .execute_with_request_id(request, Some("command-session-execution"))
+                    .await
+            })
+        };
+        let started = Instant::now();
+        while state
+            .command_run
+            .active_count_for_session("command-session")
+            == 0
+            && started.elapsed() < Duration::from_secs(2)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let response = service
+            .cancel_turn(
+                &state,
+                json!({
+                    "session_id": "command-session",
+                    "runtime_id": "runtime-command-session"
+                }),
+            )
+            .await;
+
+        assert_eq!(response["status"], "cancelling");
+        assert_eq!(response["active_command_runs_cancelled"], 1);
+        assert_eq!(response["active_command_runs_remaining"], 0);
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("cancelled command task should terminate promptly")
+            .expect("cancelled command task should join")
+            .expect("cancelled command response should remain deterministic");
+        assert!(!service.sessions.lock().contains_key("command-session"));
+        assert!(
+            !service
+                .retained_slots
+                .lock()
+                .contains_key("command-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_runtime_cannot_publish_a_retained_slot() {
+        let service = ExecutionService::new();
+        service.set_session_lease_for_test("cancelled-session", true);
+        let permit = service.runtime_slots.acquire(1).await;
+        service.sessions.lock().remove("cancelled-session");
+
+        let permit = service
+            .retain_runtime_slot_if_current(
+                "cancelled-session",
+                "runtime-cancelled-session",
+                permit,
+            )
+            .expect_err("removed lease must reject retained-slot publication");
+        drop(permit);
+
+        assert!(
+            !service
+                .retained_slots
+                .lock()
+                .contains_key("cancelled-session")
+        );
     }
 
     #[tokio::test]

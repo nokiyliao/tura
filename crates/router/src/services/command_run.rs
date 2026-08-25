@@ -4,13 +4,14 @@
 //! here so aborting a runtime worker does not orphan process-tree cleanup.
 
 use anyhow::{anyhow, Context, Result};
+use code_tools::runtime::tool::CancellationToken;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use tura_path::jspace::{JSpaceAdmissionCache, JSpaceError, JSpaceMatcher};
@@ -37,6 +38,8 @@ pub struct CommandRunRequest {
 pub struct CommandRunService {
     active: Arc<AtomicUsize>,
     active_by_session: Arc<Mutex<HashMap<String, usize>>>,
+    cancellations: Arc<Mutex<HashMap<String, HashMap<u64, CancellationToken>>>>,
+    next_cancellation_id: Arc<AtomicU64>,
     idle: Arc<tokio::sync::Notify>,
     jspace: JSpaceAdmissionCache,
 }
@@ -46,6 +49,8 @@ impl CommandRunService {
         Self {
             active: Arc::new(AtomicUsize::new(0)),
             active_by_session: Arc::new(Mutex::new(HashMap::new())),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            next_cancellation_id: Arc::new(AtomicU64::new(1)),
             idle: Arc::new(tokio::sync::Notify::new()),
             jspace: JSpaceAdmissionCache::default(),
         }
@@ -71,6 +76,8 @@ impl CommandRunService {
         ActiveCommandRunGuard::new(
             Arc::clone(&self.active),
             Arc::clone(&self.active_by_session),
+            Arc::clone(&self.cancellations),
+            Arc::clone(&self.next_cancellation_id),
             Arc::clone(&self.idle),
             session_id,
         )
@@ -94,7 +101,7 @@ impl CommandRunService {
     ) -> Result<Value> {
         let request: CommandRunRequest =
             serde_json::from_value(input).context("invalid command_run router payload")?;
-        let _active =
+        let active =
             reservation.unwrap_or_else(|| self.reserve_for_session(request.session_id.as_deref()));
         if request.session_directory.as_os_str().is_empty() {
             return Err(anyhow!("command_run session_directory is required"));
@@ -139,12 +146,13 @@ impl CommandRunService {
         }
         let output = code_tools::registry::with_command_environment(
             request.command_env,
-            code_tools::command_run::execute_async_value_with_allowed_lock_scope_and_sandbox(
+            code_tools::command_run::execute_async_value_with_allowed_lock_scope_sandbox_and_cancellation(
                 arguments,
                 request.session_directory,
                 request.allowed_commands,
                 session_id.clone(),
                 request.sandbox,
+                active.cancellation_token(),
             ),
         )
         .await;
@@ -178,6 +186,19 @@ impl CommandRunService {
             }
             notified.await;
         }
+    }
+
+    pub fn cancel_session(&self, session_id: &str) -> usize {
+        let tokens = self
+            .cancellations
+            .lock()
+            .get(session_id)
+            .map(|tokens| tokens.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for token in &tokens {
+            token.cancel();
+        }
+        tokens.len()
     }
 
     #[cfg(test)]
@@ -263,6 +284,9 @@ fn jspace_error_result(error: JSpaceError) -> Value {
 pub(crate) struct ActiveCommandRunGuard {
     active: Arc<AtomicUsize>,
     active_by_session: Arc<Mutex<HashMap<String, usize>>>,
+    cancellations: Arc<Mutex<HashMap<String, HashMap<u64, CancellationToken>>>>,
+    cancellation_id: Option<u64>,
+    cancellation: CancellationToken,
     idle: Arc<tokio::sync::Notify>,
     session_id: Option<String>,
 }
@@ -271,6 +295,8 @@ impl ActiveCommandRunGuard {
     fn new(
         active: Arc<AtomicUsize>,
         active_by_session: Arc<Mutex<HashMap<String, usize>>>,
+        cancellations: Arc<Mutex<HashMap<String, HashMap<u64, CancellationToken>>>>,
+        next_cancellation_id: Arc<AtomicU64>,
         idle: Arc<tokio::sync::Notify>,
         session_id: Option<&str>,
     ) -> Self {
@@ -279,18 +305,33 @@ impl ActiveCommandRunGuard {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        if let Some(session_id) = session_id.as_ref() {
+        let cancellation = CancellationToken::new();
+        let cancellation_id = session_id.as_ref().map(|session_id| {
             *active_by_session
                 .lock()
                 .entry(session_id.clone())
                 .or_insert(0) += 1;
-        }
+            let cancellation_id = next_cancellation_id.fetch_add(1, Ordering::SeqCst);
+            cancellations
+                .lock()
+                .entry(session_id.clone())
+                .or_default()
+                .insert(cancellation_id, cancellation.clone());
+            cancellation_id
+        });
         Self {
             active,
             active_by_session,
+            cancellations,
+            cancellation_id,
+            cancellation,
             idle,
             session_id,
         }
+    }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 }
 
@@ -303,6 +344,16 @@ impl Drop for ActiveCommandRunGuard {
                 *count -= 1;
                 if *count == 0 {
                     active.remove(session_id);
+                }
+            }
+            drop(active);
+            if let Some(cancellation_id) = self.cancellation_id {
+                let mut cancellations = self.cancellations.lock();
+                if let Some(tokens) = cancellations.get_mut(session_id) {
+                    tokens.remove(&cancellation_id);
+                    if tokens.is_empty() {
+                        cancellations.remove(session_id);
+                    }
                 }
             }
         }
@@ -422,6 +473,74 @@ mod tests {
             .await
             .expect("command_run task should join")
             .expect("command_run should finish");
+        assert_eq!(service.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn command_run_service_cancels_only_the_exact_session() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let service = CommandRunService::new();
+        let request = |session_id: &str, label: &str| {
+            json!({
+                "session_id": session_id,
+                "runtime_id": format!("runtime-{session_id}"),
+                "session_directory": workspace.path().display().to_string(),
+                "arguments": {
+                    "commands": [{
+                        "command": "shell_command",
+                        "command_line": json!({
+                            "command": delayed_read_only_command(label, 5_000),
+                            "timeout_ms": READ_ONLY_FIXTURE_TIMEOUT_MS
+                        }).to_string()
+                    }]
+                }
+            })
+        };
+        let first = {
+            let service = service.clone();
+            let request = request("cancel-first", "first");
+            tokio::spawn(async move {
+                service
+                    .execute_with_request_id(request, Some("cancel-first-execution"))
+                    .await
+            })
+        };
+        let second = {
+            let service = service.clone();
+            let request = request("keep-second", "second");
+            tokio::spawn(async move {
+                service
+                    .execute_with_request_id(request, Some("keep-second-execution"))
+                    .await
+            })
+        };
+
+        let started = Instant::now();
+        while (service.active_count_for_session("cancel-first") == 0
+            || service.active_count_for_session("keep-second") == 0)
+            && started.elapsed() < Duration::from_secs(2)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(service.cancel_session("cancel-first"), 1);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            service.wait_for_session_idle("cancel-first"),
+        )
+        .await
+        .expect("cancelled session should drain promptly");
+        assert_eq!(service.active_count_for_session("cancel-first"), 0);
+        assert_eq!(service.active_count_for_session("keep-second"), 1);
+
+        assert_eq!(service.cancel_session("keep-second"), 1);
+        first
+            .await
+            .expect("first command task should join")
+            .expect("first command response should remain deterministic");
+        second
+            .await
+            .expect("second command task should join")
+            .expect("second command response should remain deterministic");
         assert_eq!(service.active_count(), 0);
     }
 
