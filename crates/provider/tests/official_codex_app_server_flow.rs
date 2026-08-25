@@ -440,8 +440,21 @@ async fn run_interrupted_effect_recovery() {
             && message["params"]["model"] == "gpt-5.6-sol"
     }));
     assert!(recovery_messages.iter().any(|message| {
+        message.get("method").and_then(Value::as_str) == Some("thread/inject_items")
+            && message["params"]["threadId"] == "thread-recovered-1"
+            && message["params"]["items"]
+                .as_array()
+                .is_some_and(|items| {
+                    items.iter().any(|item| item["type"] == "function_call")
+                        && items
+                            .iter()
+                            .any(|item| item["type"] == "function_call_output")
+                })
+    }));
+    assert!(recovery_messages.iter().any(|message| {
         message.get("method").and_then(Value::as_str) == Some("turn/start")
             && message["params"]["threadId"] == "thread-recovered-1"
+            && message["params"]["input"] == json!([])
     }));
     assert!(!recovery_messages
         .iter()
@@ -639,6 +652,11 @@ async fn run_interrupted_effect_recovery() {
     )
     .await
     .expect_err("conflicting-effect provider loss");
+    let mut conflicting_ledger = load_only_execution_ledger(&conflict_directory);
+    conflicting_ledger.effects[0].request_params.as_mut().expect(
+        "interrupted effect must preserve its canonical request",
+    )["arguments"]["commands"][0]["command_line"] = json!("sleep 91");
+    persist_only_execution_ledger(&conflict_directory, &conflicting_ledger);
     let conflict_error = run_official_codex_turn(
         effect_request(
             &conflict_directory,
@@ -1132,6 +1150,20 @@ fn load_only_execution_ledger(session_directory: &Path) -> CodexExecutionLedger 
         .expect("valid effect ledger")
 }
 
+fn persist_only_execution_ledger(
+    session_directory: &Path,
+    execution_ledger: &CodexExecutionLedger,
+) {
+    let path = session_directory
+        .join(".tura/run/effect_ledgers")
+        .join(format!("{}.json", execution_ledger.canonical_input_sha256));
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(execution_ledger).expect("effect ledger JSON"),
+    )
+    .expect("effect ledger write");
+}
+
 fn request(
     session_directory: &Path,
     capture: &Path,
@@ -1175,6 +1207,7 @@ fn fake_app_server(args: &[String]) {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut lines = stdin.lock().lines();
+    let mut recovery_history_injected = false;
     while let Some(line) = lines.next() {
         let line = line.expect("fake app-server input");
         let message: Value = serde_json::from_str(&line).expect("JSON-RPC input");
@@ -1244,6 +1277,21 @@ fn fake_app_server(args: &[String]) {
                     json!({"thread": {"id": "thread-official-1", "turns": turns}}),
                 );
             }
+            "thread/inject_items" => {
+                assert!(mode.ends_with("-recover"));
+                assert_eq!(message["params"]["threadId"], "thread-recovered-1");
+                let items = message["params"]["items"]
+                    .as_array()
+                    .expect("recovery items");
+                assert_eq!(items.first().and_then(|item| item["type"].as_str()), Some("message"));
+                assert!(items.windows(2).any(|pair| {
+                    pair[0]["type"] == "function_call"
+                        && pair[1]["type"] == "function_call_output"
+                        && pair[0]["call_id"] == pair[1]["call_id"]
+                }));
+                recovery_history_injected = true;
+                respond(&mut stdout, id, json!({}));
+            }
             "turn/start" => {
                 if mode.contains("effect-")
                     || mode == "delivered-failure"
@@ -1268,6 +1316,42 @@ fn fake_app_server(args: &[String]) {
                             }
                         }),
                     );
+                    if recovery {
+                        assert!(recovery_history_injected);
+                        assert_eq!(message["params"]["input"], json!([]));
+                        notify(
+                            &mut stdout,
+                            "item/completed",
+                            json!({
+                                "threadId": "thread-recovered-1",
+                                "turnId": turn_id,
+                                "item": {
+                                    "type": "agentMessage",
+                                    "id": "item-recovered-effect-1",
+                                    "text": "recovered after provider loss",
+                                    "phase": "final_answer"
+                                }
+                            }),
+                        );
+                        notify(
+                            &mut stdout,
+                            "turn/completed",
+                            json!({
+                                "threadId": "thread-recovered-1",
+                                "turn": {
+                                    "id": turn_id,
+                                    "status": "completed",
+                                    "items": [{
+                                        "type": "agentMessage",
+                                        "id": "item-recovered-effect-1",
+                                        "text": "recovered after provider loss",
+                                        "phase": "final_answer"
+                                    }]
+                                }
+                            }),
+                        );
+                        continue;
+                    }
                     server_request(
                         &mut stdout,
                         91,

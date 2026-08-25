@@ -93,6 +93,8 @@ pub struct CodexReadOnlyEffectObservation {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CodexObservedToolEffect {
     pub request_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_params: Option<Value>,
     pub original_request_id: Value,
     pub state: CodexObservedToolEffectState,
     pub response: Option<Value>,
@@ -114,6 +116,8 @@ pub struct CodexInterruptedRecoveryAttempt {
     pub interrupted_turn_id: String,
     pub replay_effect_count: usize,
     pub state: CodexInterruptedRecoveryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_thread_id: Option<String>,
 }
 
 pub const CODEX_EXECUTION_LEDGER_SCHEMA_VERSION: u32 = 1;
@@ -684,10 +688,17 @@ async fn run_protocol(
     .await?;
     write_message(stdin, &json!({"method": "initialized", "params": {}})).await?;
 
-    let thread_response = if let Some(association) = prior.as_ref() {
+    let recovery_thread_id = execution_ledger
+        .interrupted_recovery
+        .as_ref()
+        .filter(|recovery| recovery.state == CodexInterruptedRecoveryState::ThreadAcknowledged)
+        .and_then(|recovery| recovery.recovery_thread_id.as_deref());
+    let resume_thread_id = recovery_thread_id
+        .or_else(|| prior.as_ref().map(|association| association.thread_id.as_str()));
+    let thread_response = if let Some(thread_id) = resume_thread_id {
         rpc_request(
             "thread/resume",
-            json!({"threadId": association.thread_id}),
+            json!({"threadId": thread_id}),
             &mut next_id,
             stdin,
             lines,
@@ -719,11 +730,11 @@ async fn run_protocol(
             )
         })?;
     let thread_id = required_string(thread, "id", "thread.id")?;
-    if let Some(prior) = prior.as_ref() {
-        if prior.thread_id != thread_id {
+    if let Some(expected_thread_id) = resume_thread_id {
+        if expected_thread_id != thread_id {
             return Err(OfficialCodexAppServerError::InvalidResponse(format!(
                 "thread/resume returned {}, expected {}",
-                thread_id, prior.thread_id
+                thread_id, expected_thread_id
             )));
         }
     }
@@ -799,12 +810,27 @@ async fn run_protocol(
         request_handler: &mut Option<&mut dyn OfficialCodexServerRequestHandler>,
         pending: &mut Vec<Value>,
     ) -> Result<(String, Option<Value>), OfficialCodexAppServerError> {
-        if execution_ledger.interrupted_recovery.is_some() {
-            return Err(
-                OfficialCodexAppServerError::ConflictingInterruptedRecovery {
-                    turn_id: interrupted_turn_id.to_string(),
-                },
-            );
+        match execution_ledger.interrupted_recovery.as_ref() {
+            Some(recovery)
+                if recovery.state == CodexInterruptedRecoveryState::Prepared
+                    && recovery.interrupted_turn_id == interrupted_turn_id => {}
+            Some(recovery)
+                if recovery.state == CodexInterruptedRecoveryState::ThreadAcknowledged
+                    && recovery.interrupted_turn_id != interrupted_turn_id =>
+            {
+                for effect in &mut execution_ledger.effects {
+                    effect.replay_request_id = None;
+                }
+                execution_ledger.interrupted_recovery = None;
+            }
+            Some(_) => {
+                return Err(
+                    OfficialCodexAppServerError::ConflictingInterruptedRecovery {
+                        turn_id: interrupted_turn_id.to_string(),
+                    },
+                );
+            }
+            None => {}
         }
         if execution_ledger.canonical_input_sha256 != current_snapshot.input_sha256 {
             return Err(OfficialCodexAppServerError::TurnAttemptInputMismatch(
@@ -823,11 +849,14 @@ async fn run_protocol(
         let interrupted_thread_id = association.thread_id.clone();
         association.active_turn_id = None;
         association.turn_attempt = None;
-        execution_ledger.interrupted_recovery = Some(CodexInterruptedRecoveryAttempt {
-            interrupted_turn_id: interrupted_turn_id.to_string(),
-            replay_effect_count: execution_ledger.effects.len(),
-            state: CodexInterruptedRecoveryState::Prepared,
-        });
+        if execution_ledger.interrupted_recovery.is_none() {
+            execution_ledger.interrupted_recovery = Some(CodexInterruptedRecoveryAttempt {
+                interrupted_turn_id: interrupted_turn_id.to_string(),
+                replay_effect_count: execution_ledger.effects.len(),
+                state: CodexInterruptedRecoveryState::Prepared,
+                recovery_thread_id: None,
+            });
+        }
         persist_execution_ledger(request_handler, execution_ledger, 0)?;
         persist_thread_association(&request.session_directory, association)?;
 
@@ -858,18 +887,41 @@ async fn run_protocol(
             ));
         }
         let codex_session_id = required_string(thread, "sessionId", "recovery thread.sessionId")?;
-        association.thread_id = thread_id.clone();
-        association.codex_session_id = codex_session_id;
+        let (recovery_items, replay_request_ids) =
+            interrupted_recovery_items(current_snapshot, execution_ledger)?;
+        rpc_request(
+            "thread/inject_items",
+            json!({"threadId": thread_id, "items": recovery_items}),
+            next_id,
+            stdin,
+            lines,
+            request_handler,
+            pending,
+            None,
+        )
+        .await?;
+        for (effect, replay_request_id) in execution_ledger
+            .effects
+            .iter_mut()
+            .zip(replay_request_ids)
+        {
+            effect.replay_request_id = Some(replay_request_id);
+        }
         if let Some(recovery) = execution_ledger.interrupted_recovery.as_mut() {
             recovery.state = CodexInterruptedRecoveryState::ThreadAcknowledged;
+            recovery.recovery_thread_id = Some(thread_id.clone());
         }
         persist_execution_ledger(request_handler, execution_ledger, 0)?;
+        association.thread_id = thread_id.clone();
+        association.codex_session_id = codex_session_id;
         persist_thread_association(&request.session_directory, association)?;
+        let mut recovery_snapshot = current_snapshot.clone();
+        recovery_snapshot.turn_input.clear();
         let started = start_turn(
             request,
             association,
             execution_ledger,
-            current_snapshot,
+            &recovery_snapshot,
             Vec::new(),
             next_id,
             stdin,
@@ -949,7 +1001,7 @@ async fn run_protocol(
         interrupted_recovery: None,
     };
     persist_thread_association(&request.session_directory, &association)?;
-    let authoritative_turns = if prior.is_some() {
+    let authoritative_turns = if resume_thread_id.is_some() {
         let thread_read = rpc_request(
             "thread/read",
             json!({"threadId": thread_id, "includeTurns": true}),
@@ -1036,7 +1088,9 @@ async fn run_protocol(
                     request.tura_session_id.clone(),
                 ));
             }
-            current_snapshot.clone()
+            let mut snapshot = current_snapshot.clone();
+            snapshot.turn_input.clear();
+            snapshot
         } else {
             current_snapshot.clone()
         };
@@ -1473,13 +1527,26 @@ fn prepare_tool_effect(
                 Some(effect_identity.clone());
             return Ok(ToolEffectDisposition::Replay(result));
         }
-        return Err(OfficialCodexAppServerError::UncertainToolEffect {
-            effect_index: recovery.replay_effect_count,
-            reason: format!(
-                "recovery requested additional effect {request_sha256} without a reconciled predecessor"
-            ),
-        });
-    } else if let Some((effect_index, effect)) = context
+        if let Some((effect_index, effect)) = context
+            .execution_ledger
+            .effects
+            .iter()
+            .take(recovery.replay_effect_count)
+            .enumerate()
+            .find(|(_, effect)| effect.request_sha256 == request_sha256)
+        {
+            validate_reconciled_tool_effect(context.session_directory, effect_index, effect)?;
+            return Ok(ToolEffectDisposition::Replay(
+                effect.response.clone().ok_or_else(|| {
+                    OfficialCodexAppServerError::UncertainToolEffect {
+                        effect_index,
+                        reason: "reconciled effect omitted its response".to_string(),
+                    }
+                })?,
+            ));
+        }
+    }
+    if let Some((effect_index, effect)) = context
         .execution_ledger
         .effects
         .iter()
@@ -1510,6 +1577,7 @@ fn prepare_tool_effect(
         .effects
         .push(CodexObservedToolEffect {
             request_sha256,
+            request_params: Some(params.clone()),
             original_request_id: effect_identity.clone(),
             state: CodexObservedToolEffectState::Observed,
             response: None,
@@ -1876,6 +1944,99 @@ fn server_request_semantic_sha256(
         "tool": tool,
         "arguments": arguments,
     }))
+}
+
+fn interrupted_recovery_items(
+    snapshot: &CodexMissionSnapshot,
+    execution_ledger: &CodexExecutionLedger,
+) -> Result<(Vec<Value>, Vec<Value>), OfficialCodexAppServerError> {
+    let user_text = snapshot
+        .turn_input
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OfficialCodexAppServerError::InvalidResponse(
+                "canonical recovery snapshot omitted its text input".to_string(),
+            )
+        })?;
+    let mut items = vec![json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": user_text}],
+    })];
+    let mut replay_request_ids = Vec::with_capacity(execution_ledger.effects.len());
+    for (effect_index, effect) in execution_ledger.effects.iter().enumerate() {
+        let params = effect.request_params.as_ref().ok_or_else(|| {
+            OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: "reconciled effect omitted its canonical tool request".to_string(),
+            }
+        })?;
+        let request_sha256 = server_request_semantic_sha256("item/tool/call", params)?;
+        if request_sha256 != effect.request_sha256 {
+            return Err(OfficialCodexAppServerError::ConflictingRecoveryToolEffect {
+                effect_index,
+                expected: effect.request_sha256.clone(),
+                actual: request_sha256,
+            });
+        }
+        let tool = params
+            .get("tool")
+            .or_else(|| params.get("name"))
+            .or_else(|| params.get("toolName"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: "reconciled effect omitted its tool name".to_string(),
+            })?;
+        let arguments = params
+            .get("arguments")
+            .or_else(|| params.get("input"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let arguments = match arguments {
+            Value::String(text) => text,
+            value => serde_json::to_string(&value)
+                .map_err(OfficialCodexAppServerError::EncodeAssociation)?,
+        };
+        let call_id = format!(
+            "tura_recovery_{effect_index}_{}",
+            &effect.request_sha256[..16]
+        );
+        let response = effect.response.as_ref().ok_or_else(|| {
+            OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: "reconciled effect omitted its response".to_string(),
+            }
+        })?;
+        let output = match response
+            .get("contentItems")
+            .and_then(Value::as_array)
+            .and_then(|content_items| {
+                content_items
+                    .iter()
+                    .find_map(|item| item.get("text").and_then(Value::as_str))
+            }) {
+            Some(text) => text.to_string(),
+            None => serde_json::to_string(response)
+                .map_err(OfficialCodexAppServerError::EncodeAssociation)?,
+        };
+        items.push(json!({
+            "type": "function_call",
+            "name": tool,
+            "arguments": arguments,
+            "call_id": call_id,
+        }));
+        items.push(json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
+        }));
+        replay_request_ids.push(Value::String(call_id));
+    }
+    Ok((items, replay_request_ids))
 }
 
 struct CommandReceiptEvidence {
@@ -2546,6 +2707,7 @@ mod interrupted_read_only_reconciliation_tests {
             runtime_ids: vec!["runtime-test".to_string()],
             effects: vec![CodexObservedToolEffect {
                 request_sha256: "request-sha".to_string(),
+                request_params: None,
                 original_request_id: json!("call-test"),
                 state: CodexObservedToolEffectState::Observed,
                 response: None,
