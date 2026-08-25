@@ -13,6 +13,7 @@ use crate::tura_conf::TuraConfig;
 use super::{ProviderConfig, ProviderResponse, ProviderStreamEventSink, TuraError};
 
 pub const OFFICIAL_CODEX_APP_SERVER_PROVIDER: &str = "official_codex_app_server";
+pub const LEGACY_CODEX_PROVIDER: &str = "codex";
 
 pub static SETTINGS: OnceLock<Arc<Settings>> = OnceLock::new();
 static PROVIDER_LATENCY_TIMEOUTS: OnceLock<RwLock<ProviderLatencyTimeouts>> = OnceLock::new();
@@ -86,6 +87,17 @@ impl RouteConfig {
     }
 
     pub fn official_codex_app_server_provider(&self) -> Result<Option<&ProviderConfig>, TuraError> {
+        if self
+            .providers
+            .iter()
+            .any(|provider| provider.provider == LEGACY_CODEX_PROVIDER)
+        {
+            return Err(TuraError::Config {
+                message: format!(
+                    "legacy provider '{LEGACY_CODEX_PROVIDER}' is disabled; use '{OFFICIAL_CODEX_APP_SERVER_PROVIDER}'"
+                ),
+            });
+        }
         let official = self
             .providers
             .iter()

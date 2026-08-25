@@ -812,13 +812,23 @@ mod tests {
             .to_string()
             .contains("fallback is prohibited"));
 
-        let existing = tura_llm_rust::RouteConfig {
+        let legacy = tura_llm_rust::RouteConfig {
             default_temperature: 0.0,
             providers: vec![provider("codex"), provider("openai")],
         };
-        assert!(existing
+        assert!(legacy
             .official_codex_app_server_provider()
-            .expect("legacy and non-Codex routes remain admitted")
+            .expect_err("legacy Codex provider must not remain selectable")
+            .to_string()
+            .contains("legacy provider 'codex' is disabled"));
+
+        let non_codex = tura_llm_rust::RouteConfig {
+            default_temperature: 0.0,
+            providers: vec![provider("openai")],
+        };
+        assert!(non_codex
+            .official_codex_app_server_provider()
+            .expect("non-Codex routes remain admitted")
             .is_none());
     }
 
