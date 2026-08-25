@@ -6,9 +6,11 @@ mod request;
 mod response;
 mod shell;
 
+pub(crate) use execution::run_in_process_command_with_terminal_receipt;
 pub use process::{
-    current_shell_process_scope_strategy, terminate_retained_shell_process_scopes,
-    ShellProcessScopeStrategy,
+    current_shell_process_scope_strategy, retained_shell_process_scope_count,
+    retained_shell_process_scope_count_for_scope, terminate_retained_shell_process_scopes,
+    terminate_retained_shell_process_scopes_for_scope, ShellProcessScopeStrategy,
 };
 
 use crate::commands::{apply_patch, command_safety, CommandResponse};
@@ -116,7 +118,7 @@ pub fn execute(
         RUNTIME_SHELL_BACKGROUND_PROCESS_KIND,
     );
 
-    execution::run_command_with_timeout(command, request.timeout_secs)
+    execution::run_command_with_timeout(command, request.timeout_secs, request.stall_timeout_secs)
 }
 
 pub async fn execute_async(
@@ -128,7 +130,9 @@ pub async fn execute_async(
 ) -> CommandResponse {
     let request = request::parse_shell_request(command_line, session_dir, timeout_secs);
     if let Some(patch_text) = request::embedded_apply_patch_text(&request.command) {
-        return apply_patch::execute(&patch_text, session_dir);
+        return run_in_process_command_with_terminal_receipt(ctx, "in_process_apply_patch", || {
+            apply_patch::execute(&patch_text, session_dir)
+        });
     }
     if let Some(reason) = command_safety::is_dangerous_command_with_workspace(
         &request.command,
@@ -203,7 +207,13 @@ pub async fn execute_async(
         BACKGROUND_PROCESS_KIND_ENV,
         RUNTIME_SHELL_BACKGROUND_PROCESS_KIND,
     );
-    execution::run_tokio_command_with_timeout(command, request.timeout_secs, ctx).await
+    execution::run_tokio_command_with_timeout(
+        command,
+        request.timeout_secs,
+        request.stall_timeout_secs,
+        ctx,
+    )
+    .await
 }
 
 pub fn looks_read_only(command_line: &str) -> bool {

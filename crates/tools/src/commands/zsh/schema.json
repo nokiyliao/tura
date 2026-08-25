@@ -15,6 +15,10 @@
       "timeout_secs": {
         "type": "integer",
         "minimum": 1
+      },
+      "stall_timeout_ms": {
+        "type": "integer",
+        "minimum": 1000
       }
     }
   },

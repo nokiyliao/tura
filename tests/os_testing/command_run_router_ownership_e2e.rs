@@ -5,9 +5,11 @@ use tokio::net::TcpListener;
 
 static MOCK_ROUTER_ADDR: OnceLock<String> = OnceLock::new();
 static MOCK_ROUTER_INIT: Mutex<()> = Mutex::new(());
+static ROUTER_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn command_run_without_router_addr_does_not_execute_in_runtime_process() {
+    let _env_guard = ROUTER_ENV_LOCK.lock().await;
     let previous = std::env::var("TURA_ROUTER_ADDR").ok();
     // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
     #[allow(
@@ -56,6 +58,7 @@ async fn command_run_without_router_addr_does_not_execute_in_runtime_process() {
 
 #[tokio::test]
 async fn command_run_executes_only_after_runtime_hands_request_to_router() {
+    let _env_guard = ROUTER_ENV_LOCK.lock().await;
     let router_addr = ensure_mock_router();
     // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
     #[allow(
@@ -93,6 +96,46 @@ async fn command_run_executes_only_after_runtime_hands_request_to_router() {
     let text = std::fs::read_to_string(workspace.path().join("router-owned.txt"))
         .expect("router-owned command created workspace artifact");
     assert!(text.contains("router-owned"));
+}
+
+#[tokio::test]
+async fn router_owned_command_run_preserves_declared_timeout_above_fifteen_seconds() {
+    let _env_guard = ROUTER_ENV_LOCK.lock().await;
+    let router_addr = ensure_mock_router();
+    // SAFETY: these OS tests use one shared mock-router address for the process.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_ROUTER_ADDR", router_addr)
+    };
+    let workspace = tempfile::tempdir().expect("workspace");
+    let started = std::time::Instant::now();
+
+    let output = runtime::router_command_run::execute_command_run_value_or_error(
+        json!({
+            "timeout_ms": 25_000,
+            "commands": [{
+                "command_type": "shell_command",
+                "command_line": "sleep 16; printf 'router-long-ok\\n'",
+                "step": 1
+            }]
+        }),
+        workspace.path().to_path_buf(),
+        Some("session-router-long-timeout"),
+        Some("runtime-router-long-timeout"),
+        None,
+    )
+    .await;
+
+    assert_eq!(output["results"][0]["success"], true, "{output}");
+    assert!(output["results"][0]["output"]["stdout"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("router-long-ok"));
+    assert!(started.elapsed() >= std::time::Duration::from_secs(15));
+    assert!(started.elapsed() < std::time::Duration::from_secs(24));
 }
 
 fn ensure_mock_router() -> String {

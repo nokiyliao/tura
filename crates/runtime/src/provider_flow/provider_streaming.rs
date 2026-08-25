@@ -3,7 +3,10 @@ use lifecycle::RuntimeState;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::time::Duration;
 use tracing::error;
 
@@ -16,7 +19,8 @@ use crate::provider_flow::command_run_streaming::{
     SpawnStreamedCommandRunTask, StreamedCommandRunState,
 };
 use crate::provider_flow::errors::{
-    finish_provider_call_failure, finish_runtime_failure, runtime_timeout,
+    finish_provider_call_failure, finish_provider_call_failure_after_command_effect,
+    finish_runtime_failure, finish_runtime_failure_after_command_effect, runtime_timeout,
 };
 use crate::provider_flow::provider_response::apply_provider_response_with_options;
 use crate::provider_flow::streamed_command_run::{
@@ -31,6 +35,7 @@ pub(crate) struct RuntimeStreamingInput {
     pub(crate) options: tura_llm_rust::CallOptions,
     pub(crate) session_directory: PathBuf,
     pub(crate) allowed_command_run_commands: Option<BTreeSet<String>>,
+    pub(crate) jspace_contract: Option<Value>,
     pub(crate) require_startup_task_state: bool,
 }
 
@@ -59,6 +64,8 @@ pub(crate) async fn call_runtime_streaming(
 
     let first_stream_output_at: Arc<Mutex<Option<DateTime<Utc>>>> = Arc::new(Mutex::new(None));
     let command_state = StreamedCommandRunState::new();
+    let command_effect_started = Arc::new(AtomicBool::new(false));
+    let command_effect_started_for_sink = Arc::clone(&command_effect_started);
     let first_stream_output_for_sink = Arc::clone(&first_stream_output_at);
     let command_state_for_sink = command_state.clone();
     let sink: tura_llm_rust::ProviderStreamEventSink = Arc::new(move |event| {
@@ -78,6 +85,7 @@ pub(crate) async fn call_runtime_streaming(
             tura_llm_rust::ProviderStreamEvent::CommandRunCommandReady { .. }
         ) {
             command_state_for_sink.mark_seen();
+            command_effect_started_for_sink.store(true, Ordering::SeqCst);
         }
         if let tura_llm_rust::ProviderStreamEvent::TextDelta { text } = &event
             && let Err(error) =
@@ -96,6 +104,7 @@ pub(crate) async fn call_runtime_streaming(
         stream_rx,
         session_directory: input.session_directory,
         allowed_command_run_commands: input.allowed_command_run_commands,
+        jspace_contract: input.jspace_contract,
         session_id: gateway_session_id,
         runtime_id: gateway_runtime_id.clone(),
         provider: gateway_provider,
@@ -109,13 +118,15 @@ pub(crate) async fn call_runtime_streaming(
 
     let route_config_for_task = route_config.clone();
     let tura_config_for_task = Arc::clone(tura_config);
+    let command_effect_started_for_task = Arc::clone(&command_effect_started);
     let provider_task = tokio::spawn(async move {
         route_config_for_task
-            .run_with_stream_events(
+            .run_with_stream_events_and_command_guard(
                 tura_config_for_task.as_ref(),
                 input.messages,
                 input.options,
                 Some(sink),
+                Some(command_effect_started_for_task),
             )
             .await
     });
@@ -135,18 +146,29 @@ pub(crate) async fn call_runtime_streaming(
                     "error": message
                 }))?;
                 flush_runtime_events(&mut runtime_event_writer, runtime)?;
-                finish_runtime_failure(
-                    runtime,
-                    finished_at,
-                    "CALL_TIMED_OUT",
-                    message,
-                    RuntimeState::TimedOut,
-                )?;
+                if command_effect_started.load(Ordering::SeqCst) {
+                    finish_runtime_failure_after_command_effect(
+                        runtime,
+                        finished_at,
+                        "CALL_TIMED_OUT_AFTER_COMMAND_EFFECT",
+                        format!(
+                            "{message}; command effect was observed; reconcile its durable terminal receipt before replay"
+                        ),
+                        RuntimeState::TimedOut,
+                    )?;
+                } else {
+                    finish_runtime_failure(
+                        runtime,
+                        finished_at,
+                        "CALL_TIMED_OUT",
+                        message,
+                        RuntimeState::TimedOut,
+                    )?;
+                }
                 flush_runtime_events(&mut runtime_event_writer, runtime)?;
                 provider_task.abort();
                 let _ = (&mut provider_task).await;
                 drop(final_response_stream_tx);
-                let _ = command_task.join();
                 return Ok(());
             }
             response = &mut provider_task => {
@@ -159,10 +181,18 @@ pub(crate) async fn call_runtime_streaming(
                             "error": e.to_string()
                         }))?;
                         flush_runtime_events(&mut runtime_event_writer, runtime)?;
-                        finish_provider_call_failure(runtime, finished_at, &e, RuntimeState::Failed)?;
+                        if command_effect_started.load(Ordering::SeqCst) {
+                            finish_provider_call_failure_after_command_effect(
+                                runtime,
+                                finished_at,
+                                &e,
+                                RuntimeState::Failed,
+                            )?;
+                        } else {
+                            finish_provider_call_failure(runtime, finished_at, &e, RuntimeState::Failed)?;
+                        }
                         flush_runtime_events(&mut runtime_event_writer, runtime)?;
                         drop(final_response_stream_tx);
-                        let _ = command_task.join();
                         return Ok(());
                     }
                     Err(e) => {
@@ -173,16 +203,25 @@ pub(crate) async fn call_runtime_streaming(
                             "error": message
                         }))?;
                         flush_runtime_events(&mut runtime_event_writer, runtime)?;
-                        finish_runtime_failure(
-                            runtime,
-                            finished_at,
-                            "CALL_FAILED",
-                            message,
-                            RuntimeState::Failed,
-                        )?;
+                        if command_effect_started.load(Ordering::SeqCst) {
+                            finish_runtime_failure_after_command_effect(
+                                runtime,
+                                finished_at,
+                                "CALL_FAILED_AFTER_COMMAND_EFFECT",
+                                message,
+                                RuntimeState::Failed,
+                            )?;
+                        } else {
+                            finish_runtime_failure(
+                                runtime,
+                                finished_at,
+                                "CALL_FAILED",
+                                message,
+                                RuntimeState::Failed,
+                            )?;
+                        }
                         flush_runtime_events(&mut runtime_event_writer, runtime)?;
                         drop(final_response_stream_tx);
-                        let _ = command_task.join();
                         return Ok(());
                     }
                 };
@@ -214,7 +253,6 @@ pub(crate) async fn call_runtime_streaming(
                     provider_task.abort();
                     let _ = (&mut provider_task).await;
                     drop(final_response_stream_tx);
-                    let _ = command_task.join();
                     return Ok(());
                 }
                 if command_state.should_finish_after_apply_patch_failure() {
@@ -239,7 +277,6 @@ pub(crate) async fn call_runtime_streaming(
                     provider_task.abort();
                     let _ = (&mut provider_task).await;
                     drop(final_response_stream_tx);
-                    let _ = command_task.join();
                     return Ok(());
                 }
                 if command_state.should_finish_startup_apply_patch_discard() {
@@ -264,7 +301,6 @@ pub(crate) async fn call_runtime_streaming(
                     provider_task.abort();
                     let _ = (&mut provider_task).await;
                     drop(final_response_stream_tx);
-                    let _ = command_task.join();
                     return Ok(());
                 }
             }

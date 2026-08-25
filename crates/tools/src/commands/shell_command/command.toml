@@ -15,8 +15,8 @@ entry = "crate::commands::shell_command"
 language = "rust"
 
 [limits]
-default_timeout_ms = 15000
-max_timeout_ms = 300000
+default_timeout_ms = 300000
+max_timeout_ms = 14400000
 
 [paths]
 prompt = "prompt.md"

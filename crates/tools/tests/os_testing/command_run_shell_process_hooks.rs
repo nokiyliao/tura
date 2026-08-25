@@ -63,6 +63,299 @@ fn pass_timeout_returns_quick_failure() {
 }
 
 #[test]
+fn timeout_after_effect_is_unknown_outcome_and_is_not_blindly_retried() {
+    let _guard = env_lock_blocking();
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("effectful-timeout-unknown");
+    let output = command_run::execute(
+        &json!({
+            "commands": [{
+                "command_type": "bash",
+                "command_line": "mkdir .tmp-interrupted; printf 'effect\\n' >> .tmp-interrupted/effects.txt; sleep 10",
+                "timeout_ms": 500,
+                "step": 1
+            }]
+        }),
+        &root,
+    );
+
+    let result = &output["results"][0];
+    assert_eq!(result["success"], false, "{output}");
+    assert_eq!(result["output"]["outcome"], "unknown", "{output}");
+    assert_eq!(result["output"]["retry_safe"], false, "{output}");
+    assert_eq!(result["output"]["auto_retry_allowed"], false, "{output}");
+    assert_eq!(result["output"]["reconcile_required"], true, "{output}");
+    assert_eq!(result["output"]["staging_authority"], "none", "{output}");
+    assert_eq!(
+        result["output"]["failure_class"], "wrapper_wall_clock_timeout",
+        "{output}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".tmp-interrupted/effects.txt")).expect("effect marker"),
+        "effect\n",
+        "the effectful command must execute once and must not be blindly retried"
+    );
+    assert!(!root.join("canonical-publication").exists());
+}
+
+#[tokio::test]
+async fn stall_watchdog_is_distinct_from_wall_timeout_and_writes_terminal_receipt() {
+    let _guard = env_lock().await;
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("stall-watchdog");
+    let router = ToolRouter::new();
+    let call = ToolCall {
+        tool_name: "bash".to_string(),
+        call_id: "call_stall_watchdog".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({
+                "command": "printf 'progress-before-stall\\n'; sleep 10",
+                "timeout_ms": 10_000,
+                "stall_timeout_ms": 1_000
+            }),
+        },
+    };
+    let started = Instant::now();
+    let result = router
+        .dispatch(call, ToolContext::new(root.clone()), false)
+        .await
+        .expect("stall is model-visible output");
+    let output = result.result.code_mode_result();
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(result.result.success, Some(false));
+    assert_eq!(output["error_type"], "CommandStalled", "{output}");
+    assert_eq!(output["failure_class"], "progress_stall", "{output}");
+    assert_eq!(
+        output["terminal_receipt"]["termination_origin"], "progress_watchdog",
+        "{output}"
+    );
+    let receipt_path = output["terminal_receipt_path"]
+        .as_str()
+        .expect("terminal receipt path");
+    assert!(Path::new(receipt_path).is_file(), "{output}");
+}
+
+#[tokio::test]
+async fn workload_failure_and_wrapper_timeout_have_different_failure_classes() {
+    let _guard = env_lock().await;
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("failure-classes");
+    let router = ToolRouter::new();
+    let failed = router
+        .dispatch(
+            ToolCall {
+                tool_name: "bash".to_string(),
+                call_id: "call_workload_exit".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: json!({ "command": "exit 7", "timeout_ms": 5_000 }),
+                },
+            },
+            ToolContext::new(root.clone()),
+            false,
+        )
+        .await
+        .expect("workload failure output");
+    let timed_out = router
+        .dispatch(
+            ToolCall {
+                tool_name: "bash".to_string(),
+                call_id: "call_wrapper_timeout".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: json!({ "command": "sleep 10", "timeout_ms": 1_000 }),
+                },
+            },
+            ToolContext::new(root),
+            false,
+        )
+        .await
+        .expect("wrapper timeout output");
+
+    assert_eq!(
+        failed.result.code_mode_result()["terminal_receipt"]["failure_class"],
+        "workload_exit_nonzero"
+    );
+    assert_eq!(
+        timed_out.result.code_mode_result()["failure_class"],
+        "wrapper_wall_clock_timeout"
+    );
+}
+
+#[tokio::test]
+async fn background_child_terminal_writes_one_receipt_and_duplicate_call_is_not_reexecuted() {
+    let _guard = env_lock().await;
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("background-terminal");
+    let router = ToolRouter::new();
+    let call = ToolCall {
+        tool_name: "bash".to_string(),
+        call_id: "call_background_terminal".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({
+                "command": "sh -c 'sleep 1; printf terminal >> executions.txt' & wait",
+                "timeout_ms": 10_000,
+                "stall_timeout_ms": 5_000
+            }),
+        },
+    };
+    let first = router
+        .dispatch(call.clone(), ToolContext::new(root.clone()), false)
+        .await
+        .expect("background child terminal output");
+    let duplicate = router
+        .dispatch(call, ToolContext::new(root.clone()), false)
+        .await
+        .expect("duplicate is model-visible admission failure");
+
+    assert_eq!(first.result.success, Some(true));
+    assert_eq!(
+        first.result.code_mode_result()["terminal_receipt"]["terminal_state"],
+        "completed"
+    );
+    assert_eq!(duplicate.result.success, Some(false));
+    assert_eq!(
+        duplicate.result.code_mode_result()["error_type"],
+        "CommandExecutionClaimFailed"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("executions.txt")).expect("execution marker"),
+        "terminal",
+        "same call identity must execute the workload exactly once"
+    );
+}
+
+#[tokio::test]
+async fn detached_background_child_is_reconciled_after_parent_terminal_receipt() {
+    let _guard = env_lock().await;
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("detached-background-terminal");
+    let router = ToolRouter::new();
+    let call = ToolCall {
+        tool_name: "bash".to_string(),
+        call_id: "call_detached_background_terminal".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({
+                "command": "sh -c 'sleep 1; printf detached-terminal >> detached.txt' &",
+                "timeout_ms": 10_000,
+                "stall_timeout_ms": 5_000
+            }),
+        },
+    };
+    let context =
+        ToolContext::new_with_lock_scope(root.clone(), Some("detached-session".to_string()));
+    let result = router
+        .dispatch(call, context, false)
+        .await
+        .expect("detached background command should return a terminal receipt");
+    assert_eq!(result.result.success, Some(true), "{result:?}");
+    assert_eq!(
+        result.result.code_mode_result()["terminal_receipt"]["terminal_state"],
+        "completed"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline && !root.join("detached.txt").exists() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(root.join("detached.txt").exists(), "{result:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline
+        && code_tools::shell_executor::retained_shell_process_scope_count_for_scope(
+            "detached-session",
+        ) != 0
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        code_tools::shell_executor::retained_shell_process_scope_count_for_scope(
+            "detached-session"
+        ),
+        0,
+        "detached child must release its retained scope after terminal completion"
+    );
+}
+
+#[test]
+fn commands_over_fifteen_seconds_complete_with_top_level_and_per_command_allowances() {
+    let _guard = env_lock_blocking();
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("declared-long-timeouts");
+    let started = Instant::now();
+    let output = command_run::execute(
+        &json!({
+            "timeout_ms": 25_000,
+            "commands": [
+                {
+                    "command_type": "bash",
+                    "command_line": "sleep 16; printf 'top-level-ok\\n'",
+                    "step": 1
+                },
+                {
+                    "command_type": "bash",
+                    "command_line": "sleep 16; printf 'per-command-ok\\n'",
+                    "timeout_ms": 26_000,
+                    "step": 1
+                }
+            ]
+        }),
+        &root,
+    );
+
+    assert_eq!(output["results"][0]["success"], true, "{output}");
+    assert_eq!(output["results"][1]["success"], true, "{output}");
+    assert!(command_result_text(&output["results"][0]).contains("top-level-ok"));
+    assert!(command_result_text(&output["results"][1]).contains("per-command-ok"));
+    assert!(started.elapsed() >= Duration::from_secs(30));
+    assert!(
+        started.elapsed() < Duration::from_secs(40),
+        "both declared allowances should complete without the 15-second default"
+    );
+}
+
+#[test]
 fn fail_timeout_kills_descendant_process_tree_quickly() {
     let _guard = env_lock_blocking();
     // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.

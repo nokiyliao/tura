@@ -12,9 +12,13 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 fn business_session(user_input: &str) -> SessionManagement {
+    business_session_with_id("session-runtime-context-business", user_input)
+}
+
+fn business_session_with_id(session_id: &str, user_input: &str) -> SessionManagement {
     let now = Utc::now();
     SessionManagement::new(
-        "session-runtime-context-business".to_string(),
+        session_id.to_string(),
         "Context business flow".to_string(),
         PathBuf::from("C:/workspace/runtime-context-business"),
         false,
@@ -106,6 +110,30 @@ fn context_business_flow_injects_initial_user_once_and_preserves_dialog_order() 
         SessionState::Created,
         "context building must not mutate the session FSM"
     );
+}
+
+#[test]
+fn context_business_flow_never_projects_a_foreign_session_log() {
+    let mut target = business_session_with_id("target-session", "target mission");
+    accumulate_message(&mut target, "assistant", json!("TARGET_ONLY"))
+        .expect("target message should log");
+
+    let mut foreign = business_session_with_id("foreign-session", "foreign mission");
+    accumulate_message(&mut foreign, "assistant", json!("FOREIGN_SESSION_SECRET"))
+        .expect("foreign message should log");
+
+    let runtime = business_runtime(&target);
+    let output = build_context(ContextInput {
+        runtime: &runtime,
+        session: &target,
+        additional_messages: Vec::new(),
+    })
+    .expect("target context should build");
+    let encoded = serde_json::to_string(&output.messages).expect("encode provider input");
+
+    assert!(encoded.contains("TARGET_ONLY"), "{encoded}");
+    assert!(!encoded.contains("FOREIGN_SESSION_SECRET"), "{encoded}");
+    assert_eq!(output.context_state.session_id, "target-session");
 }
 
 #[test]

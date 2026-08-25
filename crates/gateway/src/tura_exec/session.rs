@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use lifecycle::{SessionCommand, SessionState, TaskPlan};
 use serde_json::{json, Value};
 use session_log_contract::{
-    CreateSessionRequest, GetSessionRequest, SessionLogCommand, SessionLogResponse, SessionSnapshot,
+    CreateSessionRequest, GetSessionRequest, SessionLogCommand, SessionLogResponse,
+    SessionMetadataPatch, SessionSnapshot, UpdateSessionRequest,
 };
 
 use super::cli::CliConfig;
@@ -87,7 +88,11 @@ pub(crate) fn ensure_cli_session(config: &CliConfig, session_id: &str) -> Result
     ))
     .map_err(|error| format!("failed to query CLI session `{session_id}`: {error}"))?;
     match response {
-        SessionLogResponse::Session { session: Some(_) } => return Ok(()),
+        SessionLogResponse::Session {
+            session: Some(session),
+        } => {
+            return apply_cli_session_permission_override(config, session_id, &session);
+        }
         SessionLogResponse::Session { session: None } => {}
         SessionLogResponse::Error { error } => {
             return Err(format!(
@@ -123,7 +128,9 @@ pub(crate) fn ensure_cli_session(config: &CliConfig, session_id: &str) -> Result
             force_planning: config.planning_mode == Some(true),
             model_variant: None,
             model_acceleration_enabled: false,
-            disable_permission_restrictions: false,
+            disable_permission_restrictions: config
+                .disable_permission_restrictions
+                .unwrap_or(false),
             use_last_tool_call_response: false,
             auto_session_name: true,
             initial_task_plan_patch: None,
@@ -131,7 +138,8 @@ pub(crate) fn ensure_cli_session(config: &CliConfig, session_id: &str) -> Result
     ))
     .map_err(|error| format!("failed to create CLI session `{session_id}`: {error}"))?;
     match response {
-        SessionLogResponse::SessionCommandApplied { .. } => Ok(()),
+        SessionLogResponse::SessionCommandApplied { .. }
+        | SessionLogResponse::SessionUpdated { .. } => Ok(()),
         SessionLogResponse::Error { error } => Err(format!(
             "failed to create CLI session `{session_id}`: {error}"
         )),
@@ -139,6 +147,46 @@ pub(crate) fn ensure_cli_session(config: &CliConfig, session_id: &str) -> Result
             "unexpected session_db response while creating CLI session `{session_id}`: {other:?}"
         )),
     }
+}
+
+fn apply_cli_session_permission_override(
+    config: &CliConfig,
+    session_id: &str,
+    session: &SessionSnapshot,
+) -> Result<(), String> {
+    let Some(requested) = requested_session_permission_override(config, session) else {
+        return Ok(());
+    };
+
+    let response = session_log_contract::client::call_service(&SessionLogCommand::UpdateSession(
+        UpdateSessionRequest {
+            command_id: format!("cli-permission-override:{}", uuid::Uuid::new_v4()),
+            session_id: session_id.to_string(),
+            metadata: SessionMetadataPatch {
+                disable_permission_restrictions: Some(requested),
+                ..SessionMetadataPatch::default()
+            },
+            task_plan_patch: None,
+        },
+    ))
+    .map_err(|error| format!("failed to update CLI session `{session_id}` permissions: {error}"))?;
+    match response {
+        SessionLogResponse::SessionCommandApplied { .. } => Ok(()),
+        SessionLogResponse::Error { error } => Err(format!(
+            "failed to update CLI session `{session_id}` permissions: {error}"
+        )),
+        other => Err(format!(
+            "unexpected session_db response while updating CLI session `{session_id}` permissions: {other:?}"
+        )),
+    }
+}
+
+fn requested_session_permission_override(
+    config: &CliConfig,
+    session: &SessionSnapshot,
+) -> Option<bool> {
+    let requested = config.disable_permission_restrictions?;
+    (session.metadata.disable_permission_restrictions != requested).then_some(requested)
 }
 
 /// Extract the latest assistant message text for a session from the single
@@ -299,6 +347,34 @@ mod tests {
         assert!(message.contains("/session/session-123/prompt_async"));
         assert!(message.contains("Invoke-RestMethod"));
         assert!(message.contains("curl -X POST"));
+    }
+
+    #[test]
+    fn existing_session_permission_override_is_emitted_only_for_drift() {
+        let enabled = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse enabled permission override");
+        let default = CliConfig::parse(vec!["exec".to_string(), "inspect".to_string()])
+            .expect("parse default session config");
+        let mut session = test_snapshot();
+
+        assert_eq!(
+            requested_session_permission_override(&enabled, &session),
+            Some(true)
+        );
+        assert_eq!(
+            requested_session_permission_override(&default, &session),
+            None
+        );
+
+        session.metadata.disable_permission_restrictions = true;
+        assert_eq!(
+            requested_session_permission_override(&enabled, &session),
+            None
+        );
     }
 
     fn test_snapshot() -> SessionSnapshot {

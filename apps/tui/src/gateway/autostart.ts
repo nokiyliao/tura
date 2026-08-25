@@ -7,6 +7,7 @@ import type { TerminalCapabilities } from "../tui/capabilities.js";
 import { TUI_ANIMATION_INTERVAL_MS } from "../tui/frame-rate.js";
 import { iconAnimationFrame } from "../tui/render/busy-animation.js";
 import { t } from "../i18n.js";
+import { GatewayUnavailableError } from "../types/common.js";
 import {
   currentBuildMode,
   defaultGatewayUrl,
@@ -19,7 +20,10 @@ import {
 type StartupStep = "checking";
 
 const HEALTH_POLL_INTERVAL_MS = 500;
-const GATEWAY_START_TIMEOUT_MS = 20_000;
+const DEFAULT_GATEWAY_START_TIMEOUT_MS = 180_000;
+const MIN_GATEWAY_START_TIMEOUT_MS = 30_000;
+const MAX_GATEWAY_START_TIMEOUT_MS = 900_000;
+const GATEWAY_START_TIMEOUT_ENV = "TURA_GATEWAY_START_TIMEOUT_MS";
 
 interface GatewayIdentity {
   root: string;
@@ -44,7 +48,7 @@ type GatewayProcessTerminator = (
 
 let gatewayLauncher: GatewayLauncher = launchGatewayProcess;
 let gatewayProcessTerminator: GatewayProcessTerminator = terminateGatewayProcess;
-let gatewayStartTimeoutMs = GATEWAY_START_TIMEOUT_MS;
+let gatewayStartTimeoutMs = gatewayStartTimeoutFromEnv();
 const execFileAsync = promisify(execFile);
 
 function gatewayCandidates(
@@ -74,32 +78,17 @@ export async function ensureGatewayAvailable(
   const projectRoot = packageRoot();
   const targetUrl = explicit ? desiredUrl : stripTrailingSlash(defaultGatewayUrl());
   const candidates = gatewayCandidates(desiredUrl, targetUrl, instanceHome, Boolean(explicit));
-
-  let connectedUrl: string | undefined;
-  let connectedIdentity: GatewayIdentity | undefined;
-  await runWithSpinner({
-    step: "checking",
-    text: t("gatewayWaiting"),
+  const connected = await probeGatewayCandidates(
+    candidates,
+    instanceHome,
+    projectRoot,
+    Boolean(explicit),
     capabilities,
-    run: async (tick) => {
-      for (const candidate of candidates) {
-        tick();
-        const identity = await gatewayIdentityWithProbeTimeout(candidate);
-        if (
-          identity &&
-          gatewayMatchesInstance(identity, instanceHome, projectRoot, Boolean(explicit))
-        ) {
-          connectedUrl = candidate;
-          connectedIdentity = identity;
-          return;
-        }
-      }
-    },
-  });
+  );
 
-  if (connectedUrl) {
-    writeActiveGatewayUrl(connectedUrl, instanceHome, connectedIdentity);
-    return connectedUrl;
+  if (connected) {
+    writeActiveGatewayUrl(connected.url, instanceHome, connected.identity);
+    return connected.url;
   }
 
   if (!explicit) {
@@ -159,6 +148,61 @@ export async function ensureGatewayAvailable(
   );
 }
 
+/** Connect a thin CLI command to one proven Gateway without owning its lifecycle. */
+export async function connectGatewayAvailable(
+  gatewayUrl: string,
+  capabilities: TerminalCapabilities,
+  explicit?: boolean,
+): Promise<string> {
+  const desiredUrl = stripTrailingSlash(gatewayUrl);
+  const instanceHome = process.env.TURA_HOME?.trim()
+    ? canonical(process.env.TURA_HOME)
+    : packageRoot();
+  const projectRoot = packageRoot();
+  const targetUrl = explicit ? desiredUrl : stripTrailingSlash(defaultGatewayUrl());
+  const candidates = gatewayCandidates(desiredUrl, targetUrl, instanceHome, Boolean(explicit));
+  const connected = await probeGatewayCandidates(
+    candidates,
+    instanceHome,
+    projectRoot,
+    Boolean(explicit),
+    capabilities,
+  );
+  if (!connected) {
+    throw new GatewayUnavailableError(
+      `No healthy Tura Gateway is available at ${candidates.join(", ")}. Start the Gateway owner before using the thin CLI.`,
+    );
+  }
+  writeActiveGatewayUrl(connected.url, instanceHome, connected.identity);
+  return connected.url;
+}
+
+async function probeGatewayCandidates(
+  candidates: string[],
+  instanceHome: string,
+  projectRoot: string,
+  explicit: boolean,
+  capabilities: TerminalCapabilities,
+): Promise<{ url: string; identity: GatewayIdentity } | undefined> {
+  let connected: { url: string; identity: GatewayIdentity } | undefined;
+  await runWithSpinner({
+    step: "checking",
+    text: t("gatewayWaiting"),
+    capabilities,
+    run: async (tick) => {
+      for (const candidate of candidates) {
+        tick();
+        const identity = await gatewayIdentityWithProbeTimeout(candidate);
+        if (identity && gatewayMatchesInstance(identity, instanceHome, projectRoot, explicit)) {
+          connected = { url: candidate, identity };
+          return;
+        }
+      }
+    },
+  });
+  return connected;
+}
+
 export async function _gatewayProbeForTest(gatewayUrl: string): Promise<boolean> {
   return Boolean(await gatewayIdentityWithProbeTimeout(stripTrailingSlash(gatewayUrl)));
 }
@@ -187,6 +231,25 @@ export function _setGatewayStartTimeoutMsForTest(timeoutMs: number): () => void 
   return () => {
     gatewayStartTimeoutMs = previous;
   };
+}
+
+export function _gatewayStartTimeoutMsFromEnvForTest(value: string | undefined): number {
+  return gatewayStartTimeoutFromEnv(value);
+}
+
+function gatewayStartTimeoutFromEnv(
+  value: string | undefined = process.env[GATEWAY_START_TIMEOUT_ENV],
+): number {
+  if (value === undefined || value.trim() === "") return DEFAULT_GATEWAY_START_TIMEOUT_MS;
+  const parsed = Number(value);
+  if (
+    !Number.isSafeInteger(parsed) ||
+    parsed < MIN_GATEWAY_START_TIMEOUT_MS ||
+    parsed > MAX_GATEWAY_START_TIMEOUT_MS
+  ) {
+    return DEFAULT_GATEWAY_START_TIMEOUT_MS;
+  }
+  return parsed;
 }
 
 async function launchAndConfirmGateway(
@@ -283,7 +346,7 @@ async function launchGatewayProcess(request: GatewayLaunchRequest): Promise<stri
     exited = { code, signal };
   });
   child.unref();
-  const deadline = Date.now() + GATEWAY_START_TIMEOUT_MS;
+  const deadline = Date.now() + gatewayStartTimeoutMs;
   while (Date.now() < deadline) {
     if (exited) {
       throw new Error(`Gateway exited before becoming healthy (${exitDescription(exited)}).`);

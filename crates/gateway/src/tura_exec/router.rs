@@ -33,7 +33,9 @@ pub(crate) fn run_via_router(
     ensure_cli_session(config, session_id)?;
     let stream = TcpStream::connect(&addr)
         .map_err(|err| format!("failed to connect to router daemon at {addr}: {err}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(900))).ok();
+    stream
+        .set_read_timeout(Some(router_turn_read_timeout()))
+        .ok();
 
     let mut payload = json!({
         "session_id": session_id,
@@ -116,6 +118,21 @@ pub(crate) fn run_via_router(
         println!("{text}");
     }
     Ok(0)
+}
+
+fn router_turn_read_timeout() -> Duration {
+    router_turn_read_timeout_from(
+        std::env::var("TURA_EXEC_ROUTER_READ_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn router_turn_read_timeout_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(14_700))
 }
 
 fn read_router_response(stream: TcpStream, request_id: &str) -> Result<Value, String> {
@@ -660,8 +677,8 @@ fn resolve_router_binary() -> Option<PathBuf> {
 mod tests {
     use super::{
         read_router_response, router_callback_cli_events, router_final_text, router_health_ok,
-        router_session_log, router_stderr_log_path, router_turn_started_at_ms, router_usage,
-        worker_env_from_current_process,
+        router_session_log, router_stderr_log_path, router_turn_read_timeout_from,
+        router_turn_started_at_ms, router_usage, worker_env_from_current_process,
     };
     use serde_json::json;
     use std::collections::HashSet;
@@ -672,6 +689,16 @@ mod tests {
     use std::thread;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn router_turn_transport_budget_supports_bounded_four_hour_commands() {
+        assert_eq!(router_turn_read_timeout_from(None).as_secs(), 14_700);
+        assert_eq!(
+            router_turn_read_timeout_from(Some("14400")).as_secs(),
+            14_400
+        );
+        assert_eq!(router_turn_read_timeout_from(Some("0")).as_secs(), 14_700);
+    }
 
     fn restore_env(key: &str, value: Option<OsString>) {
         if let Some(value) = value {

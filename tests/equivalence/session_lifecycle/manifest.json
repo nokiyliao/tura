@@ -1,0 +1,66 @@
+{
+  "schema_version": "tura_session_lifecycle_gate_v1",
+  "source_head": "dad9906867eaa3c625545c04870ea036752447ff",
+  "phases": {
+    "P0": [
+      "same identity on compaction failure",
+      "same identity on transport uncertainty",
+      "same identity on callback pending",
+      "same identity on replay and restart",
+      "zero replacement create/fork calls"
+    ],
+    "P1": [
+      "fsync-safe immutable pending receipt",
+      "exactly-once transaction/event intake",
+      "pending replay until confirmed delivery",
+      "history, follow-up, audit, task, goal, lease, and override metadata"
+    ],
+    "P2": [
+      "native checkpoint event is primary",
+      "bounded macOS FSEvents adapter",
+      "stable completed write and exact checkpoint identity",
+      "watchdog reconciles event loss only"
+    ],
+    "P3": [
+      "terminal slot release after zero live evidence",
+      "typed retained-slot blocker on live evidence",
+      "idempotent repeated reclamation",
+      "history and follow-up readable after release"
+    ],
+    "P4": [
+      "crash before receipt",
+      "crash after receipt before intake",
+      "crash after intake before acknowledgement",
+      "callback pending",
+      "duplicate and out-of-order events",
+      "restart replay",
+      "receipt corruption"
+    ],
+    "P5": [
+      "event-driven normal progression",
+      "watchdog interval configurable and greater than 300 seconds",
+      "last reconcile and last blocker readback",
+      "elapsed time is not failure evidence"
+    ]
+  },
+  "commands": [
+    "tests/equivalence/session_lifecycle/run.sh"
+  ],
+  "protected_prefixes": [
+    "live_plane/",
+    "live_data_authority/",
+    "broker/",
+    "orders/",
+    "strategy/",
+    "market_data/",
+    "utm/",
+    "paper/",
+    "real/"
+  ],
+  "forbidden_artifacts": [
+    "Codex Desktop binary",
+    "OAuth material",
+    "raw rollout mutation",
+    "official Session/task/goal/lease schema mutation"
+  ]
+}

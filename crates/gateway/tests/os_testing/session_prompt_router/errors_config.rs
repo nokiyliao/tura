@@ -415,6 +415,7 @@ async fn gateway_prompt_business_flow_inherits_agent_runtime_settings_for_router
         request["payload"]["payload"]["agent"],
         "business-runtime-agent"
     );
+    assert_eq!(request["payload"]["payload"]["session_type"], "coding");
     assert_eq!(request["payload"]["payload"]["model"], "codex/gpt-5.5");
     assert_eq!(
         request["payload"]["payload"]["worker_env"]["TURA_SESSION_REASONING_EFFORT"],
@@ -525,6 +526,7 @@ async fn gateway_prompt_business_flow_applies_workspace_runtime_config_to_router
         request["payload"]["payload"]["agent"],
         "workspace-config-agent"
     );
+    assert_eq!(request["payload"]["payload"]["session_type"], "coding");
     assert_eq!(
         request["payload"]["payload"]["worker_env"]["TURA_SESSION_LANGUAGE"],
         "zh-CN"

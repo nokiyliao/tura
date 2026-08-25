@@ -1,0 +1,1535 @@
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use tura_llm_rust::official_codex_app_server::{
+    load_thread_association, run_official_codex_turn, CodexAppServerExecutable,
+    CodexExecutionLedger, CodexObservedCommandAccess, CodexObservedToolEffectState,
+    CodexReadOnlyCommandObservation, CodexReadOnlyEffectObservation, OfficialCodexServerRequest,
+    OfficialCodexServerRequestFuture, OfficialCodexServerRequestHandler, OfficialCodexTurnRequest,
+};
+
+const UNCLAIMED_READ_ONLY_COMMAND_LINE: &str = r#"rg -n -A18 -B6 "struct TurnRequestContext|TurnRequestContext \{" crates/provider/src/official_codex_app_server.rs"#;
+const UNCLAIMED_READ_ONLY_CLAIM_IDENTITY: &str = "runtime-official-1:call-original:step:1:index:0";
+
+fn read_only_claim_identity(
+    execution_id: &str,
+    effective_step: u64,
+    enumerated_index: impl std::fmt::Display,
+    binding_id: Option<&str>,
+) -> String {
+    match binding_id {
+        Some(binding_id)
+            if binding_id == execution_id
+                || binding_id.starts_with(&format!("{execution_id}:")) =>
+        {
+            binding_id.to_string()
+        }
+        Some(binding_id) => format!("{execution_id}:{binding_id}"),
+        None => format!("{execution_id}:step:{effective_step}:index:{enumerated_index}"),
+    }
+}
+
+fn encode_read_only_receipt_identity_for_test(identity: &str) -> String {
+    if identity.is_empty() {
+        return "command_run".to_string();
+    }
+    let mut encoded = String::new();
+    for character in identity.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+            encoded.push(character);
+        } else {
+            encoded.push_str(&format!("_x{:x}_", u32::from(character)));
+        }
+    }
+    encoded
+}
+
+fn verify_read_only_artifact_absent_for_test(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(format!(
+            "read-only recovery artifact exists: {}",
+            path.display()
+        )),
+        Err(error) => Err(format!(
+            "failed to prove read-only recovery artifact absence at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn main() {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "app-server") {
+        fake_app_server(&args);
+        return;
+    }
+    if args.iter().any(|arg| arg == "--version") {
+        println!("codex-cli 9.9.9-test");
+        return;
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        run_hostile_flow().await;
+        run_interrupted_effect_recovery().await;
+    });
+}
+
+async fn run_hostile_flow() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let session_directory = root.path().join("session");
+    fs::create_dir_all(&session_directory).expect("session directory");
+    let auth_path = root.path().join("home").join(".codex").join("auth.json");
+    fs::create_dir_all(&auth_path).expect("unreadable auth fixture");
+    let _home = EnvGuard::set("HOME", auth_path.parent().unwrap().parent().unwrap());
+
+    let first_capture = root.path().join("first.jsonl");
+    let first = run_official_codex_turn(
+        request(
+            &session_directory,
+            &first_capture,
+            vec![
+                json!({"role": "system", "content": "Use the governed Tura tools."}),
+                json!({
+                    "role": "user",
+                    "content": "first official turn",
+                    "previous_response_id": "resp_syntactically_valid_but_nonexistent"
+                }),
+            ],
+        ),
+        None,
+    )
+    .await
+    .expect("first official turn");
+
+    assert_eq!(first.content, Value::String("official reply".to_string()));
+    assert_eq!(first.association.thread_id, "thread-official-1");
+    assert_eq!(first.association.codex_session_id, "session-official-1");
+    assert_eq!(
+        first.association.executable_identity.canonical_path,
+        fs::canonicalize(std::env::current_exe().expect("test executable"))
+            .expect("canonical executable")
+    );
+    assert_eq!(
+        first.association.executable_identity.version,
+        "codex-cli 9.9.9-test"
+    );
+    assert_eq!(
+        first.association.executable_identity.sha256,
+        format!(
+            "{:x}",
+            Sha256::digest(fs::read(std::env::current_exe().unwrap()).expect("executable bytes"))
+        )
+    );
+    assert_eq!(first.usage.as_ref().unwrap().input_tokens, Some(17));
+    assert_eq!(
+        first.usage.as_ref().unwrap().monetary_cost_authority,
+        "unknown"
+    );
+
+    let persisted = load_thread_association(&session_directory, "tura-session-1")
+        .expect("association read")
+        .expect("association present");
+    assert_eq!(persisted, first.association);
+    assert!(persisted.active_turn_id.is_none());
+    assert!(
+        load_thread_association(&session_directory, "tura-session-2")
+            .expect("independent association read")
+            .is_none(),
+        "a terminal session association must not capture a successor in the same workspace"
+    );
+
+    let first_lines = captured_messages(&first_capture);
+    assert_eq!(
+        methods(&first_lines),
+        ["initialize", "initialized", "thread/start", "turn/start",]
+    );
+    assert_eq!(first_lines[0]["params"]["clientInfo"]["name"], "tura");
+    assert_eq!(first_lines[0]["params"]["clientInfo"]["title"], "Tura");
+    let first_thread_start = first_lines
+        .iter()
+        .find(|message| message.get("method").and_then(Value::as_str) == Some("thread/start"))
+        .expect("first thread/start");
+    assert_eq!(first_thread_start["params"]["approvalPolicy"], "on-request");
+    assert_eq!(first_thread_start["params"]["sandbox"], "workspace-write");
+    let first_wire = first_lines
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!first_wire.contains("previous_response_id"), "{first_wire}");
+    assert!(
+        !first_wire.contains("resp_syntactically_valid_but_nonexistent"),
+        "{first_wire}"
+    );
+    assert!(
+        !first_wire.contains("chatgpt.com/backend-api"),
+        "{first_wire}"
+    );
+    assert!(!first_wire.contains("auth.json"), "{first_wire}");
+
+    let unrestricted_directory = root.path().join("unrestricted-session");
+    fs::create_dir_all(&unrestricted_directory).expect("unrestricted session directory");
+    let unrestricted_capture = root.path().join("unrestricted.jsonl");
+    let mut unrestricted_request = request(
+        &unrestricted_directory,
+        &unrestricted_capture,
+        vec![json!({"role": "user", "content": "authorized unrestricted turn"})],
+    );
+    unrestricted_request.disable_permission_restrictions = true;
+    run_official_codex_turn(unrestricted_request, None)
+        .await
+        .expect("authorized unrestricted turn");
+    let unrestricted_messages = captured_messages(&unrestricted_capture);
+    let unrestricted_thread_start = unrestricted_messages
+        .iter()
+        .find(|message| message.get("method").and_then(Value::as_str) == Some("thread/start"))
+        .expect("unrestricted thread/start");
+    assert_eq!(
+        unrestricted_thread_start["params"]["approvalPolicy"],
+        "never"
+    );
+    assert_eq!(
+        unrestricted_thread_start["params"]["sandbox"],
+        "danger-full-access"
+    );
+
+    let second_capture = root.path().join("second.jsonl");
+    let second = run_official_codex_turn(
+        request(
+            &session_directory,
+            &second_capture,
+            vec![json!({"role": "user", "content": "second official turn"})],
+        ),
+        None,
+    )
+    .await
+    .expect("resumed official turn");
+    assert_eq!(second.association.thread_id, "thread-official-1");
+
+    let second_lines = captured_messages(&second_capture);
+    assert_eq!(
+        methods(&second_lines),
+        [
+            "initialize",
+            "initialized",
+            "thread/resume",
+            "thread/read",
+            "turn/start",
+        ]
+    );
+    assert_eq!(second_lines[2]["params"]["threadId"], "thread-official-1");
+    assert_eq!(second_lines[4]["params"]["threadId"], "thread-official-1");
+
+    let recovery_directory = root.path().join("recovery-session");
+    fs::create_dir_all(&recovery_directory).expect("recovery session directory");
+    let disconnect_capture = root.path().join("disconnect.jsonl");
+    let disconnect_error = run_official_codex_turn(
+        request(
+            &recovery_directory,
+            &disconnect_capture,
+            vec![json!({"role": "user", "content": "recover exactly once"})],
+        ),
+        None,
+    )
+    .await
+    .expect_err("disconnect before turn/start response");
+    assert!(disconnect_error.to_string().contains("closed stdout"));
+    let uncertain = load_thread_association(&recovery_directory, "tura-session-1")
+        .expect("uncertain association read")
+        .expect("uncertain association present");
+    assert!(uncertain.active_turn_id.is_none());
+    assert_eq!(
+        uncertain.turn_attempt.as_ref().unwrap().state,
+        tura_llm_rust::official_codex_app_server::CodexTurnSubmissionState::Prepared
+    );
+
+    let recovery_capture = root.path().join("recover.jsonl");
+    let recovered = run_official_codex_turn(
+        request(
+            &recovery_directory,
+            &recovery_capture,
+            vec![json!({"role": "user", "content": "recover exactly once"})],
+        ),
+        None,
+    )
+    .await
+    .expect("authoritative recovery");
+    assert_eq!(
+        recovered.content,
+        Value::String("recovered official reply".to_string())
+    );
+    assert!(recovered.association.turn_attempt.is_none());
+    assert!(recovered.association.active_turn_id.is_none());
+    assert_eq!(
+        methods(&captured_messages(&recovery_capture)),
+        ["initialize", "initialized", "thread/resume", "thread/read"]
+    );
+
+    assert_changed_mission_rejected(root.path(), "messages", |request| {
+        request.messages[0]["content"] = json!("changed prior assistant context");
+    })
+    .await;
+    assert_changed_mission_rejected(root.path(), "model", |request| {
+        request.model = "different-model".to_string();
+    })
+    .await;
+    assert_changed_mission_rejected(root.path(), "tool", |request| {
+        request.dynamic_tools = vec![json!({
+            "name": "command_run",
+            "description": "changed tool contract",
+            "inputSchema": {"type": "object"}
+        })];
+    })
+    .await;
+    assert_changed_mission_rejected(root.path(), "permission", |request| {
+        request.disable_permission_restrictions = true;
+    })
+    .await;
+    assert_changed_mission_rejected(root.path(), "executable", |request| {
+        request
+            .executable
+            .prefix_args
+            .push("--changed-executable-semantics".to_string());
+    })
+    .await;
+
+    println!(
+        "official_codex_app_server_flow: exact stdio identity and exactly-once recovery passed"
+    );
+}
+
+async fn assert_changed_mission_rejected(
+    root: &Path,
+    scenario: &str,
+    mutate: impl FnOnce(&mut OfficialCodexTurnRequest),
+) {
+    let session_directory = root.join(format!("{scenario}-mission-session"));
+    fs::create_dir_all(&session_directory).expect("mission session directory");
+    let messages = || {
+        vec![
+            json!({"role": "assistant", "content": "prior assistant context"}),
+            json!({"role": "user", "content": "same canonical user input"}),
+        ]
+    };
+    run_official_codex_turn(
+        request(
+            &session_directory,
+            &root.join(format!("disconnect-{scenario}.jsonl")),
+            messages(),
+        ),
+        None,
+    )
+    .await
+    .expect_err("mission setup disconnect");
+
+    let changed_capture = root.join(format!("changed-{scenario}.jsonl"));
+    let mut changed = request(&session_directory, &changed_capture, messages());
+    mutate(&mut changed);
+    let error = run_official_codex_turn(changed, None)
+        .await
+        .expect_err("changed canonical mission must fail closed");
+    assert!(
+        error.to_string().contains("different input"),
+        "{scenario}: {error}"
+    );
+    assert_eq!(
+        methods(&captured_messages(&changed_capture)),
+        ["initialize", "initialized", "thread/resume", "thread/read"]
+    );
+}
+
+async fn run_interrupted_effect_recovery() {
+    let root = tempfile::tempdir().expect("recovery tempdir");
+
+    let policy_directory = root.path().join("policy-denial-session");
+    fs::create_dir_all(&policy_directory).expect("policy-denial session directory");
+    let policy_count = root.path().join("policy-denial-execution-count");
+    let mut policy_handler = ReceiptHandler::policy_denial(&policy_directory, &policy_count);
+    let policy_capture = root.path().join("policy").join("delivered-failure.jsonl");
+    fs::create_dir_all(policy_capture.parent().unwrap()).expect("policy capture directory");
+    let delivered_policy_denial = run_official_codex_turn(
+        effect_request(
+            &policy_directory,
+            &policy_capture,
+            "observe a deterministic J-Space policy denial",
+        ),
+        Some(&mut policy_handler),
+    )
+    .await
+    .expect("deterministic policy denial must remain deliverable without a receipt");
+    assert_eq!(
+        delivered_policy_denial.content,
+        Value::String("failed command observed".to_string())
+    );
+    assert_eq!(execution_count(&policy_count), 0);
+    assert!(!policy_directory.join(".tura/run/command_receipts").exists());
+    assert!(delivered_policy_denial
+        .association
+        .observed_tool_effects
+        .is_empty());
+
+    let failed_directory = root.path().join("delivered-failure-session");
+    fs::create_dir_all(&failed_directory).expect("delivered-failure session directory");
+    let failed_count = root.path().join("delivered-failure-execution-count");
+    let mut failed_handler = ReceiptHandler::failing(&failed_directory, &failed_count);
+    let delivered_failure = run_official_codex_turn(
+        effect_request(
+            &failed_directory,
+            &root.path().join("delivered-failure.jsonl"),
+            "observe a known read-only command miss",
+        ),
+        Some(&mut failed_handler),
+    )
+    .await
+    .expect("known failed command result must remain deliverable");
+    assert_eq!(
+        delivered_failure.content,
+        Value::String("failed command observed".to_string())
+    );
+    assert_eq!(execution_count(&failed_count), 1);
+    assert!(delivered_failure
+        .association
+        .observed_tool_effects
+        .is_empty());
+
+    let same_directory = root.path().join("same-input-session");
+    fs::create_dir_all(&same_directory).expect("same-input session directory");
+    let same_count = root.path().join("same-input-execution-count");
+    let mut same_handler = ReceiptHandler::new(&same_directory, &same_count, false);
+    let lost_error = run_official_codex_turn(
+        effect_request(
+            &same_directory,
+            &root.path().join("effect-interrupt.jsonl"),
+            "recover interrupted mission",
+        ),
+        Some(&mut same_handler),
+    )
+    .await
+    .expect_err("provider loss after completed command receipt");
+    assert!(lost_error.to_string().contains("closed stdout"));
+    assert_eq!(execution_count(&same_count), 1);
+
+    let recovery_capture = root.path().join("effect-recover.jsonl");
+    let mut recovery_request = effect_request(
+        &same_directory,
+        &recovery_capture,
+        "recover interrupted mission",
+    );
+    recovery_request.runtime_id = "runtime-official-restarted".to_string();
+    let recovered = run_official_codex_turn(recovery_request, Some(&mut same_handler))
+        .await
+        .expect("same-input interrupted recovery");
+    assert_eq!(
+        recovered.content,
+        Value::String("recovered after provider loss".to_string())
+    );
+    assert_eq!(recovered.association.thread_id, "thread-recovered-1");
+    assert_eq!(execution_count(&same_count), 1, "command executed twice");
+    assert!(recovered.association.interrupted_recovery.is_none());
+    assert!(recovered.association.observed_tool_effects.is_empty());
+    let recovery_messages = captured_messages(&recovery_capture);
+    assert!(recovery_messages.iter().any(|message| {
+        message.get("method").and_then(Value::as_str) == Some("thread/start")
+            && message["params"]["model"] == "gpt-5.6-sol"
+    }));
+    assert!(recovery_messages.iter().any(|message| {
+        message.get("method").and_then(Value::as_str) == Some("turn/start")
+            && message["params"]["threadId"] == "thread-recovered-1"
+    }));
+    assert!(!recovery_messages
+        .iter()
+        .any(|message| message.to_string().contains("previous_response_id")));
+
+    let completed_directory = root.path().join("completed-read-only-session");
+    fs::create_dir_all(&completed_directory).expect("completed read-only session directory");
+    let completed_count = root.path().join("completed-read-only-execution-count");
+    let mut completed_handler =
+        ReceiptHandler::completed_response_lost(&completed_directory, &completed_count);
+    run_official_codex_turn(
+        effect_request(
+            &completed_directory,
+            &root
+                .path()
+                .join("completed-read-only-effect-interrupt.jsonl"),
+            "recover a durably completed read-only command",
+        ),
+        Some(&mut completed_handler),
+    )
+    .await
+    .expect_err("provider transport must lose the completed read-only response");
+    assert_eq!(execution_count(&completed_count), 1);
+    let completed = load_only_execution_ledger(&completed_directory);
+    assert_eq!(completed.effects.len(), 1);
+    assert!(completed.effects[0].response.is_none());
+    let completed_receipt_path =
+        completed_directory
+            .join(".tura/run/command_receipts")
+            .join(format!(
+                "{}.json",
+                encode_read_only_receipt_identity_for_test(UNCLAIMED_READ_ONLY_CLAIM_IDENTITY)
+            ));
+    assert!(completed_receipt_path.is_file());
+
+    let completed_recovery_capture = root.path().join("completed-read-only-effect-recover.jsonl");
+    let completed_recovered = run_official_codex_turn(
+        effect_request(
+            &completed_directory,
+            &completed_recovery_capture,
+            "recover a durably completed read-only command",
+        ),
+        Some(&mut completed_handler),
+    )
+    .await
+    .expect("completed read-only receipt must recover without replay");
+    assert_eq!(
+        completed_recovered.content,
+        Value::String("recovered after provider loss".to_string())
+    );
+    assert_eq!(
+        execution_count(&completed_count),
+        1,
+        "command executed twice"
+    );
+    assert!(completed_recovered
+        .association
+        .observed_tool_effects
+        .is_empty());
+    assert!(captured_messages(&completed_recovery_capture)
+        .iter()
+        .any(|message| {
+            message
+                .to_string()
+                .contains("reconstructed_from_durable_terminal_receipt")
+        }));
+
+    let unclaimed_directory = root.path().join("unclaimed-read-only-session");
+    fs::create_dir_all(&unclaimed_directory).expect("unclaimed read-only session directory");
+    let unclaimed_count = root.path().join("unclaimed-read-only-observation-count");
+    let mut unclaimed_handler = ReceiptHandler::unclaimed(&unclaimed_directory, &unclaimed_count);
+    run_official_codex_turn(
+        effect_request(
+            &unclaimed_directory,
+            &root.path().join("unclaimed-effect-interrupt.jsonl"),
+            "recover an unclaimed read-only observation",
+        ),
+        Some(&mut unclaimed_handler),
+    )
+    .await
+    .expect_err("provider loss after observing an unclaimed read-only command");
+    let unclaimed = load_only_execution_ledger(&unclaimed_directory);
+    assert_eq!(unclaimed.effects.len(), 1);
+    let unclaimed_effect = &unclaimed.effects[0];
+    assert_eq!(
+        unclaimed_effect.state,
+        CodexObservedToolEffectState::Observed
+    );
+    assert!(unclaimed_effect.response.is_none());
+    let unclaimed_observation = unclaimed_effect
+        .read_only_observation
+        .as_ref()
+        .expect("unclaimed read-only observation");
+    assert_eq!(
+        unclaimed_observation.commands[0].claim_identity,
+        UNCLAIMED_READ_ONLY_CLAIM_IDENTITY
+    );
+    assert!(unclaimed_effect.command_receipts.is_empty());
+    let unclaimed_receipt_directory = unclaimed_directory.join(".tura/run/command_receipts");
+    verify_read_only_artifact_absent_for_test(&unclaimed_receipt_directory)
+        .expect("unclaimed receipt directory absent");
+    assert_eq!(execution_count(&unclaimed_count), 1);
+    fs::create_dir_all(&unclaimed_receipt_directory).expect("unclaimed receipt directory");
+    fs::write(
+        unclaimed_receipt_directory.join("unrelated-receipt.json"),
+        "{}",
+    )
+    .expect("unrelated receipt write");
+
+    let unclaimed_recovered = run_official_codex_turn(
+        effect_request(
+            &unclaimed_directory,
+            &root.path().join("unclaimed-effect-recover.jsonl"),
+            "recover an unclaimed read-only observation",
+        ),
+        Some(&mut unclaimed_handler),
+    )
+    .await
+    .expect("unclaimed read-only observation must recover as terminal zero-mutation");
+    assert_eq!(
+        unclaimed_recovered.content,
+        Value::String("recovered after provider loss".to_string())
+    );
+    assert_eq!(
+        execution_count(&unclaimed_count),
+        1,
+        "unclaimed read-only command was replayed"
+    );
+    assert!(unclaimed_recovered
+        .association
+        .observed_tool_effects
+        .is_empty());
+
+    for (case_name, receipt_suffix) in [("claim", ".claim.json"), ("terminal", ".json")] {
+        let blocked_directory = root
+            .path()
+            .join(format!("unclaimed-read-only-{case_name}-session"));
+        fs::create_dir_all(&blocked_directory).expect("blocked unclaimed session directory");
+        let blocked_count = root
+            .path()
+            .join(format!("unclaimed-read-only-{case_name}-count"));
+        let mut blocked_handler = ReceiptHandler::unclaimed(&blocked_directory, &blocked_count);
+        run_official_codex_turn(
+            effect_request(
+                &blocked_directory,
+                &root
+                    .path()
+                    .join(format!("unclaimed-effect-{case_name}-interrupt.jsonl")),
+                "recover an unclaimed read-only observation",
+            ),
+            Some(&mut blocked_handler),
+        )
+        .await
+        .expect_err("provider loss after observing a blocked unclaimed command");
+        assert_eq!(execution_count(&blocked_count), 1);
+        let receipt_directory = blocked_directory.join(".tura/run/command_receipts");
+        fs::create_dir_all(&receipt_directory).expect("blocked receipt directory");
+        fs::write(
+            receipt_directory.join(format!(
+                "{}{receipt_suffix}",
+                encode_read_only_receipt_identity_for_test(UNCLAIMED_READ_ONLY_CLAIM_IDENTITY)
+            )),
+            "{}",
+        )
+        .expect("blocking receipt write");
+        let blocked_error = run_official_codex_turn(
+            effect_request(
+                &blocked_directory,
+                &root
+                    .path()
+                    .join(format!("unclaimed-effect-{case_name}-recover.jsonl")),
+                "recover an unclaimed read-only observation",
+            ),
+            Some(&mut blocked_handler),
+        )
+        .await
+        .expect_err("claimed unclaimed observation must fail closed");
+        assert!(blocked_error
+            .to_string()
+            .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT"));
+        assert_eq!(execution_count(&blocked_count), 1);
+    }
+
+    let conflict_directory = root.path().join("conflicting-effect-session");
+    fs::create_dir_all(&conflict_directory).expect("conflicting-effect session directory");
+    let conflict_count = root.path().join("conflicting-effect-execution-count");
+    let mut conflict_handler = ReceiptHandler::new(&conflict_directory, &conflict_count, false);
+    run_official_codex_turn(
+        effect_request(
+            &conflict_directory,
+            &root.path().join("conflict-interrupt.jsonl"),
+            "conflicting effect mission",
+        ),
+        Some(&mut conflict_handler),
+    )
+    .await
+    .expect_err("conflicting-effect provider loss");
+    let conflict_error = run_official_codex_turn(
+        effect_request(
+            &conflict_directory,
+            &root.path().join("conflict-recover.jsonl"),
+            "conflicting effect mission",
+        ),
+        Some(&mut conflict_handler),
+    )
+    .await
+    .expect_err("conflicting recovery effect must fail closed");
+    assert!(conflict_error
+        .to_string()
+        .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_CONFLICTING_EFFECT"));
+    assert_eq!(execution_count(&conflict_count), 1);
+
+    let changed_directory = root.path().join("changed-input-session");
+    fs::create_dir_all(&changed_directory).expect("changed-input session directory");
+    let changed_count = root.path().join("changed-input-execution-count");
+    let mut changed_handler = ReceiptHandler::new(&changed_directory, &changed_count, false);
+    run_official_codex_turn(
+        effect_request(
+            &changed_directory,
+            &root.path().join("changed-interrupt.jsonl"),
+            "canonical mission",
+        ),
+        Some(&mut changed_handler),
+    )
+    .await
+    .expect_err("changed-input provider loss");
+    let changed_error = run_official_codex_turn(
+        effect_request(
+            &changed_directory,
+            &root.path().join("changed-recover.jsonl"),
+            "different canonical mission",
+        ),
+        Some(&mut changed_handler),
+    )
+    .await
+    .expect_err("changed input must fail closed");
+    assert!(changed_error.to_string().contains("different input"));
+    assert_eq!(execution_count(&changed_count), 1);
+
+    let uncertain_directory = root.path().join("uncertain-effect-session");
+    fs::create_dir_all(&uncertain_directory).expect("uncertain-effect session directory");
+    let uncertain_count = root.path().join("uncertain-effect-execution-count");
+    let mut uncertain_handler = ReceiptHandler::new(&uncertain_directory, &uncertain_count, true);
+    let uncertain_initial = run_official_codex_turn(
+        effect_request(
+            &uncertain_directory,
+            &root.path().join("uncertain-interrupt.jsonl"),
+            "uncertain effect mission",
+        ),
+        Some(&mut uncertain_handler),
+    )
+    .await
+    .expect_err("uncertain effect must not be delivered");
+    assert!(uncertain_initial
+        .to_string()
+        .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT"));
+    let uncertain_recovery = run_official_codex_turn(
+        effect_request(
+            &uncertain_directory,
+            &root.path().join("uncertain-recover.jsonl"),
+            "uncertain effect mission",
+        ),
+        Some(&mut uncertain_handler),
+    )
+    .await
+    .expect_err("uncertain effect recovery must fail closed");
+    assert!(uncertain_recovery
+        .to_string()
+        .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT"));
+    assert_eq!(execution_count(&uncertain_count), 1);
+
+    println!(
+        "official_codex_app_server_flow: interrupted receipt recovery and fail-closed gates passed"
+    );
+}
+
+struct ReceiptHandler {
+    session_directory: PathBuf,
+    execution_count_path: PathBuf,
+    uncertain: bool,
+    failed: bool,
+    unclaimed: bool,
+    observe_read_only: bool,
+    drop_response_after_receipt: bool,
+    policy_denial: bool,
+}
+
+impl ReceiptHandler {
+    fn new(session_directory: &Path, execution_count_path: &Path, uncertain: bool) -> Self {
+        Self {
+            session_directory: session_directory.to_path_buf(),
+            execution_count_path: execution_count_path.to_path_buf(),
+            uncertain,
+            failed: false,
+            unclaimed: false,
+            observe_read_only: false,
+            drop_response_after_receipt: false,
+            policy_denial: false,
+        }
+    }
+
+    fn failing(session_directory: &Path, execution_count_path: &Path) -> Self {
+        Self {
+            session_directory: session_directory.to_path_buf(),
+            execution_count_path: execution_count_path.to_path_buf(),
+            uncertain: false,
+            failed: true,
+            unclaimed: false,
+            observe_read_only: false,
+            drop_response_after_receipt: false,
+            policy_denial: false,
+        }
+    }
+
+    fn unclaimed(session_directory: &Path, execution_count_path: &Path) -> Self {
+        Self {
+            session_directory: session_directory.to_path_buf(),
+            execution_count_path: execution_count_path.to_path_buf(),
+            uncertain: false,
+            failed: false,
+            unclaimed: true,
+            observe_read_only: true,
+            drop_response_after_receipt: false,
+            policy_denial: false,
+        }
+    }
+
+    fn completed_response_lost(session_directory: &Path, execution_count_path: &Path) -> Self {
+        Self {
+            session_directory: session_directory.to_path_buf(),
+            execution_count_path: execution_count_path.to_path_buf(),
+            uncertain: false,
+            failed: false,
+            unclaimed: false,
+            observe_read_only: true,
+            drop_response_after_receipt: true,
+            policy_denial: false,
+        }
+    }
+
+    fn policy_denial(session_directory: &Path, execution_count_path: &Path) -> Self {
+        Self {
+            session_directory: session_directory.to_path_buf(),
+            execution_count_path: execution_count_path.to_path_buf(),
+            uncertain: false,
+            failed: false,
+            unclaimed: false,
+            observe_read_only: false,
+            drop_response_after_receipt: false,
+            policy_denial: true,
+        }
+    }
+}
+
+impl OfficialCodexServerRequestHandler for ReceiptHandler {
+    fn load_execution_ledger(
+        &mut self,
+        canonical_input_sha256: &str,
+    ) -> Result<Option<CodexExecutionLedger>, String> {
+        let path = self
+            .session_directory
+            .join(".tura/run/effect_ledgers")
+            .join(format!("{canonical_input_sha256}.json"));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn persist_execution_ledger(&mut self, ledger: &CodexExecutionLedger) -> Result<(), String> {
+        let directory = self.session_directory.join(".tura/run/effect_ledgers");
+        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        fs::write(
+            directory.join(format!("{}.json", ledger.canonical_input_sha256)),
+            serde_json::to_vec_pretty(ledger).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn observe_read_only_effect(
+        &mut self,
+        request: &OfficialCodexServerRequest,
+    ) -> Result<Option<CodexReadOnlyEffectObservation>, String> {
+        if !self.observe_read_only
+            || request.method != "item/tool/call"
+            || request.params.get("tool").and_then(Value::as_str) != Some("command_run")
+        {
+            return Ok(None);
+        }
+        let Some(tool_call_id) = request.params.get("callId").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(commands) = request
+            .params
+            .get("arguments")
+            .and_then(|arguments| arguments.get("commands"))
+            .and_then(Value::as_array)
+        else {
+            return Ok(None);
+        };
+        if commands.len() != 1 {
+            return Ok(None);
+        }
+        let command = &commands[0];
+        let Some(command_type) = command.get("command_type").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(command_line) = command.get("command_line").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        if command_type != "zsh" || command_line != UNCLAIMED_READ_ONLY_COMMAND_LINE {
+            return Ok(None);
+        }
+        let enumerated_index = 0;
+        let effective_step = command
+            .get("step")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1);
+        let binding_id = command
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let original_runtime_id = "runtime-official-1".to_string();
+        let tool_call_id = tool_call_id.to_string();
+        let execution_id = format!("{original_runtime_id}:{tool_call_id}");
+        let claim_identity = read_only_claim_identity(
+            &execution_id,
+            effective_step,
+            enumerated_index,
+            binding_id.as_deref(),
+        );
+        if self.unclaimed {
+            let count = execution_count(&self.execution_count_path) + 1;
+            fs::write(&self.execution_count_path, count.to_string()).map_err(|error| {
+                format!(
+                    "failed to record unclaimed read-only observation count at {}: {error}",
+                    self.execution_count_path.display()
+                )
+            })?;
+        }
+        Ok(Some(CodexReadOnlyEffectObservation {
+            original_runtime_id,
+            tool_call_id,
+            execution_id,
+            commands: vec![CodexReadOnlyCommandObservation {
+                access: CodexObservedCommandAccess::ReadOnly,
+                command_type: command_type.to_string(),
+                command_line: command_line.to_string(),
+                enumerated_index,
+                effective_step,
+                binding_id,
+                claim_identity,
+            }],
+        }))
+    }
+
+    fn verify_never_claimed_read_only_effect(
+        &mut self,
+        observation: &CodexReadOnlyEffectObservation,
+    ) -> Result<(), String> {
+        if !self.unclaimed {
+            return Err(
+                "read-only absence verification requires the unclaimed handler".to_string(),
+            );
+        }
+        if observation.original_runtime_id != "runtime-official-1"
+            || observation.tool_call_id != "call-original"
+        {
+            return Err("read-only observation runtime or tool-call identity drifted".to_string());
+        }
+        let [command] = observation.commands.as_slice() else {
+            return Err(
+                "read-only absence verification requires exactly one observed command".to_string(),
+            );
+        };
+        if !matches!(&command.access, CodexObservedCommandAccess::ReadOnly) {
+            return Err("observed command is not classified read-only".to_string());
+        }
+        if command.command_type != "zsh"
+            || command.command_line != UNCLAIMED_READ_ONLY_COMMAND_LINE
+            || command.enumerated_index != 0
+            || command.effective_step != 1
+        {
+            return Err("read-only observed command identity drifted".to_string());
+        }
+        let execution_id = format!(
+            "{}:{}",
+            observation.original_runtime_id, observation.tool_call_id
+        );
+        let claim_identity = read_only_claim_identity(
+            &execution_id,
+            command.effective_step,
+            command.enumerated_index,
+            command.binding_id.as_deref(),
+        );
+        if observation.execution_id != execution_id {
+            return Err("read-only execution identity drifted".to_string());
+        }
+        if command.claim_identity != claim_identity {
+            return Err("read-only command claim identity drifted".to_string());
+        }
+        let encoded_identity = encode_read_only_receipt_identity_for_test(&claim_identity);
+        let receipt_directory = self
+            .session_directory
+            .join(".tura")
+            .join("run")
+            .join("command_receipts");
+        verify_read_only_artifact_absent_for_test(
+            &receipt_directory.join(format!("{encoded_identity}.claim.json")),
+        )?;
+        verify_read_only_artifact_absent_for_test(
+            &receipt_directory.join(format!("{encoded_identity}.json")),
+        )
+    }
+
+    fn verify_completed_read_only_effect(
+        &mut self,
+        observation: &CodexReadOnlyEffectObservation,
+    ) -> Result<(), String> {
+        if !self.observe_read_only || self.unclaimed {
+            return Err("completed read-only verification is unavailable".to_string());
+        }
+        if observation.original_runtime_id != "runtime-official-1"
+            || observation.tool_call_id != "call-original"
+            || observation.execution_id != "runtime-official-1:call-original"
+        {
+            return Err("completed read-only observation identity drifted".to_string());
+        }
+        let [command] = observation.commands.as_slice() else {
+            return Err("completed read-only verification requires one command".to_string());
+        };
+        if !matches!(&command.access, CodexObservedCommandAccess::ReadOnly)
+            || command.command_type != "zsh"
+            || command.command_line != UNCLAIMED_READ_ONLY_COMMAND_LINE
+            || command.claim_identity != UNCLAIMED_READ_ONLY_CLAIM_IDENTITY
+        {
+            return Err("completed read-only command identity drifted".to_string());
+        }
+        Ok(())
+    }
+
+    fn handle<'a>(
+        &'a mut self,
+        request: OfficialCodexServerRequest,
+    ) -> OfficialCodexServerRequestFuture<'a> {
+        Box::pin(async move {
+            assert_eq!(request.method, "item/tool/call");
+            assert_eq!(request.params["tool"], "command_run");
+            if self.unclaimed {
+                return Err("simulated interruption before command claim".to_string());
+            }
+            if self.policy_denial {
+                let output = json!({
+                    "results": [{
+                        "success": false,
+                        "command_type": "jspace",
+                        "error": "JSPACE_COMMAND_DENIED: command does not match an admitted prefix",
+                        "jspace_error_code": "JSPACE_COMMAND_DENIED",
+                        "operation": "command",
+                        "target": "touch /tmp/blocked",
+                        "effect_state": "not_started",
+                        "mutation_count": 0,
+                        "authority_effect": "none",
+                        "delivery_state": "deterministic_policy_denial",
+                        "replayable": true,
+                    }]
+                });
+                return Ok(json!({
+                    "contentItems": [{"type": "inputText", "text": output.to_string()}],
+                    "success": true,
+                }));
+            }
+            let count = execution_count(&self.execution_count_path) + 1;
+            fs::write(&self.execution_count_path, count.to_string())
+                .expect("execution count write");
+            let receipt_directory = self
+                .session_directory
+                .join(".tura")
+                .join("run")
+                .join("command_receipts");
+            fs::create_dir_all(&receipt_directory).expect("receipt directory");
+            let receipt_path = if self.observe_read_only {
+                receipt_directory.join(format!(
+                    "{}.json",
+                    encode_read_only_receipt_identity_for_test(UNCLAIMED_READ_ONLY_CLAIM_IDENTITY)
+                ))
+            } else {
+                receipt_directory.join("effect-command.json")
+            };
+            let receipt = json!({
+                "schema_version": "tura_command_terminal_receipt_v1",
+                "call_id": "runtime-official-1:call-original:step:1:index:0",
+                "pid": 4242,
+                "terminal_state": if self.failed {"failed"} else {"completed"},
+                "failure_class": if self.failed {"workload_exit_nonzero"} else {"none"},
+                "termination_origin": "workload",
+                "exit_code": if self.failed {1} else {0},
+                "wall_time_ms": 10,
+                "wall_timeout_ms": 300000,
+                "stall_timeout_ms": null,
+                "outcome": "known",
+                "process_reaped": true,
+                "process_group_empty": true,
+                "termination_proven": true,
+                "authority_effect": "none",
+                "authoritative_publication": "unproven",
+                "staging_authority": "none",
+                "retry_safe": false,
+                "auto_retry_allowed": false,
+                "reconcile_required": self.uncertain || self.failed,
+                "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof"
+            });
+            fs::write(
+                &receipt_path,
+                serde_json::to_vec_pretty(&receipt).expect("receipt encode"),
+            )
+            .expect("receipt write");
+            if self.drop_response_after_receipt {
+                self.drop_response_after_receipt = false;
+                return Err("simulated response loss after durable read-only receipt".to_string());
+            }
+            let output = json!({
+                "results": [{
+                    "command_type": "task_status",
+                    "output": {"status": "doing"},
+                    "step": 1,
+                    "success": true,
+                }, {
+                    "command_type": "zsh",
+                    "output": {
+                        "exit_code": if self.failed {1} else {0},
+                        "terminal_receipt": receipt,
+                        "terminal_receipt_path": receipt_path,
+                    },
+                    "step": 1,
+                    "success": !self.failed,
+                }]
+            });
+            Ok(json!({
+                "contentItems": [{"type": "inputText", "text": output.to_string()}],
+                "success": true,
+            }))
+        })
+    }
+}
+
+fn effect_request(
+    session_directory: &Path,
+    capture: &Path,
+    user_input: &str,
+) -> OfficialCodexTurnRequest {
+    let mut request = request(
+        session_directory,
+        capture,
+        vec![json!({"role": "user", "content": user_input})],
+    );
+    request.dynamic_tools = vec![json!({
+        "name": "command_run",
+        "description": "governed command runner",
+        "inputSchema": {"type": "object"}
+    })];
+    request
+}
+
+fn execution_count(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn load_only_execution_ledger(session_directory: &Path) -> CodexExecutionLedger {
+    let directory = session_directory.join(".tura/run/effect_ledgers");
+    let paths = fs::read_dir(&directory)
+        .expect("effect ledger directory")
+        .map(|entry| entry.expect("effect ledger entry").path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    let [path] = paths.as_slice() else {
+        panic!("expected exactly one effect ledger, got {paths:?}");
+    };
+    serde_json::from_slice(&fs::read(path).expect("effect ledger bytes"))
+        .expect("valid effect ledger")
+}
+
+fn request(
+    session_directory: &Path,
+    capture: &Path,
+    messages: Vec<Value>,
+) -> OfficialCodexTurnRequest {
+    // SAFETY: this standalone integration harness runs provider attempts sequentially.
+    unsafe { std::env::set_var("TURA_FAKE_CODEX_CAPTURE", capture) };
+    OfficialCodexTurnRequest {
+        tura_session_id: "tura-session-1".to_string(),
+        runtime_id: "runtime-official-1".to_string(),
+        session_directory: session_directory.to_path_buf(),
+        model: "gpt-5.6-sol".to_string(),
+        messages,
+        executable: CodexAppServerExecutable {
+            path: std::env::current_exe().expect("test executable"),
+            prefix_args: vec![
+                "--fake-session".to_string(),
+                session_directory.display().to_string(),
+            ],
+        },
+        dynamic_tools: Vec::new(),
+        allowed_command_run_commands: None,
+        disable_permission_restrictions: false,
+    }
+}
+
+fn fake_app_server(args: &[String]) {
+    assert_eq!(
+        &args[args.len() - 3..],
+        ["app-server", "--listen", "stdio://"]
+    );
+    let capture = PathBuf::from(
+        std::env::var_os("TURA_FAKE_CODEX_CAPTURE").expect("fake capture environment"),
+    );
+    let session_directory = argument_after(args, "--fake-session");
+    let mode = capture
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let authority = capture.parent().unwrap().join("authoritative-turn.json");
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    let mut lines = stdin.lock().lines();
+    while let Some(line) = lines.next() {
+        let line = line.expect("fake app-server input");
+        let message: Value = serde_json::from_str(&line).expect("JSON-RPC input");
+        append_capture(&capture, &message);
+        let method = message["method"].as_str().expect("method");
+        let id = message.get("id").cloned();
+        match method {
+            "initialize" => respond(
+                &mut stdout,
+                id,
+                json!({
+                    "userAgent": "codex-test",
+                    "platformFamily": "unix",
+                    "platformOs": "test"
+                }),
+            ),
+            "initialized" => {}
+            "thread/start" => {
+                let recovery = mode.ends_with("-recover");
+                respond(
+                    &mut stdout,
+                    id,
+                    json!({
+                        "thread": {
+                            "id": if recovery {
+                                "thread-recovered-1"
+                            } else {
+                                "thread-official-1"
+                            },
+                            "sessionId": if recovery {
+                                "session-recovered-1"
+                            } else {
+                                "session-official-1"
+                            }
+                        }
+                    }),
+                );
+            }
+            "thread/resume" => respond(
+                &mut stdout,
+                id,
+                json!({
+                    "thread": {
+                        "id": message["params"]["threadId"],
+                        "sessionId": "session-official-1"
+                    }
+                }),
+            ),
+            "thread/read" => {
+                let turns = if mode == "recover" {
+                    vec![serde_json::from_slice::<Value>(
+                        &fs::read(&authority).expect("authoritative turn"),
+                    )
+                    .expect("authoritative turn JSON")]
+                } else if mode.ends_with("-recover") {
+                    vec![json!({
+                        "id": "turn-effect-interrupted-1",
+                        "status": "interrupted",
+                        "items": []
+                    })]
+                } else {
+                    Vec::new()
+                };
+                respond(
+                    &mut stdout,
+                    id,
+                    json!({"thread": {"id": "thread-official-1", "turns": turns}}),
+                );
+            }
+            "turn/start" => {
+                if mode.contains("effect-")
+                    || mode == "delivered-failure"
+                    || mode.contains("changed-")
+                    || mode.contains("conflict-")
+                    || mode.contains("uncertain-")
+                {
+                    let recovery = mode.ends_with("-recover");
+                    let turn_id = if recovery {
+                        "turn-effect-recovered-1"
+                    } else {
+                        "turn-effect-interrupted-1"
+                    };
+                    respond(
+                        &mut stdout,
+                        id,
+                        json!({
+                            "turn": {
+                                "id": turn_id,
+                                "status": "inProgress",
+                                "items": []
+                            }
+                        }),
+                    );
+                    server_request(
+                        &mut stdout,
+                        91,
+                        "item/tool/call",
+                        json!({
+                            "callId": if recovery {"call-recovered"} else {"call-original"},
+                            "tool": "command_run",
+                            "arguments": {
+                                "commands": [{
+                                    "command_type": "zsh",
+                                    "command_line": if mode == "conflict-recover" {
+                                        "sleep 91"
+                                    } else if mode.contains("unclaimed-")
+                                        || mode.contains("completed-read-only-")
+                                    {
+                                        r#"rg -n -A18 -B6 "struct TurnRequestContext|TurnRequestContext \{" crates/provider/src/official_codex_app_server.rs"#
+                                    } else {
+                                        "sleep 90"
+                                    },
+                                    "step": 1
+                                }]
+                            }
+                        }),
+                    );
+                    let Some(response_line) = lines.next() else {
+                        return;
+                    };
+                    let response_line = response_line.expect("tool response input");
+                    let response: Value =
+                        serde_json::from_str(&response_line).expect("tool response JSON");
+                    append_capture(&capture, &response);
+                    assert_eq!(response["id"], 91);
+                    if !recovery && mode.contains("unclaimed-") {
+                        assert!(response.get("error").is_some(), "{response}");
+                        return;
+                    }
+                    assert!(response.get("result").is_some(), "{response}");
+                    if !recovery && mode != "delivered-failure" {
+                        return;
+                    }
+                    let final_text = if mode == "delivered-failure" {
+                        "failed command observed"
+                    } else {
+                        "recovered after provider loss"
+                    };
+                    notify(
+                        &mut stdout,
+                        "item/completed",
+                        json!({
+                            "threadId": "thread-recovered-1",
+                            "turnId": turn_id,
+                            "item": {
+                                "type": "agentMessage",
+                                "id": "item-recovered-effect-1",
+                                "text": final_text,
+                                "phase": "final_answer"
+                            }
+                        }),
+                    );
+                    notify(
+                        &mut stdout,
+                        "turn/completed",
+                        json!({
+                            "threadId": "thread-recovered-1",
+                            "turn": {
+                                "id": turn_id,
+                                "status": "completed",
+                                "items": [{
+                                    "type": "agentMessage",
+                                    "id": "item-recovered-effect-1",
+                                    "text": final_text,
+                                    "phase": "final_answer"
+                                }]
+                            }
+                        }),
+                    );
+                    continue;
+                }
+                if mode.starts_with("disconnect") {
+                    let association = serde_json::to_value(
+                        load_thread_association(&session_directory, "tura-session-1")
+                            .expect("durable pre-submit association read")
+                            .expect("durable pre-submit association"),
+                    )
+                    .expect("pre-submit association JSON");
+                    assert_eq!(association["turn_attempt"]["state"], "prepared");
+                    assert!(association["active_turn_id"].is_null());
+                    fs::write(
+                        &authority,
+                        serde_json::to_vec(&json!({
+                            "id": "turn-disconnected-1",
+                            "status": "completed",
+                            "items": [{
+                                "type": "agentMessage",
+                                "id": "item-recovered-1",
+                                "text": "recovered official reply",
+                                "phase": "final_answer"
+                            }]
+                        }))
+                        .unwrap(),
+                    )
+                    .expect("authoritative turn write");
+                    return;
+                }
+                respond(
+                    &mut stdout,
+                    id,
+                    json!({
+                        "turn": {
+                            "id": "turn-official-1",
+                            "status": "inProgress",
+                            "items": []
+                        }
+                    }),
+                );
+                notify(
+                    &mut stdout,
+                    "item/agentMessage/delta",
+                    json!({
+                        "threadId": "thread-official-1",
+                        "turnId": "turn-official-1",
+                        "itemId": "item-agent-1",
+                        "delta": "provisional reply"
+                    }),
+                );
+                notify(
+                    &mut stdout,
+                    "item/completed",
+                    json!({
+                        "threadId": "thread-official-1",
+                        "turnId": "turn-official-1",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "item-agent-1",
+                            "text": "official reply",
+                            "phase": "final_answer"
+                        }
+                    }),
+                );
+                notify(
+                    &mut stdout,
+                    "thread/tokenUsage/updated",
+                    json!({
+                        "threadId": "thread-official-1",
+                        "turnId": "turn-official-1",
+                        "tokenUsage": {
+                            "last": {
+                                "inputTokens": 17,
+                                "cachedInputTokens": 3,
+                                "outputTokens": 5,
+                                "reasoningOutputTokens": 2,
+                                "cacheWriteInputTokens": 0,
+                                "totalTokens": 22
+                            },
+                            "total": {
+                                "inputTokens": 17,
+                                "cachedInputTokens": 3,
+                                "outputTokens": 5,
+                                "reasoningOutputTokens": 2,
+                                "cacheWriteInputTokens": 0,
+                                "totalTokens": 22
+                            },
+                            "modelContextWindow": 260000
+                        }
+                    }),
+                );
+                notify(
+                    &mut stdout,
+                    "turn/completed",
+                    json!({
+                        "threadId": "thread-official-1",
+                        "turn": {
+                            "id": "turn-official-1",
+                            "status": "completed",
+                            "items": [{
+                                "type": "agentMessage",
+                                "id": "item-agent-1",
+                                "text": "official reply",
+                                "phase": "final_answer"
+                            }]
+                        }
+                    }),
+                );
+            }
+            other => panic!("unexpected fake app-server method: {other}"),
+        }
+    }
+}
+
+fn respond(stdout: &mut impl Write, id: Option<Value>, result: Value) {
+    writeln!(stdout, "{}", json!({"id": id, "result": result})).expect("response");
+    stdout.flush().expect("response flush");
+}
+
+fn notify(stdout: &mut impl Write, method: &str, params: Value) {
+    writeln!(stdout, "{}", json!({"method": method, "params": params})).expect("notification");
+    stdout.flush().expect("notification flush");
+}
+
+fn server_request(stdout: &mut impl Write, id: u64, method: &str, params: Value) {
+    writeln!(
+        stdout,
+        "{}",
+        json!({"id": id, "method": method, "params": params})
+    )
+    .expect("server request");
+    stdout.flush().expect("server request flush");
+}
+
+fn argument_after(args: &[String], name: &str) -> PathBuf {
+    let index = args.iter().position(|arg| arg == name).expect("argument");
+    PathBuf::from(args.get(index + 1).expect("argument value"))
+}
+
+fn append_capture(path: &Path, message: &Value) {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("capture file");
+    writeln!(file, "{message}").expect("capture write");
+    file.sync_data().expect("capture sync");
+}
+
+fn captured_messages(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("capture")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("captured JSON"))
+        .collect()
+}
+
+fn methods(messages: &[Value]) -> Vec<&str> {
+    messages
+        .iter()
+        .map(|message| message["method"].as_str().expect("captured method"))
+        .collect()
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: this harness is a single-threaded process before provider work starts.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: this harness is a single-threaded process after provider work finishes.
+        unsafe {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}

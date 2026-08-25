@@ -236,6 +236,30 @@ fn fail_planning_command_is_unavailable_by_default() {
 }
 
 #[tokio::test]
+async fn pass_command_run_accepts_canonical_shell_alias_from_runtime_allowlist() {
+    let root = temp_workspace("allowed-shell-alias");
+    let allowed = BTreeSet::from(["shell_command".to_string()]);
+    let output = command_run::execute_async_value_with_allowed(
+        json!({
+            "commands": [
+                {
+                    "command_type": "zsh",
+                    "command_line": "printf 'canonical-shell-alias-ok\\n'"
+                }
+            ]
+        }),
+        root,
+        Some(allowed),
+    )
+    .await;
+
+    assert_eq!(output["results"][0]["success"], true, "{output}");
+    assert!(output["results"][0]["output"]["stdout"]
+        .as_str()
+        .is_some_and(|stdout| stdout.contains("canonical-shell-alias-ok")));
+}
+
+#[tokio::test]
 async fn fail_command_run_rejects_commands_outside_agent_capabilities() {
     let root = temp_workspace("allowed-commands");
     let allowed = BTreeSet::from(["shell_command".to_string()]);

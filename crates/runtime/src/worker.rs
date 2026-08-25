@@ -13,6 +13,7 @@
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
+use runtime_contract::{LifecycleExecutionContext, TaskContextCapsule};
 use runtime_contract::{WorkerEnvelope, WORKER_KIND_CALL, WORKER_KIND_HEALTH_CHECK};
 use serde_json::{json, Value};
 use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
@@ -145,11 +146,19 @@ fn handle_call(payload: &Value) -> Value {
         .cloned()
         .unwrap_or_else(|| payload.clone());
 
-    let session_id = call
+    let Some(session_id) = call
         .get("session_id")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("worker-{}", uuid::Uuid::new_v4()));
+    else {
+        return json!({
+            "ok": false,
+            "code": "LIFECYCLE_IDENTITY_MISSING",
+            "error": "missing session_id"
+        });
+    };
     let Some(runtime_id) = call
         .get("runtime_id")
         .and_then(Value::as_str)
@@ -168,6 +177,18 @@ fn handle_call(payload: &Value) -> Value {
     else {
         return json!({ "ok": false, "session_id": session_id, "error": "missing lease_id" });
     };
+    let fallback_from_id = match call.get("fallback_from_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        Some(_) => {
+            return json!({
+                "ok": false,
+                "session_id": session_id,
+                "code": "RUNTIME_RETRY_SOURCE_INVALID",
+                "error": "fallback_from_id must be a non-empty string when provided"
+            });
+        }
+    };
     let directory = call
         .get("directory")
         .and_then(Value::as_str)
@@ -179,11 +200,48 @@ fn handle_call(payload: &Value) -> Value {
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_default();
+    if prompt.trim().is_empty() {
+        return json!({ "ok": false, "session_id": session_id, "error": "empty prompt" });
+    }
+    let lifecycle = match call.get("lifecycle").cloned() {
+        Some(value) => match serde_json::from_value::<LifecycleExecutionContext>(value) {
+            Ok(context)
+                if !context.transaction_id.trim().is_empty()
+                    && !context.commander_session_id.trim().is_empty() =>
+            {
+                context
+            }
+            Ok(_) => {
+                return json!({
+                    "ok": false,
+                    "session_id": session_id,
+                    "code": "LIFECYCLE_IDENTITY_MISSING",
+                    "error": "lifecycle transaction_id and commander_session_id are required"
+                });
+            }
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "session_id": session_id,
+                    "code": "LIFECYCLE_CONTEXT_INVALID",
+                    "error": format!("invalid lifecycle context: {error}")
+                });
+            }
+        },
+        None => {
+            return json!({
+                "ok": false,
+                "session_id": session_id,
+                "code": "LIFECYCLE_IDENTITY_MISSING",
+                "error": "missing lifecycle context"
+            });
+        }
+    };
     let agent = call
         .get("agent")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let runtime_context = call
+    let mut runtime_context = call
         .get("runtime_context")
         .and_then(Value::as_str)
         .map(str::to_string);
@@ -197,9 +255,39 @@ fn handle_call(payload: &Value) -> Value {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let agent_spec = call.get("agent_spec").cloned();
-
-    if prompt.trim().is_empty() {
-        return json!({ "ok": false, "session_id": session_id, "error": "empty prompt" });
+    let jspace_contract = call.get("jspace_contract").cloned();
+    let task_context_capsule = match call.get("task_context_capsule").cloned() {
+        None | Some(Value::Null) => None,
+        Some(value) => match TaskContextCapsule::from_value(value) {
+            Ok(capsule) => Some(capsule),
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "session_id": session_id,
+                    "code": error.split(':').next().unwrap_or("TASK_CONTEXT_CAPSULE_INVALID"),
+                    "error": error,
+                });
+            }
+        },
+    };
+    if let Some(capsule) = task_context_capsule.as_ref() {
+        if runtime_context.is_some() {
+            return json!({
+                "ok": false,
+                "session_id": session_id,
+                "code": "TASK_CONTEXT_RUNTIME_CONTEXT_CONFLICT",
+                "error": "raw runtime_context cannot accompany a signed Task Context Capsule",
+            });
+        }
+        if let Err(error) = capsule.bind_jspace(jspace_contract.as_ref()) {
+            return json!({
+                "ok": false,
+                "session_id": session_id,
+                "code": error.split(':').next().unwrap_or("TASK_CONTEXT_JSPACE_BINDING_INVALID"),
+                "error": error,
+            });
+        }
+        runtime_context = Some(capsule.provider_context());
     }
 
     let input = SessionInput {
@@ -249,12 +337,15 @@ fn handle_call(payload: &Value) -> Value {
             std::env::remove_var("TURA_ROUTER_AGENT_SPEC")
         };
     }
-    match crate::mano::process_from_gateway_session_with_lease_in_directory(
+    match crate::mano::process_from_gateway_session_with_lease_and_lifecycle_and_jspace_in_directory(
         session_id.clone(),
         runtime_id,
+        fallback_from_id,
         lease_id,
         input,
         directory,
+        lifecycle,
+        jspace_contract,
     ) {
         Ok(result) => response_from_mano_result(&session_id, result, return_log),
         Err(error) => json!({ "ok": false, "session_id": session_id, "error": error }),
@@ -392,6 +483,23 @@ mod tests {
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["session_id"], "s1");
         assert_eq!(reply["error"], "empty prompt");
+    }
+
+    #[test]
+    fn missing_session_identity_is_rejected_without_generating_a_replacement() {
+        let reply = handle_call(&json!({
+            "input": {
+                "input": {
+                    "runtime_id": "runtime-missing-session",
+                    "lease_id": "lease-missing-session",
+                    "prompt": "must remain attached to the caller identity"
+                }
+            }
+        }));
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["code"], "LIFECYCLE_IDENTITY_MISSING");
+        assert_eq!(reply["error"], "missing session_id");
+        assert!(reply.get("session_id").is_none());
     }
 
     #[test]

@@ -399,6 +399,12 @@ pub(super) fn run_mano_for_prompt(session_id: String, payload: serde_json::Value
     let content = prompt_text(&payload).unwrap_or_else(|| "Prompt submitted".to_string());
     let before_count = session_store().get_messages(&session_id).len();
     let session = session_store().get_session(&session_id);
+    let jspace_contract = payload.get("jspace_contract").cloned().or_else(|| {
+        session_store()
+            .get_session_info(&session_id)
+            .and_then(|info| info.jspace_contract.clone())
+    });
+    let task_context_capsule = payload.get("task_context_capsule").cloned();
     let directory = session
         .as_ref()
         .and_then(|session| {
@@ -416,6 +422,9 @@ pub(super) fn run_mano_for_prompt(session_id: String, payload: serde_json::Value
         session.as_ref().and_then(|session| session.agent.clone()),
         session_config.as_ref(),
     );
+    let session_type = session
+        .as_ref()
+        .and_then(|session| session.session_type.clone());
     let runtime_context = prompt_runtime_context(&payload);
     let force_planning = session
         .as_ref()
@@ -554,9 +563,12 @@ pub(super) fn run_mano_for_prompt(session_id: String, payload: serde_json::Value
         "directory": directory,
         "model": model_override,
         "agent": agent,
+        "session_type": session_type,
         "prompt": content,
         "runtime_context": runtime_context,
         "planning_mode_override": force_planning.then_some(true),
+        "jspace_contract": jspace_contract,
+        "task_context_capsule": task_context_capsule,
         "maximum_parallel_runtime_workers": runtime_settings.maximum_parallel_runtime_workers(),
         "worker_env": worker_env,
     });

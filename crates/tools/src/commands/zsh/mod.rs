@@ -46,7 +46,7 @@ impl ToolHandler for ZshHandler {
         let response = shell_executor::execute_async(
             &payload_command_line(&call.payload),
             &ctx.session_dir,
-            120,
+            300,
             ShellKind::Zsh,
             &ctx,
         )
@@ -116,6 +116,13 @@ mod tests {
             }),
             ""
         );
+    }
+
+    #[test]
+    fn prompt_prevents_reserved_status_variable_in_generated_preflights() {
+        let prompt = include_str!("prompt.md");
+        assert!(prompt.contains("Never use `status` as a zsh variable name"));
+        assert!(prompt.contains("`command_status`"));
     }
 
     #[tokio::test]

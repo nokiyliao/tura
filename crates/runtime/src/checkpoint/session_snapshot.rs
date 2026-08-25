@@ -5,6 +5,7 @@ use crate::tool_callback_sanitizer::sanitize_tool_callback_output;
 use chrono::{DateTime, Utc};
 use lifecycle::{SessionLogEntry, SessionManagement};
 use serde_json::Value;
+use session_lifecycle::{commander_store_path, LifecycleConfig, SessionLifecycleStore};
 use session_log_contract::{
     PersistSessionDeltaRequest, SessionContextRecord, SessionDeltaEntry, SessionRecordProjection,
 };
@@ -123,15 +124,17 @@ impl SessionDeltaWriter {
         let management_delta =
             SessionManagement::persistence_delta(self.last_management.as_ref(), &management);
         let expected_next_management = self.next_management_sequence.saturating_add(1);
+        let request = PersistSessionDeltaRequest {
+            session_id: session.session_id.clone(),
+            management_sequence: self.next_management_sequence,
+            management_delta,
+            retained_from_sequence,
+            entries,
+        };
+        let persisted_delta = serde_json::to_vec(&request)
+            .map_err(|error| format!("failed to encode checkpoint evidence: {error}"))?;
         let (next_sequence, next_management_sequence) =
-            self.client
-                .persist_session_delta(PersistSessionDeltaRequest {
-                    session_id: session.session_id.clone(),
-                    management_sequence: self.next_management_sequence,
-                    management_delta,
-                    retained_from_sequence,
-                    entries,
-                })?;
+            self.client.persist_session_delta(request)?;
         if next_sequence != expected_next {
             return Err(format!(
                 "session {} checkpoint {stage} acknowledged context cursor {}, expected {}",
@@ -149,6 +152,30 @@ impl SessionDeltaWriter {
         self.retained_from_sequence = retained_from_sequence;
         self.local_retained_from_sequence = local_retained_from_sequence;
         self.last_management = Some(management);
+        if matches!(stage, "compact_context" | "auto_compact_context") {
+            let projection = session.lifecycle_projection();
+            let commander_session_id = projection
+                .parent_id
+                .as_deref()
+                .unwrap_or(&projection.session_id);
+            let base = session_log_contract::client::default_db_dir().join("session_lifecycle_v1");
+            let store = SessionLifecycleStore::open(
+                commander_store_path(&base, commander_session_id)
+                    .map_err(|error| error.to_string())?,
+                commander_session_id,
+                LifecycleConfig::default(),
+            )
+            .map_err(|error| error.to_string())?;
+            store
+                .publish_checkpoint_evidence(
+                    &session.session_id,
+                    stage,
+                    next_sequence,
+                    next_management_sequence,
+                    &persisted_delta,
+                )
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 }

@@ -3,12 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { GatewayClient } from "../gateway/client.js";
 import { sameDirectory } from "../gateway/directory.js";
 import { normalizeEvent } from "../gateway/events.js";
-import {
-  GatewayUnavailableError,
-  TimeoutError,
-  type CliContext,
-  type OutputMode,
-} from "../types/common.js";
+import { GatewayUnavailableError, type CliContext, type OutputMode } from "../types/common.js";
 import {
   hasUserFacingAssistantText,
   sessionStatusText,
@@ -35,7 +30,10 @@ export interface RunOptions {
   modelAccelerationEnabled?: boolean;
   killProcessesOnStart?: boolean;
   validatorEnabled?: boolean;
+  disablePermissionRestrictions?: boolean;
   commandRunShell?: CommandRunShell;
+  jspaceContract?: unknown;
+  taskContextCapsule?: unknown;
   output: OutputMode;
   stream: boolean;
   timeoutSec: number;
@@ -63,7 +61,11 @@ async function runPromptWithShellEnv(context: CliContext, options: RunOptions): 
   }
 
   const session = options.sessionID
-    ? await client.getSession(options.sessionID)
+    ? await resolveExistingRunSession(
+        client,
+        options.sessionID,
+        options.disablePermissionRestrictions,
+      )
     : await client.createSession({
         directory: context.cwd,
         model: options.model,
@@ -73,6 +75,7 @@ async function runPromptWithShellEnv(context: CliContext, options: RunOptions): 
         model_acceleration_enabled: options.modelAccelerationEnabled,
         kill_processes_on_start: options.killProcessesOnStart,
         validator_enabled: options.validatorEnabled,
+        disable_permission_restrictions: options.disablePermissionRestrictions,
       });
   const initialMessages = await client.listMessages(session.id).catch(() => []);
   const initialCount = initialMessages.length;
@@ -84,6 +87,8 @@ async function runPromptWithShellEnv(context: CliContext, options: RunOptions): 
     modelAccelerationEnabled:
       options.modelAccelerationEnabled ?? session.model_acceleration_enabled,
     commandRunShell: options.commandRunShell,
+    jspaceContract: options.jspaceContract,
+    taskContextCapsule: options.taskContextCapsule,
   });
 
   const human = options.output === "text" ? new HumanOutput(context.color) : undefined;
@@ -109,6 +114,17 @@ async function runPromptWithShellEnv(context: CliContext, options: RunOptions): 
   return result;
 }
 
+export async function resolveExistingRunSession(
+  client: Pick<GatewayClient, "getSession" | "updateSession">,
+  sessionID: string,
+  disablePermissionRestrictions: boolean | undefined,
+): Promise<Session> {
+  if (disablePermissionRestrictions === undefined) return client.getSession(sessionID);
+  return client.updateSession(sessionID, {
+    disable_permission_restrictions: disablePermissionRestrictions,
+  });
+}
+
 async function withCommandRunShellEnv<T>(
   shell: CommandRunShell | undefined,
   callback: () => Promise<T>,
@@ -128,7 +144,14 @@ export function promptPayload(
   prompt: string,
   options: Pick<
     RunOptions,
-    "model" | "agent" | "source" | "modelVariant" | "modelAccelerationEnabled" | "commandRunShell"
+    | "model"
+    | "agent"
+    | "source"
+    | "modelVariant"
+    | "modelAccelerationEnabled"
+    | "commandRunShell"
+    | "jspaceContract"
+    | "taskContextCapsule"
   >,
 ): PromptPayload {
   const messageID = `msg_${options.source}_${randomUUID()}`;
@@ -144,11 +167,15 @@ export function promptPayload(
       ? { model_acceleration_enabled: options.modelAccelerationEnabled }
       : {}),
     ...(options.commandRunShell ? { command_run_shell: options.commandRunShell } : {}),
+    ...(options.jspaceContract ? { jspace_contract: options.jspaceContract } : {}),
+    ...(options.taskContextCapsule
+      ? { task_context_capsule: options.taskContextCapsule }
+      : {}),
     source: options.source,
   };
 }
 
-async function waitWithEvents(
+export async function waitWithEvents(
   client: GatewayClient,
   session: Session,
   initialCount: number,
@@ -157,10 +184,12 @@ async function waitWithEvents(
   ndjson: NdjsonOutput | undefined,
 ): Promise<RunResult> {
   const controller = new AbortController();
-  const deadline = Date.now() + timeoutSec * 1000;
+  const idleTimeoutMs = timeoutSec * 1000;
+  let deadline = Date.now() + idleTimeoutMs;
   const stream = client.streamEvents(controller.signal)[Symbol.asyncIterator]();
   let candidate: { result: RunResult; signature: string; since: number } | undefined;
   let lastRelevantEventAt = Date.now();
+  let lastProgressSignature = "";
   const eventTexts = new Map<string, string>();
   let latestEventText = "";
   try {
@@ -174,12 +203,17 @@ async function waitWithEvents(
           sameDirectory(normalized.directory, client.directory);
         if (directoryMatches && (!normalized.sessionID || normalized.sessionID === session.id)) {
           lastRelevantEventAt = Date.now();
+          deadline = lastRelevantEventAt + idleTimeoutMs;
           latestEventText = updateEventText(eventTexts, latestEventText, normalized);
           human?.event(normalized);
           ndjson?.event(normalized);
         }
       }
-      const completed = await completionResult(client, session.id, initialCount);
+      const completed = await completionResult(client, session.id, initialCount, (signature) => {
+        if (signature === lastProgressSignature) return;
+        lastProgressSignature = signature;
+        deadline = Date.now() + idleTimeoutMs;
+      });
       candidate = stableCompletionCandidate(candidate, completed);
       const stableSince = Math.max(candidate?.since ?? 0, lastRelevantEventAt);
       if (candidate && Date.now() - stableSince >= RUN_COMPLETION_STABLE_MS) {
@@ -190,8 +224,7 @@ async function waitWithEvents(
     controller.abort();
     await stream.return?.(undefined);
   }
-  await client.abort(session.id).catch(() => undefined);
-  throw new TimeoutError(`timed out after ${timeoutSec}s`);
+  return detachedResult(client, session.id);
 }
 
 function updateEventText(
@@ -221,32 +254,46 @@ function resultWithEventText(result: RunResult, eventText: string): RunResult {
   return { ...result, finalText: text };
 }
 
-async function waitByPolling(
+export async function waitByPolling(
   client: GatewayClient,
   session: Session,
   initialCount: number,
   timeoutSec: number,
 ): Promise<RunResult> {
-  const deadline = Date.now() + timeoutSec * 1000;
+  const idleTimeoutMs = timeoutSec * 1000;
+  let deadline = Date.now() + idleTimeoutMs;
   let candidate: { result: RunResult; signature: string; since: number } | undefined;
+  let lastProgressSignature = "";
   while (Date.now() < deadline) {
-    const completed = await completionResult(client, session.id, initialCount);
+    const completed = await completionResult(client, session.id, initialCount, (signature) => {
+      if (signature === lastProgressSignature) return;
+      lastProgressSignature = signature;
+      deadline = Date.now() + idleTimeoutMs;
+    });
     candidate = stableCompletionCandidate(candidate, completed);
     if (candidate && Date.now() - candidate.since >= RUN_COMPLETION_STABLE_MS)
       return candidate.result;
     await delay(1000);
   }
-  await client.abort(session.id).catch(() => undefined);
-  throw new TimeoutError(`timed out after ${timeoutSec}s`);
+  return detachedResult(client, session.id);
 }
 
 async function completionResult(
   client: GatewayClient,
   sessionID: string,
   initialCount: number,
+  observeProgress?: (signature: string) => void,
 ): Promise<RunResult | undefined> {
   const session = await client.getSession(sessionID).catch(() => undefined);
   const messages = await client.listMessages(sessionID);
+  observeProgress?.(
+    JSON.stringify({
+      status: sessionStatusText(session?.status),
+      count: messages.length,
+      lastID: messages.at(-1)?.id,
+      lastUpdated: messages.at(-1)?.updated_at ?? messages.at(-1)?.time?.updated,
+    }),
+  );
   const hasNewAssistant = hasUserFacingAssistantText(messages, initialCount);
   const status = sessionStatusText(session?.status);
   if (status === "busy") return undefined;
@@ -257,6 +304,11 @@ async function completionResult(
     return buildRunResult(sessionID, messages, "completed");
   }
   return undefined;
+}
+
+async function detachedResult(client: GatewayClient, sessionID: string): Promise<RunResult> {
+  const messages = await client.listMessages(sessionID).catch(() => []);
+  return buildRunResult(sessionID, messages, "detached");
 }
 
 function stableCompletionCandidate(

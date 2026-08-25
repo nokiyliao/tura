@@ -6,6 +6,7 @@ pub(super) struct ShellRequest {
     pub(super) command: String,
     pub(super) cwd: PathBuf,
     pub(super) timeout_secs: u64,
+    pub(super) stall_timeout_secs: Option<u64>,
 }
 
 pub(super) fn parse_shell_request(
@@ -31,6 +32,11 @@ pub(super) fn parse_shell_request(
                     .map(|ms| ms.div_ceil(1000).max(1))
             })
             .unwrap_or(default_timeout_secs);
+        let stall_timeout_secs = value
+            .get("stall_timeout_ms")
+            .or_else(|| value.get("stallTimeoutMs"))
+            .and_then(Value::as_u64)
+            .map(|ms| ms.div_ceil(1000).max(1));
         let cwd = value
             .get("workdir")
             .or_else(|| value.get("cwd"))
@@ -48,12 +54,14 @@ pub(super) fn parse_shell_request(
             command: normalize_shell_command_text(command),
             cwd,
             timeout_secs,
+            stall_timeout_secs,
         };
     }
     ShellRequest {
         command: normalize_shell_command_text(command_line),
         cwd: session_dir.to_path_buf(),
         timeout_secs: default_timeout_secs,
+        stall_timeout_secs: None,
     }
 }
 
@@ -151,6 +159,12 @@ fn parse_loose_shell_request_object(text: &str) -> Option<Value> {
         object.insert(
             "timeout_secs".to_string(),
             Value::Number(timeout_secs.into()),
+        );
+    }
+    if let Some(stall_timeout_ms) = loose_json_number_field(trimmed, "stall_timeout_ms") {
+        object.insert(
+            "stall_timeout_ms".to_string(),
+            Value::Number(stall_timeout_ms.into()),
         );
     }
     Some(Value::Object(object))

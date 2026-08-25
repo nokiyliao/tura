@@ -18,8 +18,12 @@ use std::time::Duration;
 // ============================================================================
 
 pub async fn health() -> Json<HealthResponse> {
+    let projection = crate::session_feed::projection_health();
     Json(HealthResponse {
-        healthy: true,
+        healthy: projection.healthy,
+        ready: projection.ready,
+        status: projection.status.to_string(),
+        error: projection.error,
         version: env!("CARGO_PKG_VERSION").to_string(),
         root: gateway_identity_root(),
         home: gateway_identity_home(),

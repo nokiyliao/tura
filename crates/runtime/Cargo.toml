@@ -120,6 +120,7 @@ runtime_contract.workspace = true
 tura_path = { workspace = true }
 tools = { workspace = true }
 session_log_contract.workspace = true
+session_lifecycle.workspace = true
 uuid.workspace = true
 sysinfo.workspace = true
 

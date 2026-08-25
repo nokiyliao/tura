@@ -345,6 +345,8 @@ pub struct SessionManagement {
     pub context_tokens: ContextTokenStats,
     /// Latest terminal provider token/cost report for the session.
     pub runtime_usage: serde_json::Value,
+    /// Optional DCF J-Space contract admitted for this session.
+    pub jspace_contract: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +398,8 @@ pub struct SessionManagementDelta {
     pub context_tokens: Option<ContextTokenStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_usage: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jspace_contract: Option<serde_json::Value>,
 }
 
 impl<'de> Deserialize<'de> for SessionManagement {
@@ -436,6 +440,8 @@ impl<'de> Deserialize<'de> for SessionManagement {
             last_goal_user_input: String,
             context_tokens: ContextTokenStats,
             runtime_usage: serde_json::Value,
+            #[serde(default)]
+            jspace_contract: Option<serde_json::Value>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -477,6 +483,7 @@ impl<'de> Deserialize<'de> for SessionManagement {
             last_goal_user_input: wire.last_goal_user_input,
             context_tokens: wire.context_tokens,
             runtime_usage: wire.runtime_usage,
+            jspace_contract: wire.jspace_contract,
         })
     }
 }
@@ -489,7 +496,7 @@ impl Serialize for SessionManagement {
         // Keep the established SessionManagement wire field order. The lifecycle
         // aggregate owns task_plan internally, but aggregate-only fields are not
         // part of this runtime persistence projection.
-        let mut state = serializer.serialize_struct("SessionManagement", 30)?;
+        let mut state = serializer.serialize_struct("SessionManagement", 31)?;
         state.serialize_field("session_id", &self.lifecycle.session_id)?;
         state.serialize_field("state", &self.lifecycle.state)?;
         state.serialize_field("session_name", &self.session_name)?;
@@ -529,6 +536,9 @@ impl Serialize for SessionManagement {
         state.serialize_field("last_goal_user_input", &self.last_goal_user_input)?;
         state.serialize_field("context_tokens", &self.context_tokens)?;
         state.serialize_field("runtime_usage", &self.runtime_usage)?;
+        if self.jspace_contract.is_some() {
+            state.serialize_field("jspace_contract", &self.jspace_contract)?;
+        }
         state.end()
     }
 }
@@ -585,6 +595,13 @@ impl SessionManagement {
             last_goal_user_input: changed!(last_goal_user_input),
             context_tokens: changed!(context_tokens),
             runtime_usage: changed!(runtime_usage),
+            jspace_contract: if previous
+                .is_some_and(|previous| previous.jspace_contract == current.jspace_contract)
+            {
+                None
+            } else {
+                current.jspace_contract.clone()
+            },
         }
     }
 
@@ -620,6 +637,9 @@ impl SessionManagement {
         apply!(last_goal_user_input);
         apply!(context_tokens);
         apply!(runtime_usage);
+        if let Some(value) = delta.jspace_contract {
+            self.jspace_contract = Some(value);
+        }
     }
 
     pub fn lifecycle_projection(&self) -> SessionProjection {
@@ -708,6 +728,7 @@ impl SessionManagement {
             last_goal_user_input,
             context_tokens: ContextTokenStats::default(),
             runtime_usage: serde_json::Value::Null,
+            jspace_contract: None,
         }
     }
 
@@ -874,6 +895,7 @@ impl SessionManagement {
             last_goal_user_input: self.last_goal_user_input.clone(),
             context_tokens: self.context_tokens,
             runtime_usage: self.runtime_usage.clone(),
+            jspace_contract: self.jspace_contract.clone(),
         }
     }
 

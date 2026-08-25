@@ -1,7 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 
-use lifecycle::{RuntimeAggregate, RuntimeEvent};
+use lifecycle::{RuntimeAggregate, RuntimeEvent, RuntimeState};
+use runtime_contract::LifecycleExecutionContext;
+use session_lifecycle::{
+    commander_store_path, LifecycleConfig, SessionLifecycleStore, TerminalReceipt,
+    TerminalReceiptIdentity, TerminalState,
+};
 use session_log_contract::{
     ActivateRuntimeLeaseRequest, AppendSessionFeedEventRequest, CommitRuntimeEventRequest,
     RegisterRuntimeRequest, RuntimeEventCommitOutcome, RuntimeLeaseOutcome,
@@ -97,13 +102,25 @@ pub(crate) struct RuntimeEventWriter {
     feed_sender: Option<mpsc::Sender<FeedCommand>>,
     feed_worker: Option<std::thread::JoinHandle<()>>,
     client: SessionLogClient,
+    lifecycle: Option<LifecycleExecutionContext>,
+    next_receipt_event_seq: u64,
 }
 
 impl RuntimeEventWriter {
+    #[cfg(test)]
     pub(crate) fn new(
         session_id: String,
         initial_runtime_id: String,
         initial_lease_id: String,
+    ) -> Result<Self, String> {
+        Self::new_with_lifecycle(session_id, initial_runtime_id, initial_lease_id, None)
+    }
+
+    pub(crate) fn new_with_lifecycle(
+        session_id: String,
+        initial_runtime_id: String,
+        initial_lease_id: String,
+        lifecycle: Option<LifecycleExecutionContext>,
     ) -> Result<Self, String> {
         if session_id.trim().is_empty()
             || initial_runtime_id.trim().is_empty()
@@ -125,6 +142,8 @@ impl RuntimeEventWriter {
             feed_sender: Some(feed_sender),
             feed_worker: Some(feed_worker),
             client,
+            lifecycle,
+            next_receipt_event_seq: 0,
         })
     }
 
@@ -204,6 +223,19 @@ impl RuntimeEventWriter {
     }
 
     pub(crate) fn seal_runtime(&mut self, runtime_id: &str) -> Result<(), String> {
+        self.seal_runtime_with(runtime_id, commit_runtime_event)
+    }
+
+    fn seal_runtime_with(
+        &mut self,
+        runtime_id: &str,
+        commit: impl FnOnce(
+            &SessionLogClient,
+            &str,
+            &RuntimeCursor,
+            RuntimeEvent,
+        ) -> Result<(u64, u64), String>,
+    ) -> Result<(), String> {
         self.feed_barrier(runtime_id)?;
         let cursor = self
             .cursors
@@ -215,8 +247,8 @@ impl RuntimeEventWriter {
                 "runtime {runtime_id} has no pending terminal event"
             ));
         };
-        let (revision, next_event_seq) =
-            commit_runtime_event(&self.client, runtime_id, &cursor, event)?;
+        self.write_terminal_receipt(runtime_id, &cursor, &event)?;
+        let (revision, next_event_seq) = commit(&self.client, runtime_id, &cursor, event)?;
         let cursor = self
             .cursors
             .get_mut(runtime_id)
@@ -224,6 +256,75 @@ impl RuntimeEventWriter {
         cursor.revision = revision;
         cursor.next_event_seq = next_event_seq;
         cursor.pending_terminal = None;
+        self.next_receipt_event_seq += 1;
+        Ok(())
+    }
+
+    fn write_terminal_receipt(
+        &self,
+        runtime_id: &str,
+        cursor: &RuntimeCursor,
+        event: &RuntimeEvent,
+    ) -> Result<(), String> {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return Ok(());
+        };
+        if lifecycle.transaction_id.trim().is_empty()
+            || lifecycle.commander_session_id.trim().is_empty()
+        {
+            return Err("runtime lifecycle identifiers must be non-empty".to_string());
+        }
+        let (terminal_state, finished_at_ms, runtime_state) = terminal_receipt_state(event)?;
+        let idempotency_key = format!("{runtime_id}:{}", cursor.next_event_seq);
+        let event_id = format!("{idempotency_key}:session-projection");
+        let mut receipt = TerminalReceipt::new(
+            TerminalReceiptIdentity::new(
+                &lifecycle.transaction_id,
+                event_id,
+                self.next_receipt_event_seq,
+                &lifecycle.commander_session_id,
+                &self.session_id,
+                runtime_id,
+                &cursor.lease_id,
+            ),
+            terminal_state,
+            finished_at_ms,
+        );
+        receipt.task_id.clone_from(&lifecycle.task_id);
+        receipt.goal_id.clone_from(&lifecycle.goal_id);
+        receipt.operator_override = lifecycle.operator_override;
+        receipt.audit_metadata.insert(
+            "runtime_event_seq".to_string(),
+            serde_json::json!(cursor.next_event_seq),
+        );
+        receipt.audit_metadata.insert(
+            "runtime_expected_revision".to_string(),
+            serde_json::json!(cursor.revision),
+        );
+        receipt.audit_metadata.insert(
+            "runtime_state".to_string(),
+            serde_json::json!(runtime_state),
+        );
+        receipt.audit_metadata.insert(
+            "dispatch_runtime_id".to_string(),
+            serde_json::json!(self.initial_runtime_id),
+        );
+        receipt.audit_metadata.insert(
+            "dispatch_lease_id".to_string(),
+            serde_json::json!(self.initial_lease_id),
+        );
+        let base = session_log_contract::client::default_db_dir().join("session_lifecycle_v1");
+        let root = commander_store_path(&base, &lifecycle.commander_session_id)
+            .map_err(|error| error.to_string())?;
+        let store = SessionLifecycleStore::open(
+            root,
+            &lifecycle.commander_session_id,
+            LifecycleConfig::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        store
+            .write_terminal_receipt(&receipt)
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -345,6 +446,29 @@ fn is_terminal_event(event: &RuntimeEvent) -> bool {
         event,
         RuntimeEvent::RuntimeFinished { .. } | RuntimeEvent::RuntimeFailed { .. }
     )
+}
+
+fn terminal_receipt_state(
+    event: &RuntimeEvent,
+) -> Result<(TerminalState, i64, RuntimeState), String> {
+    match event {
+        RuntimeEvent::RuntimeFinished { finished_at, .. } => Ok((
+            TerminalState::Completed,
+            finished_at.timestamp_millis(),
+            RuntimeState::Finished,
+        )),
+        RuntimeEvent::RuntimeFailed {
+            finished_at, state, ..
+        } => {
+            let terminal_state = if *state == RuntimeState::Cancelled {
+                TerminalState::Cancelled
+            } else {
+                TerminalState::Failed
+            };
+            Ok((terminal_state, finished_at.timestamp_millis(), *state))
+        }
+        _ => Err("runtime terminal receipt requires a terminal event".to_string()),
+    }
 }
 
 fn commit_runtime_event(
@@ -524,6 +648,132 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(state.next_event_seq, 7);
         assert_eq!(state.assistant_text, "kept");
+    }
+
+    #[test]
+    fn terminal_receipt_is_durable_before_commit_and_reuses_identity_on_retry() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().expect("isolated lifecycle root");
+        let previous_root = std::env::var_os("SESSION_LOG_DB_ROOT");
+        // SAFETY: ENV_LOCK serializes process-environment mutation in this module.
+        #[allow(
+            unsafe_code,
+            reason = "Rust 2024 process-environment mutation audited at the caller"
+        )]
+        unsafe {
+            std::env::set_var("SESSION_LOG_DB_ROOT", root.path())
+        };
+
+        let lifecycle = LifecycleExecutionContext {
+            transaction_id: "ordering-transaction".to_string(),
+            commander_session_id: "ordering-commander".to_string(),
+            task_id: Some("ordering-task".to_string()),
+            goal_id: Some("ordering-goal".to_string()),
+            operator_override: true,
+        };
+        let mut writer = RuntimeEventWriter::new_with_lifecycle(
+            "ordering-child".to_string(),
+            "ordering-runtime".to_string(),
+            "ordering-lease".to_string(),
+            Some(lifecycle),
+        )
+        .expect("runtime writer");
+        writer.cursors.insert(
+            "ordering-runtime".to_string(),
+            RuntimeCursor {
+                lease_id: "ordering-lease".to_string(),
+                revision: 4,
+                next_event_seq: 5,
+                pending_terminal: Some(RuntimeEvent::RuntimeFinished {
+                    finished_at: Utc::now(),
+                    usage: None,
+                }),
+            },
+        );
+
+        let event_id = "ordering-runtime:5:session-projection";
+        let error = writer
+            .seal_runtime_with("ordering-runtime", |_, runtime_id, cursor, event| {
+                assert_eq!(runtime_id, "ordering-runtime");
+                assert_eq!(cursor.next_event_seq, 5);
+                assert!(matches!(event, RuntimeEvent::RuntimeFinished { .. }));
+                let base =
+                    session_log_contract::client::default_db_dir().join("session_lifecycle_v1");
+                let store = SessionLifecycleStore::open(
+                    commander_store_path(&base, "ordering-commander").expect("store path"),
+                    "ordering-commander",
+                    LifecycleConfig::default(),
+                )
+                .expect("lifecycle store");
+                let receipt = store
+                    .terminal_receipt("ordering-transaction", event_id)
+                    .expect("receipt must exist before terminal commit");
+                assert_eq!(receipt.runtime_id, "ordering-runtime");
+                assert_eq!(receipt.lease_id, "ordering-lease");
+                assert_eq!(receipt.event_seq, 0);
+                Err("SIMULATED_CRASH_BEFORE_TERMINAL_COMMIT".to_string())
+            })
+            .expect_err("injected terminal commit crash");
+        assert_eq!(error, "SIMULATED_CRASH_BEFORE_TERMINAL_COMMIT");
+
+        let base = session_log_contract::client::default_db_dir().join("session_lifecycle_v1");
+        let store = SessionLifecycleStore::open(
+            commander_store_path(&base, "ordering-commander").expect("store path"),
+            "ordering-commander",
+            LifecycleConfig::default(),
+        )
+        .expect("lifecycle store");
+        let readback = store.readback().expect("receipt readback after crash");
+        assert_eq!(readback.pending_receipts, 1);
+        assert_eq!(readback.applied_receipts, 0);
+        assert!(writer
+            .cursors
+            .get("ordering-runtime")
+            .and_then(|cursor| cursor.pending_terminal.as_ref())
+            .is_some());
+        assert_eq!(writer.next_receipt_event_seq, 0);
+
+        writer
+            .seal_runtime_with("ordering-runtime", |_, runtime_id, cursor, event| {
+                assert_eq!(runtime_id, "ordering-runtime");
+                assert_eq!(cursor.next_event_seq, 5);
+                assert!(matches!(event, RuntimeEvent::RuntimeFinished { .. }));
+                Ok((5, 6))
+            })
+            .expect("retry reuses the durable receipt and commits");
+        let receipt = store
+            .terminal_receipt("ordering-transaction", event_id)
+            .expect("same receipt remains durable");
+        assert_eq!(receipt.event_seq, 0);
+        assert_eq!(writer.next_receipt_event_seq, 1);
+        assert!(writer
+            .cursors
+            .get("ordering-runtime")
+            .and_then(|cursor| cursor.pending_terminal.as_ref())
+            .is_none());
+
+        match previous_root {
+            Some(value) => {
+                // SAFETY: ENV_LOCK serializes process-environment mutation in this module.
+                #[allow(
+                    unsafe_code,
+                    reason = "Rust 2024 process-environment mutation audited at the caller"
+                )]
+                unsafe {
+                    std::env::set_var("SESSION_LOG_DB_ROOT", value)
+                }
+            }
+            None => {
+                // SAFETY: ENV_LOCK serializes process-environment mutation in this module.
+                #[allow(
+                    unsafe_code,
+                    reason = "Rust 2024 process-environment mutation audited at the caller"
+                )]
+                unsafe {
+                    std::env::remove_var("SESSION_LOG_DB_ROOT")
+                }
+            }
+        }
     }
 
     #[test]

@@ -4,39 +4,92 @@
 //! cancel turns, but must not spawn runtime workers directly.
 
 use anyhow::{anyhow, Result};
-use lifecycle::RuntimeId;
+use lifecycle::{RuntimeAggregate, RuntimeId, RuntimeState, SessionState};
 use parking_lot::Mutex;
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Notify;
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::sync::{Notify, RwLock};
 
 use crate::services::runtime_workers::{runtime_worker_limit, MAX_QUEUED_RUNTIME_TURNS};
 use crate::{dispatch_run_agent_with_runtime_slot, AppState};
 use router_contract::{CancelRuntimeRequest, EnqueueTurnRequest, ProbeSessionsRequest};
-use runtime_contract::RunAgentRequest;
+use runtime_contract::{LifecycleExecutionContext, RunAgentRequest};
+use session_lifecycle::{
+    commander_store_path, IntakeOutcome, LifecycleConfig, LiveEffectEvidence, ReclaimOutcome,
+    SessionLifecycleStore, TerminalState,
+};
 use session_log_contract::{
-    ActivateRuntimeLeaseRequest, RegisterRuntimeRequest, RuntimeLeaseOutcome,
-    RuntimeRegistrationOutcome, SessionLogCommand, SessionLogResponse,
+    ActivateRuntimeLeaseRequest, GetRuntimeLeaseRequest, GetSessionRequest,
+    RecoveryCloseRuntimeReason, RecoveryCloseRuntimeRequest, RegisterRuntimeRequest,
+    ReplayRuntimeRequest, RuntimeLeaseOutcome, RuntimeRecoveryQuiescenceProof,
+    RuntimeRegistrationOutcome, SessionFeedEntry, SessionFeedEvent, SessionLogCommand,
+    SessionLogResponse,
 };
 
 #[derive(Clone)]
 pub struct ExecutionService {
+    admission: Arc<RwLock<()>>,
     sessions: Arc<Mutex<HashMap<String, RuntimeLease>>>,
     runtime_slots: RuntimeSlotGate,
+    retained_slots: Arc<Mutex<HashMap<String, RuntimeSlotPermit>>>,
+    retained_watchers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeLease {
     runtime_id: RuntimeId,
     lease_id: String,
+    commander_session_id: String,
+    transaction_id: String,
+    task_id: Option<String>,
+    goal_id: Option<String>,
+    operator_override: bool,
     slot_acquired: bool,
+}
+
+fn active_turn_conflict(session_id: &str, active: &RuntimeLease) -> Value {
+    json!({
+        "ok": false,
+        "code": "session_active_turn",
+        "session_id": session_id,
+        "runtime_id": active.runtime_id,
+        "error": format!("session {session_id} already has an active turn"),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouterRecoveryCloseRuntimeRequest {
+    receipt_id: String,
+    database_path: String,
+    runtime_id: String,
+    session_id: String,
+    lease_id: Option<String>,
+    expected_lease_active: bool,
+    expected_revision: u64,
+    expected_last_event_seq: u64,
+    expected_session_event_seq: u64,
+    expected_session_state: lifecycle::SessionState,
+    reason: RecoveryCloseRuntimeReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalDeliveryIdentity {
+    pub(crate) commander_session_id: String,
+    pub(crate) transaction_id: String,
+    pub(crate) event_id: String,
+    pub(crate) runtime_id: String,
 }
 
 impl ExecutionService {
     pub fn new() -> Self {
         Self {
+            admission: Arc::new(RwLock::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             runtime_slots: RuntimeSlotGate::default(),
+            retained_slots: Arc::new(Mutex::new(HashMap::new())),
+            retained_watchers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -46,9 +99,47 @@ impl ExecutionService {
         input: Value,
         request_id: &str,
     ) -> Result<Value> {
+        let _admission = self.admission.read().await;
         let request: EnqueueTurnRequest = serde_json::from_value(input)?;
+        if let Some(active) = self.sessions.lock().get(&request.session_id) {
+            return Ok(active_turn_conflict(&request.session_id, active));
+        }
         let lease_id = format!("lease-{}", uuid::Uuid::new_v4());
-        let run_request = payload_to_run_agent_request(&request, &lease_id)?;
+        state.session_db.start()?;
+        let mut run_request = payload_to_run_agent_request(&request, &lease_id, None)?;
+        let requested_prompt = run_request
+            .prompt
+            .as_deref()
+            .or(run_request.message.as_deref())
+            .or_else(|| run_request.input.as_ref().and_then(Value::as_str));
+        let fallback_from_id =
+            runtime_registration_fallback(&request.session_id, requested_prompt)?;
+        run_request.fallback_from_id.clone_from(&fallback_from_id);
+        let commander_session_id = run_request
+            .parent_session_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| request.session_id.clone());
+        let supplied_lifecycle = run_request.lifecycle.take();
+        let task_id = supplied_lifecycle
+            .as_ref()
+            .and_then(|context| context.task_id.clone())
+            .or_else(|| run_request.task_id.clone());
+        let goal_id = supplied_lifecycle
+            .as_ref()
+            .and_then(|context| context.goal_id.clone())
+            .or_else(|| run_request.goal_id.clone());
+        let operator_override = supplied_lifecycle
+            .as_ref()
+            .map(|context| context.operator_override)
+            .unwrap_or(run_request.operator_override);
+        run_request.lifecycle = Some(LifecycleExecutionContext {
+            transaction_id: request_id.to_string(),
+            commander_session_id: commander_session_id.clone(),
+            task_id: task_id.clone(),
+            goal_id: goal_id.clone(),
+            operator_override,
+        });
         let maximum_parallel_runtime_workers =
             runtime_worker_limit(run_request.maximum_parallel_runtime_workers);
         if debug_runtime_enabled() {
@@ -60,13 +151,7 @@ impl ExecutionService {
         {
             let mut sessions = self.sessions.lock();
             if let Some(active) = sessions.get(&request.session_id) {
-                return Ok(json!({
-                    "ok": false,
-                    "code": "session_active_turn",
-                    "session_id": request.session_id,
-                    "runtime_id": active.runtime_id,
-                    "error": format!("session {} already has an active turn", request.session_id),
-                }));
+                return Ok(active_turn_conflict(&request.session_id, active));
             }
             let queued = sessions
                 .values()
@@ -82,6 +167,11 @@ impl ExecutionService {
                 RuntimeLease {
                     runtime_id: request.runtime_id.clone(),
                     lease_id: lease_id.clone(),
+                    commander_session_id,
+                    transaction_id: request_id.to_string(),
+                    task_id,
+                    goal_id,
+                    operator_override,
                     slot_acquired: false,
                 },
             );
@@ -91,7 +181,7 @@ impl ExecutionService {
             &request.session_id,
             &request.runtime_id,
         );
-        let _permit = self
+        let permit = self
             .acquire_runtime_slot(&request.session_id, maximum_parallel_runtime_workers)
             .await?;
         if !self.mark_slot_acquired(&request.session_id, &request.runtime_id) {
@@ -100,8 +190,12 @@ impl ExecutionService {
                 request.session_id
             ));
         }
-        state.session_db.start()?;
-        register_and_activate_runtime(&request.session_id, &request.runtime_id, &lease_id)?;
+        register_and_activate_runtime(
+            &request.session_id,
+            &request.runtime_id,
+            &lease_id,
+            fallback_from_id,
+        )?;
         if debug_runtime_enabled() {
             eprintln!(
                 "router debug: enqueue_turn dispatch session_id={}",
@@ -110,7 +204,47 @@ impl ExecutionService {
         }
         let (status, body) =
             dispatch_run_agent_with_runtime_slot(state, run_request, request_id.to_string()).await;
-        active_guard.finish();
+        let delivery = match self.ensure_terminal_receipt(
+            &request.session_id,
+            &request.runtime_id,
+            request_id,
+        ) {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                self.retain_runtime_slot(&request.session_id, permit);
+                active_guard.retain();
+                return Err(anyhow!("TERMINAL_RECEIPT_NOT_DURABLE:{error:#}"));
+            }
+        };
+        state
+            .command_run
+            .wait_for_session_idle(&request.session_id)
+            .await;
+        let evidence = self.live_effect_evidence(state, &request.session_id).await;
+        match lifecycle_store(&delivery.commander_session_id)?.reclaim_terminal_slot(
+            &delivery.transaction_id,
+            &delivery.event_id,
+            evidence,
+        )? {
+            ReclaimOutcome::Released | ReclaimOutcome::AlreadyReleased => {
+                active_guard.finish();
+                drop(permit);
+            }
+            ReclaimOutcome::Retained { blocker } => {
+                self.retain_runtime_slot(&request.session_id, permit);
+                self.spawn_retained_reclaimer(
+                    state.clone(),
+                    request.session_id.clone(),
+                    delivery.clone(),
+                );
+                self.wait_for_retained_release(&request.session_id).await;
+                if self.retained_slots.lock().contains_key(&request.session_id) {
+                    active_guard.retain();
+                    return Err(anyhow!(blocker));
+                }
+                active_guard.finish();
+            }
+        }
         if debug_runtime_enabled() {
             eprintln!(
                 "router debug: enqueue_turn finished session_id={} status={} body={}",
@@ -132,6 +266,124 @@ impl ExecutionService {
             "session_id": request.session_id,
             "result": body
         }))
+    }
+
+    pub async fn command_run_request(
+        &self,
+        state: &AppState,
+        input: Value,
+        request_id: &str,
+    ) -> Result<Value> {
+        let nested_session = input
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let nested_reservation = {
+            let sessions = self.sessions.lock();
+            nested_session.and_then(|session_id| {
+                sessions
+                    .contains_key(session_id)
+                    .then(|| state.command_run.reserve_for_session(Some(session_id)))
+            })
+        };
+        if let Some(reservation) = nested_reservation {
+            return state
+                .command_run
+                .execute_with_reserved_session(input, Some(request_id), reservation)
+                .await;
+        }
+
+        let _admission = self.admission.read().await;
+        state
+            .command_run
+            .execute_with_request_id(input, Some(request_id))
+            .await
+    }
+
+    pub async fn get_runtime_lease(&self, state: &AppState, input: Value) -> Result<Value> {
+        let request: GetRuntimeLeaseRequest = serde_json::from_value(input)?;
+        state.session_db.start()?;
+        match session_log_contract::client::call_service(&SessionLogCommand::GetRuntimeLease(
+            request,
+        ))? {
+            SessionLogResponse::RuntimeLeaseRead { runtime } => Ok(json!({
+                "status": "ok",
+                "runtime": runtime,
+            })),
+            SessionLogResponse::Error { error } => Err(anyhow!(error)),
+            other => Err(anyhow!("unexpected get_runtime_lease response: {other:?}")),
+        }
+    }
+
+    pub async fn recovery_close_runtime(&self, state: &AppState, input: Value) -> Result<Value> {
+        let request: RouterRecoveryCloseRuntimeRequest = serde_json::from_value(input)?;
+        let _admission = self.admission.write().await;
+
+        let lease = self.sessions.lock().get(&request.session_id).cloned();
+        let queued_turn = lease.as_ref().is_some_and(|lease| !lease.slot_acquired);
+        let running_turn = lease.as_ref().is_some_and(|lease| lease.slot_acquired);
+        let active_turn = lease.is_some();
+        let worker_alive = state
+            .manager
+            .worker_alive_by_key(&format!("runtime_worker:{}", request.session_id))
+            .await;
+        let retained_process_scopes =
+            code_tools::shell_executor::retained_shell_process_scope_count_for_scope(
+                &request.session_id,
+            );
+        let retained_slot = self.retained_slots.lock().contains_key(&request.session_id);
+        let proof = RuntimeRecoveryQuiescenceProof {
+            active_turn,
+            queued_turn,
+            running_turn,
+            worker_alive,
+            active_command_runs: state
+                .command_run
+                .active_count_for_session(&request.session_id)
+                as u64,
+            retained_process_scopes: retained_process_scopes as u64,
+            retained_slot,
+            global_active_session_count: self.sessions.lock().len() as u64,
+            global_retained_slot_count: self.retained_slots.lock().len() as u64,
+            global_active_command_runs: state.command_run.active_count() as u64,
+        };
+        if !proof.is_quiescent() {
+            return Ok(json!({
+                "status": "ok",
+                "result": session_log_contract::RecoveryCloseRuntimeOutcome::RuntimeLive {
+                    proof,
+                },
+            }));
+        }
+
+        state.session_db.start()?;
+        let recovery = RecoveryCloseRuntimeRequest {
+            receipt_id: request.receipt_id,
+            database_path: request.database_path,
+            runtime_id: request.runtime_id,
+            session_id: request.session_id,
+            lease_id: request.lease_id,
+            expected_lease_active: request.expected_lease_active,
+            expected_revision: request.expected_revision,
+            expected_last_event_seq: request.expected_last_event_seq,
+            expected_session_event_seq: request.expected_session_event_seq,
+            expected_session_state: request.expected_session_state,
+            reason: request.reason,
+            quiescence: proof,
+        };
+        match session_log_contract::client::call_service(&SessionLogCommand::RecoveryCloseRuntime(
+            recovery,
+        ))? {
+            SessionLogResponse::RuntimeRecoveryClosed { result } => Ok(json!({
+                "status": "ok",
+                "result": result,
+            })),
+            SessionLogResponse::Error { error } => Err(anyhow!(error)),
+            other => Err(anyhow!(
+                "unexpected recovery_close_runtime response: {other:?}"
+            )),
+        }
     }
 
     pub async fn cancel_turn(&self, state: &AppState, input: Value) -> Value {
@@ -159,6 +411,10 @@ impl ExecutionService {
         };
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
+        let retained_process_scopes_terminated =
+            code_tools::shell_executor::terminate_retained_shell_process_scopes_for_scope(
+                &session_id,
+            );
         let removed = {
             let mut sessions = self.sessions.lock();
             if sessions
@@ -171,6 +427,10 @@ impl ExecutionService {
             }
         };
         let stopped_worker = if removed {
+            self.retained_slots.lock().remove(&session_id);
+            if let Some(notify) = self.retained_watchers.lock().remove(&session_id) {
+                notify.notify_one();
+            }
             state
                 .manager
                 .stop_worker_by_key(&format!("runtime_worker:{session_id}"))
@@ -182,7 +442,8 @@ impl ExecutionService {
             "status": if removed || stopped_worker { "cancelling" } else { "idle" },
             "session_id": session_id,
             "runtime_id": runtime_id,
-            "stopped_worker": stopped_worker
+            "stopped_worker": stopped_worker,
+            "retained_process_scopes_terminated": retained_process_scopes_terminated
         })
     }
 
@@ -199,6 +460,16 @@ impl ExecutionService {
                 .stop_workers_with_prefix("runtime_worker:")
                 .await;
             let active_turns_removed = self.sessions.lock().drain().count();
+            self.retained_slots.lock().clear();
+            let watchers = self
+                .retained_watchers
+                .lock()
+                .drain()
+                .map(|(_, notify)| notify)
+                .collect::<Vec<_>>();
+            for notify in watchers {
+                notify.notify_one();
+            }
             return json!({
                 "status": "stopped",
                 "stopped": stopped,
@@ -208,6 +479,14 @@ impl ExecutionService {
         };
 
         let active_turn_removed = self.sessions.lock().remove(&session_id).is_some();
+        let retained_process_scopes_terminated =
+            code_tools::shell_executor::terminate_retained_shell_process_scopes_for_scope(
+                &session_id,
+            );
+        self.retained_slots.lock().remove(&session_id);
+        if let Some(notify) = self.retained_watchers.lock().remove(&session_id) {
+            notify.notify_one();
+        }
         let stopped_worker = state
             .manager
             .stop_worker_by_key(&format!("runtime_worker:{session_id}"))
@@ -217,7 +496,8 @@ impl ExecutionService {
             "session_id": session_id,
             "stopped": usize::from(stopped_worker),
             "stopped_worker": stopped_worker,
-            "active_turn_removed": active_turn_removed
+            "active_turn_removed": active_turn_removed,
+            "retained_process_scopes_terminated": retained_process_scopes_terminated
         })
     }
 
@@ -259,8 +539,107 @@ impl ExecutionService {
         Ok(json!({ "sessions": sessions }))
     }
 
+    pub async fn status(&self, state: &AppState) -> Value {
+        let leases = self.sessions.lock().clone();
+        let retained = self
+            .retained_slots
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut sessions = Vec::with_capacity(leases.len());
+        for (session_id, lease) in leases {
+            let worker_alive = state
+                .manager
+                .worker_alive_by_key(&format!("runtime_worker:{session_id}"))
+                .await;
+            sessions.push(json!({
+                "session_id": session_id,
+                "runtime_id": lease.runtime_id,
+                "transaction_id": lease.transaction_id,
+                "slot_acquired": lease.slot_acquired,
+                "worker_alive": worker_alive,
+                "active_command_runs": state.command_run.active_count_for_session(&session_id),
+                "retained_process_scopes": code_tools::shell_executor::retained_shell_process_scope_count_for_scope(&session_id),
+                "retained_slot": retained.iter().any(|value| value == &session_id)
+            }));
+        }
+        json!({
+            "status": "ok",
+            "active_session_count": sessions.len(),
+            "retained_slot_count": retained.len(),
+            "active_command_runs": state.command_run.active_count(),
+            "sessions": sessions
+        })
+    }
+
     pub fn active_session_count(&self) -> usize {
         self.sessions.lock().len()
+    }
+
+    pub(crate) fn intake_terminal_feed_entry(
+        &self,
+        entry: &SessionFeedEntry,
+        transaction_id: &str,
+    ) -> Result<Option<TerminalDeliveryIdentity>> {
+        let SessionFeedEvent::SessionProjectionUpdated { projection, .. } = &entry.event else {
+            return Ok(None);
+        };
+        if !projection.state.is_terminal() {
+            return Ok(None);
+        }
+        let Some(runtime_id) = entry
+            .runtime_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            // Session commands also publish terminal projections. They carry no
+            // runtime identity and therefore cannot own a terminal receipt.
+            return Ok(None);
+        };
+        let lease = self
+            .sessions
+            .lock()
+            .get(&entry.session_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("TERMINAL_FEED_LEASE_NOT_FOUND:{}", entry.session_id))?;
+        if lease.transaction_id != transaction_id {
+            return Err(anyhow!(
+                "TERMINAL_FEED_IDENTITY_MISMATCH:session={},runtime={},transaction={}",
+                entry.session_id,
+                runtime_id,
+                transaction_id
+            ));
+        }
+        if !terminal_runtime_is_current(
+            projection,
+            &entry.session_id,
+            &lease.runtime_id,
+            runtime_id,
+        )? {
+            return Ok(None);
+        }
+        let store = lifecycle_store(&lease.commander_session_id)?;
+        intake_terminal_receipt(
+            &store,
+            entry,
+            projection,
+            runtime_id,
+            transaction_id,
+            &lease,
+        )
+    }
+
+    pub(crate) fn acknowledge_terminal_delivery(
+        &self,
+        delivery: &TerminalDeliveryIdentity,
+    ) -> Result<()> {
+        lifecycle_store(&delivery.commander_session_id)?.acknowledge(
+            &delivery.transaction_id,
+            &delivery.event_id,
+            &delivery.transaction_id,
+        )?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -270,11 +649,15 @@ impl ExecutionService {
             RuntimeLease {
                 runtime_id: format!("runtime-{session_id}"),
                 lease_id: format!("lease-{session_id}"),
+                commander_session_id: session_id.to_string(),
+                transaction_id: format!("transaction-{session_id}"),
+                task_id: None,
+                goal_id: None,
+                operator_override: false,
                 slot_acquired,
             },
         );
     }
-
     async fn acquire_runtime_slot(
         &self,
         session_id: &str,
@@ -306,6 +689,220 @@ impl ExecutionService {
         lease.slot_acquired = true;
         true
     }
+
+    fn ensure_terminal_receipt(
+        &self,
+        session_id: &str,
+        dispatch_runtime_id: &str,
+        transaction_id: &str,
+    ) -> Result<TerminalDeliveryIdentity> {
+        let mut after_cursor = 0;
+        let mut latest = None;
+        loop {
+            let response = session_log_contract::client::call_service(
+                &SessionLogCommand::ReadSessionFeed(session_log_contract::ReadSessionFeedRequest {
+                    session_id: session_id.to_string(),
+                    after_cursor,
+                    limit: 1_000,
+                }),
+            )?;
+            let SessionLogResponse::SessionFeed {
+                entries,
+                next_cursor,
+            } = response
+            else {
+                return Err(anyhow!("TERMINAL_FEED_READ_FAILED:{response:?}"));
+            };
+            for entry in &entries {
+                if let Some(delivery) = self.intake_terminal_feed_entry(entry, transaction_id)? {
+                    latest = Some(delivery);
+                }
+            }
+            if next_cursor <= after_cursor {
+                return latest.ok_or_else(|| {
+                    anyhow!(
+                        "TERMINAL_FEED_EVENT_NOT_FOUND:session={session_id},runtime={dispatch_runtime_id}"
+                    )
+                });
+            }
+            after_cursor = next_cursor;
+        }
+    }
+
+    fn retain_runtime_slot(&self, session_id: &str, permit: RuntimeSlotPermit) {
+        self.retained_slots
+            .lock()
+            .insert(session_id.to_string(), permit);
+    }
+
+    async fn live_effect_evidence(&self, state: &AppState, session_id: &str) -> LiveEffectEvidence {
+        LiveEffectEvidence {
+            runtime_worker_alive: state
+                .manager
+                .worker_alive_by_key(&format!("runtime_worker:{session_id}"))
+                .await,
+            active_tool_calls: 0,
+            active_command_runs: state.command_run.active_count_for_session(session_id),
+            live_effect_processes:
+                code_tools::shell_executor::retained_shell_process_scope_count_for_scope(session_id),
+            pending_init: false,
+        }
+    }
+
+    fn spawn_retained_reclaimer(
+        &self,
+        state: AppState,
+        session_id: String,
+        delivery: TerminalDeliveryIdentity,
+    ) {
+        let notify = Arc::new(Notify::new());
+        if self
+            .retained_watchers
+            .lock()
+            .insert(session_id.clone(), Arc::clone(&notify))
+            .is_some()
+        {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if !service.retained_slots.lock().contains_key(&session_id) {
+                    if let Some(notify) = service.retained_watchers.lock().remove(&session_id) {
+                        notify.notify_one();
+                    }
+                    return;
+                }
+                let evidence = service.live_effect_evidence(&state, &session_id).await;
+                let outcome = match lifecycle_store(&delivery.commander_session_id).and_then(
+                    |store| {
+                        store
+                            .reclaim_terminal_slot(
+                                &delivery.transaction_id,
+                                &delivery.event_id,
+                                evidence,
+                            )
+                            .map_err(|error| anyhow!(error.to_string()))
+                    },
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        eprintln!(
+                            "router retained execution reclaimer deferred session={session_id}: {error:#}"
+                        );
+                        continue;
+                    }
+                };
+                match outcome {
+                    ReclaimOutcome::Released | ReclaimOutcome::AlreadyReleased => {
+                        service.retained_slots.lock().remove(&session_id);
+                        service.retained_watchers.lock().remove(&session_id);
+                        notify.notify_one();
+                        return;
+                    }
+                    ReclaimOutcome::Retained { .. } => {}
+                }
+            }
+        });
+    }
+
+    async fn wait_for_retained_release(&self, session_id: &str) {
+        loop {
+            let Some(notify) = self.retained_watchers.lock().get(session_id).cloned() else {
+                return;
+            };
+            let notified = notify.notified();
+            if !self.retained_slots.lock().contains_key(session_id) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+fn intake_terminal_receipt(
+    store: &SessionLifecycleStore,
+    entry: &SessionFeedEntry,
+    projection: &lifecycle::SessionProjection,
+    runtime_id: &str,
+    transaction_id: &str,
+    lease: &RuntimeLease,
+) -> Result<Option<TerminalDeliveryIdentity>> {
+    let receipt = store.terminal_receipt(transaction_id, &entry.event_id)?;
+    if receipt.commander_session_id != lease.commander_session_id
+        || receipt.child_session_id != entry.session_id
+        || receipt.runtime_id != runtime_id
+        || receipt.terminal_state != terminal_state(projection.state)?
+        || receipt.task_id != lease.task_id
+        || receipt.goal_id != lease.goal_id
+        || receipt.operator_override != lease.operator_override
+        || receipt
+            .audit_metadata
+            .get("dispatch_runtime_id")
+            .and_then(Value::as_str)
+            != Some(lease.runtime_id.as_str())
+        || receipt
+            .audit_metadata
+            .get("dispatch_lease_id")
+            .and_then(Value::as_str)
+            != Some(lease.lease_id.as_str())
+        || (runtime_id == lease.runtime_id && receipt.lease_id != lease.lease_id)
+    {
+        return Err(anyhow!(
+            "TERMINAL_RECEIPT_DISPATCH_IDENTITY_MISMATCH:session={},runtime={},transaction={},event={}",
+            entry.session_id,
+            runtime_id,
+            transaction_id,
+            entry.event_id
+        ));
+    }
+    match store.intake(transaction_id, &entry.event_id)? {
+        IntakeOutcome::Applied { .. } | IntakeOutcome::Duplicate { .. } => {
+            Ok(Some(TerminalDeliveryIdentity {
+                commander_session_id: lease.commander_session_id.clone(),
+                transaction_id: transaction_id.to_string(),
+                event_id: entry.event_id.clone(),
+                runtime_id: runtime_id.to_string(),
+            }))
+        }
+        IntakeOutcome::Pending { blocker } => Err(anyhow!(blocker)),
+    }
+}
+
+fn terminal_runtime_is_current(
+    projection: &lifecycle::SessionProjection,
+    session_id: &str,
+    dispatch_runtime_id: &str,
+    runtime_id: &str,
+) -> Result<bool> {
+    let Some(dispatch_index) = projection
+        .runtime_ids
+        .iter()
+        .position(|candidate| candidate == dispatch_runtime_id)
+    else {
+        return Ok(false);
+    };
+    let Some(runtime_index) = projection
+        .runtime_ids
+        .iter()
+        .position(|candidate| candidate == runtime_id)
+    else {
+        return Err(anyhow!(
+            "TERMINAL_FEED_RUNTIME_NOT_IN_SESSION:session={session_id},runtime={runtime_id}"
+        ));
+    };
+    if runtime_index < dispatch_index {
+        return Ok(false);
+    }
+    if projection.runtime_ids.last().map(String::as_str) != Some(runtime_id)
+        || projection.session_id != session_id
+    {
+        return Err(anyhow!(
+            "TERMINAL_FEED_RUNTIME_CHAIN_MISMATCH:session={session_id},dispatch_runtime={dispatch_runtime_id},runtime={runtime_id}"
+        ));
+    }
+    Ok(true)
 }
 
 #[derive(Clone, Default)]
@@ -370,6 +967,11 @@ impl ActiveSessionGuard {
         self.remove_matching_lease();
     }
 
+    fn retain(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn remove_matching_lease(&self) {
         let mut sessions = self.sessions.lock();
         if sessions
@@ -392,6 +994,7 @@ impl Drop for ActiveSessionGuard {
 fn payload_to_run_agent_request(
     request: &EnqueueTurnRequest,
     lease_id: &str,
+    fallback_from_id: Option<String>,
 ) -> Result<RunAgentRequest> {
     let mut value = request.payload.clone();
     if let Some(object) = value.as_object_mut() {
@@ -404,6 +1007,17 @@ fn payload_to_run_agent_request(
             Value::String(request.runtime_id.clone()),
         );
         object.insert("lease_id".to_string(), Value::String(lease_id.to_string()));
+        match fallback_from_id {
+            Some(fallback_from_id) => {
+                object.insert(
+                    "fallback_from_id".to_string(),
+                    Value::String(fallback_from_id),
+                );
+            }
+            None => {
+                object.remove("fallback_from_id");
+            }
+        }
     }
     serde_json::from_value(value).map_err(|error| {
         anyhow!(
@@ -414,12 +1028,37 @@ fn payload_to_run_agent_request(
     })
 }
 
-fn register_and_activate_runtime(session_id: &str, runtime_id: &str, lease_id: &str) -> Result<()> {
+fn lifecycle_store(commander_session_id: &str) -> Result<SessionLifecycleStore> {
+    let base = session_log_contract::client::default_db_dir().join("session_lifecycle_v1");
+    let root = commander_store_path(&base, commander_session_id)?;
+    Ok(SessionLifecycleStore::open(
+        root,
+        commander_session_id,
+        LifecycleConfig::default(),
+    )?)
+}
+
+fn terminal_state(state: SessionState) -> Result<TerminalState> {
+    match state {
+        SessionState::Completed => Ok(TerminalState::Completed),
+        SessionState::Failed => Ok(TerminalState::Failed),
+        SessionState::Cancelled => Ok(TerminalState::Cancelled),
+        SessionState::Interrupted => Ok(TerminalState::Interrupted),
+        other => Err(anyhow!("SESSION_STATE_NOT_TERMINAL:{other:?}")),
+    }
+}
+
+fn register_and_activate_runtime(
+    session_id: &str,
+    runtime_id: &str,
+    lease_id: &str,
+    fallback_from_id: Option<String>,
+) -> Result<()> {
     let response = session_log_contract::client::call_service(
         &SessionLogCommand::RegisterRuntime(RegisterRuntimeRequest {
             runtime_id: runtime_id.to_string(),
             session_id: session_id.to_string(),
-            fallback_from_id: None,
+            fallback_from_id,
         }),
     )?;
     match response {
@@ -467,6 +1106,189 @@ fn register_and_activate_runtime(session_id: &str, runtime_id: &str, lease_id: &
     }
 }
 
+fn runtime_registration_fallback(
+    session_id: &str,
+    expected_user_input: Option<&str>,
+) -> Result<Option<String>> {
+    let response = session_log_contract::client::call_service(&SessionLogCommand::GetSession(
+        GetSessionRequest {
+            session_id: session_id.to_string(),
+        },
+    ))?;
+    match response {
+        SessionLogResponse::Session {
+            session: Some(session),
+        } => {
+            let Some(latest_runtime_id) =
+                failed_session_runtime_fallback(&session.lifecycle_projection)?
+            else {
+                return Ok(None);
+            };
+            let expected_user_input = expected_user_input
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "FAILED_SESSION_RETRY_INPUT_MISSING:{}",
+                        session.lifecycle_projection.session_id
+                    )
+                })?;
+            failed_session_retry_root(
+                &session.lifecycle_projection,
+                &latest_runtime_id,
+                expected_user_input,
+                replay_runtime_identity,
+            )
+            .map(Some)
+        }
+        SessionLogResponse::Session { session: None } => Err(anyhow!(
+            "session_db cannot register runtime for missing session {session_id}"
+        )),
+        SessionLogResponse::Error { error } => Err(anyhow!(
+            "session_db failed to read session {session_id} before runtime registration: {error}"
+        )),
+        other => Err(anyhow!(
+            "unexpected session_db response while reading session {session_id}: {other:?}"
+        )),
+    }
+}
+
+const MAX_FAILED_RUNTIME_RECONCILIATION_DEPTH: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetryRuntimeIdentity {
+    runtime_id: String,
+    session_id: String,
+    state: RuntimeState,
+    latest_user_input: Option<String>,
+}
+
+fn replay_runtime_identity(runtime_id: &str) -> Result<Option<RetryRuntimeIdentity>> {
+    let response = session_log_contract::client::call_service(&SessionLogCommand::ReplayRuntime(
+        ReplayRuntimeRequest {
+            runtime_id: runtime_id.to_string(),
+        },
+    ))?;
+    match response {
+        SessionLogResponse::RuntimeReplayed {
+            runtime: Some(runtime),
+        } => Ok(Some(retry_runtime_identity(&runtime.aggregate))),
+        SessionLogResponse::RuntimeReplayed { runtime: None } => Ok(None),
+        SessionLogResponse::Error { error } => Err(anyhow!(
+            "session_db failed to replay runtime {runtime_id}: {error}"
+        )),
+        other => Err(anyhow!(
+            "unexpected session_db response while replaying runtime {runtime_id}: {other:?}"
+        )),
+    }
+}
+
+fn retry_runtime_identity(runtime: &RuntimeAggregate) -> RetryRuntimeIdentity {
+    let latest_user_input = runtime
+        .input
+        .as_ref()
+        .and_then(|input| input.get("messages"))
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages.iter().rev().find_map(|message| {
+                (message.get("role").and_then(Value::as_str) == Some("user"))
+                    .then(|| message.get("content").and_then(Value::as_str))
+                    .flatten()
+                    .map(str::to_string)
+            })
+        });
+    RetryRuntimeIdentity {
+        runtime_id: runtime.runtime_id.clone(),
+        session_id: runtime.session_id.clone(),
+        state: runtime.state,
+        latest_user_input,
+    }
+}
+
+fn failed_session_retry_root<F>(
+    projection: &lifecycle::SessionProjection,
+    latest_runtime_id: &str,
+    expected_user_input: &str,
+    mut replay_runtime: F,
+) -> Result<String>
+where
+    F: FnMut(&str) -> Result<Option<RetryRuntimeIdentity>>,
+{
+    let latest_index = projection
+        .runtime_ids
+        .iter()
+        .position(|runtime_id| runtime_id == latest_runtime_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "FAILED_SESSION_RETRY_SOURCE_NOT_IN_PROJECTION:{}:{}",
+                projection.session_id,
+                latest_runtime_id
+            )
+        })?;
+    let mut root = None;
+    for runtime_id in projection.runtime_ids[..=latest_index]
+        .iter()
+        .rev()
+        .take(MAX_FAILED_RUNTIME_RECONCILIATION_DEPTH)
+    {
+        let identity = replay_runtime(runtime_id)?.ok_or_else(|| {
+            anyhow!(
+                "FAILED_SESSION_RETRY_SOURCE_MISSING:{}:{}",
+                projection.session_id,
+                runtime_id
+            )
+        })?;
+        if identity.runtime_id != *runtime_id || identity.session_id != projection.session_id {
+            return Err(anyhow!(
+                "FAILED_SESSION_RETRY_SOURCE_IDENTITY_MISMATCH:{}:{}",
+                projection.session_id,
+                runtime_id
+            ));
+        }
+        if !matches!(
+            identity.state,
+            RuntimeState::Failed | RuntimeState::TimedOut
+        ) {
+            break;
+        }
+        root = Some(identity);
+    }
+    let root = root.ok_or_else(|| {
+        anyhow!(
+            "FAILED_SESSION_RETRY_ROOT_NOT_FOUND:{}:{}",
+            projection.session_id,
+            latest_runtime_id
+        )
+    })?;
+    if root.latest_user_input.as_deref().map(str::trim) != Some(expected_user_input.trim()) {
+        return Err(anyhow!(
+            "FAILED_SESSION_RETRY_ROOT_INPUT_MISMATCH:{}:{}",
+            projection.session_id,
+            root.runtime_id
+        ));
+    }
+    Ok(root.runtime_id)
+}
+
+fn failed_session_runtime_fallback(
+    projection: &lifecycle::SessionProjection,
+) -> Result<Option<String>> {
+    if projection.state != SessionState::Failed {
+        return Ok(None);
+    }
+    projection
+        .runtime_ids
+        .last()
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow!(
+                "FAILED_SESSION_MISSING_RUNTIME_LINEAGE:{}",
+                projection.session_id
+            )
+        })
+}
+
 fn debug_runtime_enabled() -> bool {
     std::env::var("TURA_DEBUG_RUNTIME")
         .ok()
@@ -480,10 +1302,239 @@ fn debug_runtime_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{payload_to_run_agent_request, EnqueueTurnRequest, ExecutionService};
+    use super::{
+        failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
+        payload_to_run_agent_request, terminal_runtime_is_current, EnqueueTurnRequest,
+        ExecutionService, RetryRuntimeIdentity, RouterRecoveryCloseRuntimeRequest, RuntimeLease,
+    };
     use crate::{build_state, services::manager::ServiceManager};
+    use lifecycle::{RuntimeState, SessionProjection, SessionState, TaskPlan};
     use serde_json::json;
+    use session_lifecycle::{
+        LifecycleConfig, SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity,
+        TerminalState,
+    };
+    use session_log_contract::{SessionFeedEntry, SessionFeedEvent};
+
+    #[test]
+    fn failed_session_registration_reuses_exact_latest_runtime_lineage() {
+        let mut projection = SessionProjection {
+            session_id: "session-retry".to_string(),
+            state: SessionState::Failed,
+            parent_id: None,
+            task_plan: TaskPlan::default(),
+            pending_user_inputs: Vec::new(),
+            cancelled: false,
+            runtime_ids: vec!["runtime-old".to_string(), "runtime-failed".to_string()],
+            active_runtime_id: None,
+        };
+
+        assert_eq!(
+            failed_session_runtime_fallback(&projection).expect("failed session fallback"),
+            Some("runtime-failed".to_string())
+        );
+
+        projection.state = SessionState::Completed;
+        assert_eq!(
+            failed_session_runtime_fallback(&projection).expect("completed session starts fresh"),
+            None
+        );
+
+        projection.state = SessionState::Failed;
+        projection.runtime_ids.clear();
+        assert!(failed_session_runtime_fallback(&projection)
+            .expect_err("failed session without lineage must fail closed")
+            .to_string()
+            .contains("FAILED_SESSION_MISSING_RUNTIME_LINEAGE"));
+    }
+
+    #[test]
+    fn failed_session_retry_recovers_root_before_legacy_unlinked_attempts() {
+        let projection = SessionProjection {
+            session_id: "session-retry".to_string(),
+            state: SessionState::Failed,
+            parent_id: None,
+            task_plan: TaskPlan::default(),
+            pending_user_inputs: Vec::new(),
+            cancelled: false,
+            runtime_ids: vec![
+                "runtime-completed".to_string(),
+                "runtime-root".to_string(),
+                "runtime-legacy-retry-1".to_string(),
+                "runtime-legacy-retry-2".to_string(),
+            ],
+            active_runtime_id: None,
+        };
+        let identities = std::collections::HashMap::from([
+            (
+                "runtime-completed",
+                RetryRuntimeIdentity {
+                    runtime_id: "runtime-completed".to_string(),
+                    session_id: "session-retry".to_string(),
+                    state: RuntimeState::Finished,
+                    latest_user_input: Some("older completed task".to_string()),
+                },
+            ),
+            (
+                "runtime-root",
+                RetryRuntimeIdentity {
+                    runtime_id: "runtime-root".to_string(),
+                    session_id: "session-retry".to_string(),
+                    state: RuntimeState::Failed,
+                    latest_user_input: Some("exact root task".to_string()),
+                },
+            ),
+            (
+                "runtime-legacy-retry-1",
+                RetryRuntimeIdentity {
+                    runtime_id: "runtime-legacy-retry-1".to_string(),
+                    session_id: "session-retry".to_string(),
+                    state: RuntimeState::Failed,
+                    latest_user_input: Some("legacy wrapper prompt".to_string()),
+                },
+            ),
+            (
+                "runtime-legacy-retry-2",
+                RetryRuntimeIdentity {
+                    runtime_id: "runtime-legacy-retry-2".to_string(),
+                    session_id: "session-retry".to_string(),
+                    state: RuntimeState::Failed,
+                    latest_user_input: Some("legacy wrapper prompt".to_string()),
+                },
+            ),
+        ]);
+
+        let root = failed_session_retry_root(
+            &projection,
+            "runtime-legacy-retry-2",
+            "exact root task",
+            |runtime_id| Ok(identities.get(runtime_id).cloned()),
+        )
+        .expect("legacy unlinked retries should reconcile to their failed root");
+        assert_eq!(root, "runtime-root");
+
+        let error = failed_session_retry_root(
+            &projection,
+            "runtime-legacy-retry-2",
+            "legacy wrapper prompt",
+            |runtime_id| Ok(identities.get(runtime_id).cloned()),
+        )
+        .expect_err("a rewritten retry prompt must not replace canonical root input");
+        assert!(error
+            .to_string()
+            .contains("FAILED_SESSION_RETRY_ROOT_INPUT_MISMATCH"));
+    }
     use std::sync::Arc;
+
+    #[test]
+    fn recovery_router_payload_rejects_caller_supplied_quiescence() {
+        let request = json!({
+            "receipt_id": "receipt-1",
+            "database_path": "/tmp/session_log.sqlite3",
+            "runtime_id": "runtime-1",
+            "session_id": "session-1",
+            "lease_id": "lease-1",
+            "expected_lease_active": true,
+            "expected_revision": 0,
+            "expected_last_event_seq": 0,
+            "expected_session_event_seq": 1,
+            "expected_session_state": "interrupted",
+            "reason": "unborn_runtime",
+            "quiescence": {
+                "active_turn": false
+            }
+        });
+
+        let error = serde_json::from_value::<RouterRecoveryCloseRuntimeRequest>(request)
+            .expect_err("caller-supplied quiescence proof must be rejected");
+        assert!(error.to_string().contains("unknown field `quiescence`"));
+    }
+
+    #[tokio::test]
+    async fn queued_recovery_writer_does_not_deadlock_nested_command_run() {
+        let workspace = tempfile::tempdir().expect("nested command workspace");
+        let state = build_state();
+        let service = ExecutionService::new();
+        service.set_session_lease_for_test("nested-session", true);
+        let outer_turn_lease = service.admission.read().await;
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let writer_gate = Arc::clone(&service.admission);
+        let writer = tokio::spawn(async move {
+            queued_tx.send(()).expect("signal queued recovery writer");
+            let _recovery = writer_gate.write().await;
+        });
+        queued_rx.await.expect("recovery writer queued");
+        tokio::task::yield_now().await;
+        assert!(!writer.is_finished());
+
+        let nested = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.command_run_request(
+                &state,
+                json!({
+                    "session_id": "nested-session",
+                    "runtime_id": "runtime-nested-session",
+                    "session_directory": workspace.path().display().to_string(),
+                    "arguments": {
+                        "commands": [{
+                            "command": "task_status",
+                            "command_line": json!({
+                                "status": "done",
+                                "task_group": "nested admission canary"
+                            }).to_string()
+                        }]
+                    },
+                    "allowed_commands": ["task_status"]
+                }),
+                "nested-command-run-canary",
+            ),
+        )
+        .await
+        .expect("nested command_run must not wait behind recovery writer")
+        .expect("nested command_run should finish");
+        assert_eq!(nested["result"]["results"][0]["success"], true);
+
+        drop(outer_turn_lease);
+        tokio::time::timeout(std::time::Duration::from_secs(1), writer)
+            .await
+            .expect("recovery writer should acquire after outer turn release")
+            .expect("recovery writer task should join");
+    }
+
+    #[tokio::test]
+    async fn active_router_turn_denies_recovery_before_session_db_mutation() {
+        let state = build_state();
+        let service = ExecutionService::new();
+        service.set_session_lease_for_test("active-recovery-session", true);
+
+        let response = service
+            .recovery_close_runtime(
+                &state,
+                json!({
+                    "receipt_id": "active-recovery-receipt",
+                    "database_path": "/tmp/session_log.sqlite3",
+                    "runtime_id": "runtime-active-recovery-session",
+                    "session_id": "active-recovery-session",
+                    "lease_id": "lease-active-recovery-session",
+                    "expected_lease_active": true,
+                    "expected_revision": 0,
+                    "expected_last_event_seq": 0,
+                    "expected_session_event_seq": 1,
+                    "expected_session_state": "interrupted",
+                    "reason": "unborn_runtime"
+                }),
+            )
+            .await
+            .expect("active recovery denial");
+
+        assert_eq!(response["result"]["outcome"], "runtime_live");
+        assert_eq!(response["result"]["proof"]["active_turn"], true);
+        assert_eq!(response["result"]["proof"]["running_turn"], true);
+        assert_eq!(
+            response["result"]["proof"]["global_active_session_count"],
+            1
+        );
+    }
 
     #[test]
     fn payload_to_run_agent_request_injects_authoritative_session_id() {
@@ -498,11 +1549,16 @@ mod tests {
             }),
         };
 
-        let run = payload_to_run_agent_request(&request, "lease-test")
-            .expect("valid enqueue payload should become run-agent request");
+        let run = payload_to_run_agent_request(
+            &request,
+            "lease-test",
+            Some("runtime-failed".to_string()),
+        )
+        .expect("valid enqueue payload should become run-agent request");
 
         assert_eq!(run.session_id.as_deref(), Some("session-authoritative"));
         assert_eq!(run.runtime_id, "runtime-1");
+        assert_eq!(run.fallback_from_id.as_deref(), Some("runtime-failed"));
         assert_eq!(run.prompt.as_deref(), Some("hello"));
         assert_eq!(run.model.as_deref(), Some("openai/gpt-test"));
         assert_eq!(
@@ -523,7 +1579,7 @@ mod tests {
             }),
         };
 
-        let error = payload_to_run_agent_request(&request, "lease-test")
+        let error = payload_to_run_agent_request(&request, "lease-test", None)
             .expect_err("invalid worker_env shape should be rejected");
 
         assert!(
@@ -531,6 +1587,173 @@ mod tests {
                 && error.to_string().contains("runtime-invalid")
                 && error.to_string().contains("session-invalid"),
             "invalid payload error should include runtime and session context: {error}"
+        );
+    }
+
+    #[test]
+    fn terminal_runtime_chain_accepts_fallback_and_ignores_prior_turns() {
+        let projection = SessionProjection {
+            session_id: "child-1".to_string(),
+            state: SessionState::Completed,
+            parent_id: Some("commander-1".to_string()),
+            task_plan: TaskPlan::default(),
+            pending_user_inputs: Vec::new(),
+            cancelled: false,
+            runtime_ids: vec![
+                "old-runtime".to_string(),
+                "dispatch-runtime".to_string(),
+                "fallback-runtime".to_string(),
+            ],
+            active_runtime_id: None,
+        };
+
+        assert!(!terminal_runtime_is_current(
+            &projection,
+            "child-1",
+            "dispatch-runtime",
+            "old-runtime",
+        )
+        .expect("historical runtime should be ignored"));
+        assert!(terminal_runtime_is_current(
+            &projection,
+            "child-1",
+            "dispatch-runtime",
+            "fallback-runtime",
+        )
+        .expect("latest fallback should be accepted"));
+        let error = terminal_runtime_is_current(
+            &projection,
+            "child-1",
+            "dispatch-runtime",
+            "dispatch-runtime",
+        )
+        .expect_err("non-latest dispatch runtime must not terminate a fallback chain");
+        assert!(error
+            .to_string()
+            .contains("TERMINAL_FEED_RUNTIME_CHAIN_MISMATCH"));
+    }
+
+    #[test]
+    fn fallback_receipt_intake_is_exactly_once_and_preserves_dispatch_identity() {
+        let root = tempfile::tempdir().expect("lifecycle root");
+        let store =
+            SessionLifecycleStore::open(root.path(), "commander-1", LifecycleConfig::default())
+                .expect("lifecycle store");
+        let lease = RuntimeLease {
+            runtime_id: "dispatch-runtime".to_string(),
+            lease_id: "dispatch-lease".to_string(),
+            commander_session_id: "commander-1".to_string(),
+            transaction_id: "transaction-1".to_string(),
+            task_id: Some("task-1".to_string()),
+            goal_id: Some("goal-1".to_string()),
+            operator_override: true,
+            slot_acquired: true,
+        };
+        let projection = SessionProjection {
+            session_id: "child-1".to_string(),
+            state: SessionState::Completed,
+            parent_id: Some("commander-1".to_string()),
+            task_plan: TaskPlan::default(),
+            pending_user_inputs: Vec::new(),
+            cancelled: false,
+            runtime_ids: vec![
+                "dispatch-runtime".to_string(),
+                "fallback-runtime".to_string(),
+            ],
+            active_runtime_id: None,
+        };
+        let entry = SessionFeedEntry {
+            session_id: "child-1".to_string(),
+            cursor: 9,
+            runtime_id: Some("fallback-runtime".to_string()),
+            event_id: "fallback-runtime:5:session-projection".to_string(),
+            event: SessionFeedEvent::SessionProjectionUpdated {
+                projection: projection.clone(),
+                session_name: None,
+                updated_at: 10,
+            },
+        };
+        let mut receipt = TerminalReceipt::new(
+            TerminalReceiptIdentity::new(
+                "transaction-1",
+                entry.event_id.clone(),
+                0,
+                "commander-1",
+                "child-1",
+                "fallback-runtime",
+                "fallback-lease",
+            ),
+            TerminalState::Completed,
+            10,
+        );
+        receipt.task_id = Some("task-1".to_string());
+        receipt.goal_id = Some("goal-1".to_string());
+        receipt.operator_override = true;
+        receipt
+            .audit_metadata
+            .insert("dispatch_runtime_id".to_string(), json!("dispatch-runtime"));
+        receipt
+            .audit_metadata
+            .insert("dispatch_lease_id".to_string(), json!("dispatch-lease"));
+        store
+            .write_terminal_receipt(&receipt)
+            .expect("durable fallback receipt");
+
+        let first = intake_terminal_receipt(
+            &store,
+            &entry,
+            &projection,
+            "fallback-runtime",
+            "transaction-1",
+            &lease,
+        )
+        .expect("first intake")
+        .expect("terminal delivery");
+        let duplicate = intake_terminal_receipt(
+            &store,
+            &entry,
+            &projection,
+            "fallback-runtime",
+            "transaction-1",
+            &lease,
+        )
+        .expect("duplicate intake")
+        .expect("duplicate terminal delivery");
+        assert_eq!(first, duplicate);
+        assert_eq!(first.runtime_id, "fallback-runtime");
+        assert_eq!(store.readback().expect("readback").applied_receipts, 1);
+        assert_eq!(store.readback().expect("readback").pending_receipts, 0);
+    }
+
+    #[test]
+    fn terminal_session_command_projection_without_runtime_is_not_a_receipt() {
+        let service = ExecutionService::new();
+        let entry = SessionFeedEntry {
+            session_id: "child-1".to_string(),
+            cursor: 20,
+            runtime_id: None,
+            event_id: "session-command-1:session-projection".to_string(),
+            event: SessionFeedEvent::SessionProjectionUpdated {
+                projection: SessionProjection {
+                    session_id: "child-1".to_string(),
+                    state: SessionState::Completed,
+                    parent_id: Some("commander-1".to_string()),
+                    task_plan: TaskPlan::default(),
+                    pending_user_inputs: Vec::new(),
+                    cancelled: false,
+                    runtime_ids: vec!["dispatch-runtime".to_string()],
+                    active_runtime_id: None,
+                },
+                session_name: None,
+                updated_at: 10,
+            },
+        };
+
+        assert_eq!(
+            service
+                .intake_terminal_feed_entry(&entry, "transaction-1")
+                .expect("session-level terminal projections are not receipt failures"),
+            None
         );
     }
 
@@ -646,6 +1869,22 @@ mod tests {
         assert_eq!(sessions[0]["active_turn"], true);
         assert_eq!(sessions[0]["queued_turn"], true);
         assert_eq!(sessions[0]["worker_alive"], false);
+    }
+
+    #[tokio::test]
+    async fn execution_status_exposes_retained_and_command_liveness_evidence() {
+        let state = build_state();
+        let service = ExecutionService::new();
+        service.set_session_lease_for_test("status-session", true);
+
+        let response = service.status(&state).await;
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["active_session_count"], 1);
+        assert_eq!(response["active_command_runs"], 0);
+        assert_eq!(response["sessions"][0]["session_id"], "status-session");
+        assert_eq!(response["sessions"][0]["slot_acquired"], true);
+        assert_eq!(response["sessions"][0]["retained_slot"], false);
     }
 
     #[tokio::test]

@@ -7,7 +7,20 @@ use super::{
 };
 use serde_json::json;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[test]
+fn command_allowlist_matches_shell_aliases_by_canonical_identity() {
+    let allowed = BTreeSet::from(["shell_command".to_string()]);
+
+    assert!(super::command_allowed("zsh", Some(&allowed)));
+    assert!(super::command_allowed("bash", Some(&allowed)));
+    assert!(!super::command_allowed(
+        "unregistered_command",
+        Some(&allowed)
+    ));
+}
 
 #[test]
 fn parse_missing_steps_default_to_original_order_steps() {
@@ -162,7 +175,7 @@ fn parse_command_only_shell_text_is_mapped_to_active_shell_command() {
 }
 
 #[test]
-fn normalize_shell_commands_default_to_15_second_timeout() {
+fn normalize_shell_commands_default_to_five_minute_timeout() {
     let args = parse_args(&json!({
         "commands": [
             {
@@ -177,7 +190,38 @@ fn normalize_shell_commands_default_to_15_second_timeout() {
     let arguments =
         normalize_shell_command_arguments(&args.commands[0]).expect("normalize shell arguments");
 
-    assert_eq!(arguments["timeout_ms"], json!(15_000));
+    assert_eq!(arguments["timeout_ms"], json!(300_000));
+}
+
+#[test]
+fn parse_long_command_keeps_wall_and_stall_budgets_separate_and_bounded() {
+    let args = parse_args(&json!({
+        "timeout_ms": 14_400_000,
+        "stall_timeout_ms": 60_000,
+        "commands": [{"command_type": "bash", "command_line": "builder"}]
+    }))
+    .expect("bounded long command");
+
+    assert_eq!(args.commands[0].timeout_ms, Some(14_400_000));
+    assert_eq!(args.commands[0].stall_timeout_ms, Some(60_000));
+    let error = parse_args(&json!({
+        "timeout_ms": 14_400_001,
+        "commands": [{"command_type": "bash", "command_line": "builder"}]
+    }))
+    .expect_err("wall budget above four hours must fail closed");
+    assert!(error.contains("exceeds bounded maximum"), "{error}");
+}
+
+#[test]
+fn parse_rejects_stall_budget_that_cannot_fire_before_wall_timeout() {
+    let error = parse_args(&json!({
+        "timeout_ms": 10_000,
+        "stall_timeout_ms": 10_000,
+        "commands": [{"command_type": "bash", "command_line": "builder"}]
+    }))
+    .expect_err("stall watchdog must be lower than wall timeout");
+
+    assert!(error.contains("stall_timeout_ms must be lower"), "{error}");
 }
 
 #[test]
@@ -669,6 +713,45 @@ async fn streaming_executor_returns_safe_shell_result_before_finish() {
         result[0].get("success").and_then(Value::as_bool),
         Some(true)
     );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn parallel_read_only_shells_each_preserve_a_known_terminal_receipt() {
+    let workspace = temporary_workspace("parallel-read-only-terminal-receipts");
+    let active_shell = crate::commands::active_shell_command_name();
+    let commands = (0..6)
+        .map(|index| {
+            json!({
+                "id": format!("read-{index}"),
+                "command_type": active_shell,
+                "command_line": format!("printf 'read-{index}\\n'"),
+                "timeout_ms": 3000,
+                "step": 1
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let output = super::execute_async_value(
+        json!({"execution_id": "parallel-read-only", "commands": commands}),
+        workspace.clone(),
+    )
+    .await;
+
+    let results = output["results"].as_array().expect("command results");
+    assert_eq!(results.len(), 6, "{output}");
+    for result in results {
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(
+            result["output"]["terminal_receipt"]["terminal_state"], "completed",
+            "{result}"
+        );
+        assert_eq!(
+            result["output"]["terminal_receipt"]["failure_class"], "none",
+            "{result}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(workspace);
 }

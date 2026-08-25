@@ -1,25 +1,33 @@
 use crate::commands::CommandResponse;
 use crate::runtime::tool::ToolContext;
-use serde_json::Value;
-use std::io::Read;
+use serde_json::{json, Value};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 
 use super::process::{
     attach_shell_process_scope, configure_process_scope, configure_tokio_process_scope,
-    retain_shell_process_scope, terminate_process_tree,
+    process_is_alive, retain_shell_process_scope, terminate_process_tree,
 };
 use super::response::failed_async_response;
 
 const EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_EXEC_OUTPUT_DELTAS_PER_CALL: usize = 512;
+const PROCESS_TERMINATION_GRACE_SECS: u64 = 5;
 
-pub(super) fn run_command_with_timeout(mut command: Command, timeout_secs: u64) -> CommandResponse {
+pub(super) fn run_command_with_timeout(
+    mut command: Command,
+    timeout_secs: u64,
+    stall_timeout_secs: Option<u64>,
+) -> CommandResponse {
     let started = Instant::now();
+    let progress = ProgressClock::new();
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -28,19 +36,19 @@ pub(super) fn run_command_with_timeout(mut command: Command, timeout_secs: u64) 
     match command.spawn() {
         Ok(mut child) => {
             let mut scope = attach_shell_process_scope(child.id());
-            let stdout_task = child
-                .stdout
-                .take()
-                .map(|stream| thread::spawn(move || read_blocking_stream(stream)));
-            let stderr_task = child
-                .stderr
-                .take()
-                .map(|stream| thread::spawn(move || read_blocking_stream(stream)));
+            let stdout_task = child.stdout.take().map(|stream| {
+                let progress = progress.clone();
+                thread::spawn(move || read_blocking_stream(stream, progress))
+            });
+            let stderr_task = child.stderr.take().map(|stream| {
+                let progress = progress.clone();
+                thread::spawn(move || read_blocking_stream(stream, progress))
+            });
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         if let Some(scope) = scope.take() {
-                            retain_shell_process_scope(scope);
+                            retain_shell_process_scope(scope, None);
                         }
                         let (stdout, stderr) = drain_blocking_stream_tasks(
                             stdout_task,
@@ -50,7 +58,11 @@ pub(super) fn run_command_with_timeout(mut command: Command, timeout_secs: u64) 
                         return command_response_from_status(started, status, stdout, stderr);
                     }
                     Ok(None) => {
-                        if started.elapsed() >= Duration::from_secs(timeout_secs) {
+                        let wall_timed_out = started.elapsed() >= Duration::from_secs(timeout_secs);
+                        let stalled = stall_timeout_secs.is_some_and(|seconds| {
+                            progress.elapsed() >= Duration::from_secs(seconds)
+                        });
+                        if wall_timed_out || stalled {
                             if let Some(scope) = &scope {
                                 scope.terminate();
                             }
@@ -62,7 +74,23 @@ pub(super) fn run_command_with_timeout(mut command: Command, timeout_secs: u64) 
                                 stderr_task,
                                 Duration::from_secs(2),
                             );
-                            let mut message = format!("Timed out after {timeout_secs} seconds");
+                            let (error_type, failure_class, termination_origin, mut message) =
+                                if stalled {
+                                    let seconds = stall_timeout_secs.unwrap_or_default();
+                                    (
+                                        "CommandStalled",
+                                        "progress_stall",
+                                        "progress_watchdog",
+                                        format!("No command progress for {seconds} seconds"),
+                                    )
+                                } else {
+                                    (
+                                        "CommandWallClockTimedOut",
+                                        "wrapper_wall_clock_timeout",
+                                        "command_run_wrapper",
+                                        format!("Timed out after {timeout_secs} seconds"),
+                                    )
+                                };
                             if !stderr.is_empty() {
                                 message.push_str("\nStderr tail:\n");
                                 message.push_str(&tail_chars(&stderr, 4000));
@@ -72,7 +100,12 @@ pub(super) fn run_command_with_timeout(mut command: Command, timeout_secs: u64) 
                                 exit_code: -1,
                                 stdout,
                                 stderr,
-                                output: Value::String(message),
+                                output: terminated_unknown_outcome(
+                                    error_type,
+                                    failure_class,
+                                    termination_origin,
+                                    message,
+                                ),
                                 changes: Vec::new(),
                             };
                         }
@@ -102,13 +135,14 @@ pub(super) fn run_command_with_timeout(mut command: Command, timeout_secs: u64) 
     }
 }
 
-fn read_blocking_stream<R: Read>(mut stream: R) -> String {
+fn read_blocking_stream<R: Read>(mut stream: R, progress: ProgressClock) -> String {
     let mut output = CappedOutput::new();
     let mut buffer = [0_u8; 8192];
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => {
+                progress.mark();
                 output.push(&buffer[..n]);
             }
             Err(_) => break,
@@ -180,9 +214,50 @@ fn tail_chars(text: &str, max_chars: usize) -> String {
 pub(super) async fn run_tokio_command_with_timeout(
     mut command: tokio::process::Command,
     timeout_secs: u64,
+    stall_timeout_secs: Option<u64>,
     ctx: &ToolContext,
 ) -> CommandResponse {
     let started = Instant::now();
+    let progress = ProgressClock::new();
+    if let Err(error) = reconcile_command_execution_claims(&ctx.session_dir, ctx.current_call_id())
+    {
+        return CommandResponse {
+            success: false,
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: error.clone(),
+            output: json!({
+                "error_type": "CommandExecutionReconciliationRequired",
+                "failure_class": "duplicate_or_unreconciled_execution",
+                "termination_origin": "command_run_admission",
+                "message": error,
+                "outcome": "unknown",
+                "retry_safe": false,
+                "auto_retry_allowed": false,
+                "reconcile_required": true
+            }),
+            changes: Vec::new(),
+        };
+    }
+    if let Err(error) = claim_command_execution(ctx, timeout_secs, stall_timeout_secs) {
+        return CommandResponse {
+            success: false,
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: error.clone(),
+            output: json!({
+                "error_type": "CommandExecutionClaimFailed",
+                "failure_class": "duplicate_or_unreconciled_execution",
+                "termination_origin": "command_run_admission",
+                "message": error,
+                "outcome": "unknown",
+                "retry_safe": false,
+                "auto_retry_allowed": false,
+                "reconcile_required": true
+            }),
+            changes: Vec::new(),
+        };
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -190,9 +265,69 @@ pub(super) async fn run_tokio_command_with_timeout(
     configure_tokio_process_scope(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(err) => return failed_async_response(&err.to_string(), 1),
+        Err(err) => {
+            let mut response = failed_async_response(&err.to_string(), 1);
+            if let Err(receipt_error) = attach_durable_terminal_receipt(
+                &mut response,
+                ctx,
+                None,
+                started,
+                timeout_secs,
+                stall_timeout_secs,
+                "spawn_failed",
+                "workload_spawn_failure",
+                "command_run_spawn",
+                "known",
+                true,
+                true,
+            ) {
+                response.output = json!({
+                    "error_type": "CommandTerminalReceiptWriteFailed",
+                    "failure_class": "control_plane_receipt_failure",
+                    "termination_origin": "command_run_spawn",
+                    "message": receipt_error,
+                    "outcome": "unknown",
+                    "retry_safe": false,
+                    "auto_retry_allowed": false,
+                    "reconcile_required": true
+                });
+            }
+            return response;
+        }
     };
     let pid = child.id();
+    if let Err(error) = update_command_claim_running(ctx, pid, timeout_secs, stall_timeout_secs) {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let process_group_empty = pid.map(|pid| !process_is_alive(pid)).unwrap_or(true);
+        let mut response = failed_async_response(&error, 1);
+        if let Err(receipt_error) = attach_durable_terminal_receipt(
+            &mut response,
+            ctx,
+            pid,
+            started,
+            timeout_secs,
+            stall_timeout_secs,
+            "claim_update_failed",
+            "control_plane_claim_failure",
+            "command_run_admission",
+            "unknown",
+            true,
+            process_group_empty,
+        ) {
+            response.output = json!({
+                "error_type": "CommandTerminalReceiptWriteFailed",
+                "failure_class": "control_plane_receipt_failure",
+                "termination_origin": "command_run_admission",
+                "message": receipt_error,
+                "outcome": "unknown",
+                "retry_safe": false,
+                "auto_retry_allowed": false,
+                "reconcile_required": true
+            });
+        }
+        return response;
+    }
     let mut scope = pid.and_then(attach_shell_process_scope);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -210,6 +345,7 @@ pub(super) async fn run_tokio_command_with_timeout(
             call_id.clone(),
             "stdout",
             capture,
+            progress.clone(),
         ))
     });
     let stderr_task = stderr.map(|reader| {
@@ -223,10 +359,12 @@ pub(super) async fn run_tokio_command_with_timeout(
             call_id.clone(),
             "stderr",
             capture,
+            progress.clone(),
         ))
     });
     let mut wait_task = tokio::spawn(async move { child.wait().await });
     let mut expiration = None;
+    let mut termination = None;
     let status = if ctx.cancellation.is_cancelled() {
         expiration = Some("tool task aborted".to_string());
         if let Some(scope) = &scope {
@@ -240,7 +378,20 @@ pub(super) async fn run_tokio_command_with_timeout(
         tokio::select! {
             output = &mut wait_task => output.ok().and_then(Result::ok),
             _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+                termination = Some(("CommandWallClockTimedOut", "wrapper_wall_clock_timeout", "command_run_wrapper"));
                 expiration = Some(format!("Timed out after {timeout_secs} seconds"));
+                if let Some(scope) = &scope {
+                    scope.terminate();
+                }
+                if let Some(pid) = pid {
+                    terminate_process_tree(pid);
+                }
+                None
+            }
+            _ = wait_for_stall(progress.clone(), stall_timeout_secs), if stall_timeout_secs.is_some() => {
+                let seconds = stall_timeout_secs.unwrap_or_default();
+                termination = Some(("CommandStalled", "progress_stall", "progress_watchdog"));
+                expiration = Some(format!("No command progress for {seconds} seconds"));
                 if let Some(scope) = &scope {
                     scope.terminate();
                 }
@@ -261,19 +412,30 @@ pub(super) async fn run_tokio_command_with_timeout(
             }
         }
     };
-    if status.is_some()
-        && let Some(scope) = scope.take()
-    {
-        retain_shell_process_scope(scope);
-    }
+    let mut process_reaped = status.is_some();
     if status.is_none() {
-        wait_task.abort();
+        process_reaped = tokio::time::timeout(
+            Duration::from_secs(PROCESS_TERMINATION_GRACE_SECS),
+            &mut wait_task,
+        )
+        .await
+        .ok()
+        .and_then(|joined| joined.ok())
+        .and_then(Result::ok)
+        .is_some();
+    }
+    let process_group_empty = scope.as_ref().is_none_or(|scope| !scope.has_live_members());
+    if let Some(scope) = scope.take()
+        && scope.has_live_members()
+    {
+        retain_shell_process_scope(scope, ctx.lock_scope());
     }
     let (stdout, stderr) =
         drain_stream_tasks(stdout_task, stdout_capture, stderr_task, stderr_capture).await;
 
     let wall = started.elapsed().as_secs_f32();
-    match status {
+    let was_cancelled = expiration.is_some() && termination.is_none();
+    let mut response = match status {
         Some(status) => {
             let exit_code = status.code().unwrap_or(1);
             let mut text =
@@ -308,10 +470,582 @@ pub(super) async fn run_tokio_command_with_timeout(
                 exit_code: -1,
                 stdout,
                 stderr,
-                output: Value::String(text),
+                output: if let Some((error_type, failure_class, termination_origin)) = termination {
+                    terminated_unknown_outcome(error_type, failure_class, termination_origin, text)
+                } else {
+                    Value::String(text)
+                },
                 changes: Vec::new(),
             }
         }
+    };
+    let (terminal_state, failure_class, termination_origin, outcome) =
+        if let Some((_, failure_class, termination_origin)) = termination {
+            ("terminated", failure_class, termination_origin, "unknown")
+        } else if was_cancelled {
+            (
+                "cancelled",
+                "wrapper_cancellation",
+                "runtime_cancellation",
+                "unknown",
+            )
+        } else if response.exit_code == 0 {
+            ("completed", "none", "workload", "known")
+        } else {
+            ("failed", "workload_exit_nonzero", "workload", "known")
+        };
+    if let Err(error) = attach_durable_terminal_receipt(
+        &mut response,
+        ctx,
+        pid,
+        started,
+        timeout_secs,
+        stall_timeout_secs,
+        terminal_state,
+        failure_class,
+        termination_origin,
+        outcome,
+        process_reaped,
+        process_group_empty,
+    ) {
+        response.success = false;
+        response.exit_code = -1;
+        response.stderr = if response.stderr.is_empty() {
+            error.clone()
+        } else {
+            format!("{}\n{}", response.stderr, error)
+        };
+        response.output = json!({
+            "error_type": "CommandTerminalReceiptWriteFailed",
+            "failure_class": "control_plane_receipt_failure",
+            "termination_origin": "command_run_wrapper",
+            "message": error,
+            "outcome": "unknown",
+            "retry_safe": false,
+            "auto_retry_allowed": false,
+            "reconcile_required": true
+        });
+    }
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_durable_terminal_receipt(
+    response: &mut CommandResponse,
+    ctx: &ToolContext,
+    pid: Option<u32>,
+    started: Instant,
+    timeout_secs: u64,
+    stall_timeout_secs: Option<u64>,
+    terminal_state: &str,
+    failure_class: &str,
+    termination_origin: &str,
+    outcome: &str,
+    process_reaped: bool,
+    process_group_empty: bool,
+) -> Result<(), String> {
+    let call_id = ctx.current_call_id().unwrap_or("command_run");
+    let receipt = json!({
+        "schema_version": "tura_command_terminal_receipt_v1",
+        "call_id": call_id,
+        "pid": pid,
+        "terminal_state": terminal_state,
+        "failure_class": failure_class,
+        "termination_origin": termination_origin,
+        "exit_code": response.exit_code,
+        "wall_time_ms": started.elapsed().as_millis() as u64,
+        "wall_timeout_ms": timeout_secs.saturating_mul(1000),
+        "stall_timeout_ms": stall_timeout_secs.map(|seconds| seconds.saturating_mul(1000)),
+        "outcome": outcome,
+        "process_reaped": process_reaped,
+        "process_group_empty": process_group_empty,
+        "termination_proven": process_reaped && process_group_empty,
+        "authority_effect": "none",
+        "authoritative_publication": "unproven",
+        "staging_authority": "none",
+        "retry_safe": false,
+        "auto_retry_allowed": false,
+        "reconcile_required": outcome == "unknown"
+            || failure_class == "workload_exit_nonzero"
+            || !(process_reaped && process_group_empty),
+        "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof"
+    });
+    let path = ctx
+        .current_call_id()
+        .map(|call_id| command_receipt_path(&ctx.session_dir, call_id));
+    if let Some(path) = path.as_ref() {
+        durable_write_receipt(path, &receipt)?;
+    }
+    let prior_output = std::mem::replace(&mut response.output, Value::Null);
+    let mut output = match prior_output {
+        Value::Object(object) => object,
+        Value::String(message) => {
+            let mut object = serde_json::Map::new();
+            object.insert("message".to_string(), Value::String(message));
+            object
+        }
+        _ => serde_json::Map::new(),
+    };
+    output.insert("terminal_receipt".to_string(), receipt);
+    if let Some(path) = path {
+        output.insert(
+            "terminal_receipt_path".to_string(),
+            Value::String(path.display().to_string()),
+        );
+    }
+    response.output = Value::Object(output);
+    mark_claim_terminal(
+        ctx,
+        terminal_state,
+        outcome,
+        process_reaped,
+        process_group_empty,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn run_in_process_command_with_terminal_receipt<F>(
+    ctx: &ToolContext,
+    termination_origin: &str,
+    operation: F,
+) -> CommandResponse
+where
+    F: FnOnce() -> CommandResponse,
+{
+    let started = Instant::now();
+    if let Err(error) = reconcile_command_execution_claims(&ctx.session_dir, ctx.current_call_id())
+    {
+        return CommandResponse {
+            success: false,
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: error.clone(),
+            output: json!({
+                "error_type": "CommandExecutionReconciliationRequired",
+                "failure_class": "duplicate_or_unreconciled_execution",
+                "termination_origin": "command_run_admission",
+                "message": error,
+                "outcome": "unknown",
+                "retry_safe": false,
+                "auto_retry_allowed": false,
+                "reconcile_required": true
+            }),
+            changes: Vec::new(),
+        };
+    }
+    if let Err(error) = claim_command_execution(ctx, 0, None) {
+        return CommandResponse {
+            success: false,
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: error.clone(),
+            output: json!({
+                "error_type": "CommandExecutionClaimFailed",
+                "failure_class": "duplicate_or_unreconciled_execution",
+                "termination_origin": "command_run_admission",
+                "message": error,
+                "outcome": "unknown",
+                "retry_safe": false,
+                "auto_retry_allowed": false,
+                "reconcile_required": true
+            }),
+            changes: Vec::new(),
+        };
+    }
+
+    let mut response = operation();
+    let (terminal_state, failure_class) = if response.exit_code == 0 {
+        ("completed", "none")
+    } else {
+        ("failed", "workload_exit_nonzero")
+    };
+    if let Err(error) = attach_durable_terminal_receipt(
+        &mut response,
+        ctx,
+        None,
+        started,
+        0,
+        None,
+        terminal_state,
+        failure_class,
+        termination_origin,
+        "known",
+        true,
+        true,
+    ) {
+        response.success = false;
+        response.exit_code = -1;
+        response.stderr = if response.stderr.is_empty() {
+            error.clone()
+        } else {
+            format!("{}\n{}", response.stderr, error)
+        };
+        response.output = json!({
+            "error_type": "CommandTerminalReceiptWriteFailed",
+            "failure_class": "control_plane_receipt_failure",
+            "termination_origin": termination_origin,
+            "message": error,
+            "outcome": "unknown",
+            "retry_safe": false,
+            "auto_retry_allowed": false,
+            "reconcile_required": true
+        });
+    }
+    response
+}
+
+fn command_receipt_path(session_dir: &Path, call_id: &str) -> PathBuf {
+    session_dir
+        .join(".tura/run/command_receipts")
+        .join(format!("{}.json", safe_call_id(call_id)))
+}
+
+fn command_claim_path(session_dir: &Path, call_id: &str) -> PathBuf {
+    session_dir
+        .join(".tura/run/command_receipts")
+        .join(format!("{}.claim.json", safe_call_id(call_id)))
+}
+
+fn safe_call_id(call_id: &str) -> String {
+    let mut safe = String::new();
+    for character in call_id.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+            safe.push(character);
+        } else {
+            safe.push_str(&format!("_x{:x}_", character as u32));
+        }
+    }
+    if safe.is_empty() {
+        "command_run".to_string()
+    } else {
+        safe
+    }
+}
+
+fn claim_command_execution(
+    ctx: &ToolContext,
+    timeout_secs: u64,
+    stall_timeout_secs: Option<u64>,
+) -> Result<(), String> {
+    let Some(call_id) = ctx.current_call_id() else {
+        return Ok(());
+    };
+    let path = command_claim_path(&ctx.session_dir, call_id);
+    let parent = path
+        .parent()
+        .ok_or_else(|| "COMMAND_EXECUTION_CLAIM_PARENT_MISSING".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let started_at_unix_ms = unix_time_ms();
+    let claim = serde_json::to_vec_pretty(&json!({
+        "schema_version": "tura_command_execution_claim_v1",
+        "call_id": call_id,
+        "state": "claimed",
+        "pid": Value::Null,
+        "owner_pid": std::process::id(),
+        "started_at_unix_ms": started_at_unix_ms,
+        "deadline_unix_ms": started_at_unix_ms
+            .saturating_add(timeout_secs.saturating_mul(1000)),
+        "wall_timeout_ms": timeout_secs.saturating_mul(1000),
+        "stall_timeout_ms": stall_timeout_secs.map(|seconds| seconds.saturating_mul(1000)),
+        "authority_effect": "none",
+        "execution_count": 1,
+        "replay_allowed": false
+    }))
+    .map_err(|error| error.to_string())?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("COMMAND_EXECUTION_ALREADY_CLAIMED:{}", path.display())
+            } else {
+                error.to_string()
+            }
+        })?;
+    file.write_all(&claim).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    sync_receipt_directory(parent)
+}
+
+fn update_command_claim_running(
+    ctx: &ToolContext,
+    pid: Option<u32>,
+    timeout_secs: u64,
+    stall_timeout_secs: Option<u64>,
+) -> Result<(), String> {
+    let Some(call_id) = ctx.current_call_id() else {
+        return Ok(());
+    };
+    let path = command_claim_path(&ctx.session_dir, call_id);
+    let existing = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let mut claim: Value = serde_json::from_str(&existing).map_err(|error| error.to_string())?;
+    let object = claim
+        .as_object_mut()
+        .ok_or_else(|| "COMMAND_EXECUTION_CLAIM_INVALID".to_string())?;
+    object.insert("state".to_string(), Value::String("running".to_string()));
+    object.insert("pid".to_string(), pid.map_or(Value::Null, |pid| json!(pid)));
+    object.insert("started_at_unix_ms".to_string(), json!(unix_time_ms()));
+    object.insert(
+        "deadline_unix_ms".to_string(),
+        json!(unix_time_ms().saturating_add(timeout_secs.saturating_mul(1000))),
+    );
+    object.insert(
+        "wall_timeout_ms".to_string(),
+        json!(timeout_secs.saturating_mul(1000)),
+    );
+    object.insert(
+        "stall_timeout_ms".to_string(),
+        stall_timeout_secs.map_or(Value::Null, |seconds| json!(seconds.saturating_mul(1000))),
+    );
+    durable_replace_json(&path, &claim)
+}
+
+fn mark_claim_terminal(
+    ctx: &ToolContext,
+    terminal_state: &str,
+    outcome: &str,
+    process_reaped: bool,
+    process_group_empty: bool,
+) -> Result<(), String> {
+    let Some(call_id) = ctx.current_call_id() else {
+        return Ok(());
+    };
+    let path = command_claim_path(&ctx.session_dir, call_id);
+    let existing = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let mut claim: Value = serde_json::from_str(&existing).map_err(|error| error.to_string())?;
+    let object = claim
+        .as_object_mut()
+        .ok_or_else(|| "COMMAND_EXECUTION_CLAIM_INVALID".to_string())?;
+    object.insert(
+        "state".to_string(),
+        Value::String(terminal_state.to_string()),
+    );
+    object.insert("terminal_at_unix_ms".to_string(), json!(unix_time_ms()));
+    object.insert("process_reaped".to_string(), json!(process_reaped));
+    object.insert(
+        "process_group_empty".to_string(),
+        json!(process_group_empty),
+    );
+    object.insert(
+        "reconcile_required".to_string(),
+        json!(outcome == "unknown" || !(process_reaped && process_group_empty)),
+    );
+    durable_replace_json(&path, &claim)
+}
+
+fn reconcile_command_execution_claims(
+    session_dir: &Path,
+    current_call_id: Option<&str>,
+) -> Result<(), String> {
+    let directory = session_dir.join(".tura/run/command_receipts");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json")
+            || !path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.ends_with(".claim.json"))
+        {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let claim: Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        let Some(object) = claim.as_object() else {
+            return Err(format!(
+                "COMMAND_EXECUTION_CLAIM_INVALID:{}",
+                path.display()
+            ));
+        };
+        let call_id = object
+            .get("call_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("COMMAND_EXECUTION_CLAIM_ID_MISSING:{}", path.display()))?;
+        let state = object
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("claimed");
+        if matches!(
+            state,
+            "completed"
+                | "failed"
+                | "terminated"
+                | "cancelled"
+                | "spawn_failed"
+                | "claim_update_failed"
+                | "interrupted"
+        ) {
+            continue;
+        }
+        if current_call_id == Some(call_id) {
+            return Err(format!(
+                "COMMAND_EXECUTION_ALREADY_CLAIMED:{}",
+                path.display()
+            ));
+        }
+        let owner_pid = object
+            .get("owner_pid")
+            .and_then(Value::as_u64)
+            .map(|pid| pid as u32);
+        let deadline_unix_ms = object
+            .get("deadline_unix_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if owner_pid.is_some_and(process_is_alive) && unix_time_ms() < deadline_unix_ms {
+            continue;
+        }
+        let pid = object
+            .get("pid")
+            .and_then(Value::as_u64)
+            .map(|pid| pid as u32);
+        if pid.is_some_and(process_is_alive) {
+            continue;
+        }
+        let receipt_path = command_receipt_path(session_dir, call_id);
+        if !receipt_path.exists() {
+            durable_write_receipt(
+                &receipt_path,
+                &json!({
+                    "schema_version": "tura_command_terminal_receipt_v1",
+                    "call_id": call_id,
+                    "pid": pid,
+                    "terminal_state": "interrupted",
+                    "failure_class": "orphaned_execution_claim",
+                    "termination_origin": "router_recovery",
+                    "outcome": "unknown",
+                    "process_reaped": false,
+                    "process_group_empty": false,
+                    "termination_proven": false,
+                    "authority_effect": "none",
+                    "authoritative_publication": "unproven",
+                    "staging_authority": "none",
+                    "retry_safe": false,
+                    "auto_retry_allowed": false,
+                    "reconcile_required": true,
+                    "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof"
+                }),
+            )?;
+        }
+        let mut interrupted = claim;
+        if let Some(object) = interrupted.as_object_mut() {
+            object.insert(
+                "state".to_string(),
+                Value::String("interrupted".to_string()),
+            );
+            object.insert("terminal_at_unix_ms".to_string(), json!(unix_time_ms()));
+            object.insert("reconcile_required".to_string(), Value::Bool(true));
+        }
+        durable_replace_json(&path, &interrupted)?;
+    }
+    Ok(())
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn durable_write_receipt(path: &Path, receipt: &Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(receipt).map_err(|error| error.to_string())?;
+    if path.exists() {
+        let existing = fs::read(path).map_err(|error| error.to_string())?;
+        if existing == bytes {
+            return Ok(());
+        }
+        return Err(format!(
+            "COMMAND_TERMINAL_RECEIPT_CONFLICT:{}",
+            path.display()
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "COMMAND_TERMINAL_RECEIPT_PARENT_MISSING".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| error.to_string())?;
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    fs::rename(&temp, path).map_err(|error| error.to_string())?;
+    sync_receipt_directory(parent)?;
+    Ok(())
+}
+
+fn durable_replace_json(path: &Path, value: &Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "COMMAND_JSON_PARENT_MISSING".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temp = path.with_extension(format!("tmp-{}-{}", std::process::id(), unix_time_ms()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| error.to_string())?;
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    fs::rename(&temp, path).map_err(|error| error.to_string())?;
+    sync_receipt_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_receipt_directory(path: &Path) -> Result<(), String> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn sync_receipt_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn terminated_unknown_outcome(
+    error_type: &str,
+    failure_class: &str,
+    termination_origin: &str,
+    message: String,
+) -> Value {
+    json!({
+        "error_type": error_type,
+        "failure_class": failure_class,
+        "termination_origin": termination_origin,
+        "message": message,
+        "outcome": "unknown",
+        "authoritative_publication": "unproven",
+        "staging_authority": "none",
+        "retry_safe": false,
+        "auto_retry_allowed": false,
+        "reconcile_required": true,
+        "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof",
+        "guidance": "Read back authoritative publication and reconcile private staging before deciding whether to replay."
+    })
+}
+
+async fn wait_for_stall(progress: ProgressClock, stall_timeout_secs: Option<u64>) {
+    let Some(seconds) = stall_timeout_secs else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let limit = Duration::from_secs(seconds.max(1));
+    loop {
+        let elapsed = progress.elapsed();
+        if elapsed >= limit {
+            return;
+        }
+        tokio::time::sleep((limit - elapsed).min(Duration::from_millis(250))).await;
     }
 }
 
@@ -321,6 +1055,7 @@ async fn read_stream_with_deltas<R>(
     call_id: String,
     stream: &'static str,
     output: SharedOutput,
+    progress: ProgressClock,
 ) -> String
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -332,6 +1067,7 @@ where
         match reader.read(&mut buffer).await {
             Ok(0) => break,
             Ok(n) => {
+                progress.mark();
                 let (accepted, truncated) = output.push(&buffer[..n]);
                 if emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL && accepted > 0 {
                     emitted_deltas += 1;
@@ -355,6 +1091,32 @@ where
         }
     }
     output.snapshot()
+}
+
+#[derive(Clone)]
+struct ProgressClock {
+    last_activity: Arc<Mutex<Instant>>,
+}
+
+impl ProgressClock {
+    fn new() -> Self {
+        Self {
+            last_activity: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
+
+    fn mark(&self) {
+        if let Ok(mut last_activity) = self.last_activity.lock() {
+            *last_activity = Instant::now();
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.last_activity
+            .lock()
+            .map(|last_activity| last_activity.elapsed())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone)]
@@ -470,10 +1232,13 @@ async fn drain_stream_tasks(
 #[cfg(test)]
 mod tests {
     use super::{
-        read_stream_with_deltas, run_command_with_timeout, run_tokio_command_with_timeout,
-        tail_chars, SharedOutput,
+        claim_command_execution, command_claim_path, command_receipt_path, read_stream_with_deltas,
+        reconcile_command_execution_claims, run_command_with_timeout,
+        run_tokio_command_with_timeout, tail_chars, ProgressClock, SharedOutput,
     };
     use crate::runtime::tool::{ToolContext, ToolRuntimeEvent};
+    use serde_json::Value;
+    use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
     use tokio::io::AsyncWriteExt;
@@ -493,6 +1258,29 @@ mod tests {
             command.args(["-c", "printf shell-ok"]);
             command
         }
+    }
+
+    #[test]
+    fn live_claim_owner_prevents_parallel_startup_from_being_reconciled_as_orphan() {
+        let workspace =
+            std::env::temp_dir().join(format!("tura-live-claim-owner-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace");
+        let call_id = "runtime:tool-call:parallel-a";
+        let context = ToolContext::new(workspace.clone()).with_call_id(call_id.to_string());
+
+        claim_command_execution(&context, 30, None).expect("claim command");
+        reconcile_command_execution_claims(&workspace, Some("runtime:tool-call:parallel-b"))
+            .expect("live sibling claim must remain active");
+
+        let claim: Value = serde_json::from_slice(
+            &fs::read(command_claim_path(&workspace, call_id)).expect("read claim"),
+        )
+        .expect("claim JSON");
+        assert_eq!(claim["state"], "claimed");
+        assert_eq!(claim["owner_pid"], std::process::id());
+        assert!(!command_receipt_path(&workspace, call_id).exists());
+        let _ = fs::remove_dir_all(workspace);
     }
 
     fn failing_command() -> Command {
@@ -553,6 +1341,23 @@ mod tests {
         }
     }
 
+    fn tokio_over_fifteen_seconds_command() -> tokio::process::Command {
+        if cfg!(windows) {
+            let mut command = tokio::process::Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 16; Write-Output long-command-ok",
+            ]);
+            command
+        } else {
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", "sleep 16; printf long-command-ok"]);
+            command
+        }
+    }
+
     #[test]
     fn tail_chars_preserves_unicode_boundaries() {
         assert_eq!(tail_chars("alpha", 10), "alpha");
@@ -562,7 +1367,7 @@ mod tests {
 
     #[test]
     fn run_command_with_timeout_captures_success_output_and_exit_code() {
-        let response = run_command_with_timeout(success_command(), 10);
+        let response = run_command_with_timeout(success_command(), 10, None);
 
         assert!(response.success, "{}", response.stderr);
         assert_eq!(response.exit_code, 0);
@@ -576,7 +1381,7 @@ mod tests {
 
     #[test]
     fn run_command_with_timeout_captures_failure_stderr() {
-        let response = run_command_with_timeout(failing_command(), 10);
+        let response = run_command_with_timeout(failing_command(), 10, None);
 
         assert!(!response.success);
         assert_eq!(response.exit_code, 7);
@@ -590,7 +1395,8 @@ mod tests {
 
     #[test]
     fn run_command_with_timeout_reports_spawn_error() {
-        let response = run_command_with_timeout(Command::new("__tura_missing_shell_binary__"), 1);
+        let response =
+            run_command_with_timeout(Command::new("__tura_missing_shell_binary__"), 1, None);
 
         assert!(!response.success);
         assert_eq!(response.exit_code, 1);
@@ -603,15 +1409,15 @@ mod tests {
 
     #[test]
     fn run_command_with_timeout_kills_slow_command() {
-        let response = run_command_with_timeout(slow_command(), 1);
+        let response = run_command_with_timeout(slow_command(), 1, None);
 
         assert!(!response.success);
         assert_eq!(response.exit_code, -1);
-        assert!(response
-            .output
+        assert!(response.output["message"]
             .as_str()
             .unwrap_or_default()
             .contains("Timed out after 1 seconds"));
+        assert_eq!(response.output["outcome"], "unknown");
     }
 
     #[tokio::test]
@@ -626,6 +1432,7 @@ mod tests {
                 "call-1".to_string(),
                 "stdout",
                 SharedOutput::new(),
+                ProgressClock::new(),
             )
             .await
         });
@@ -662,7 +1469,8 @@ mod tests {
         let context = ToolContext::new(PathBuf::from("workspace"));
         context.cancellation.cancel();
 
-        let response = run_tokio_command_with_timeout(tokio_slow_command(), 10, &context).await;
+        let response =
+            run_tokio_command_with_timeout(tokio_slow_command(), 10, None, &context).await;
 
         assert!(!response.success);
         assert_eq!(response.exit_code, -1);
@@ -675,7 +1483,8 @@ mod tests {
         let context = ToolContext::new(PathBuf::from("workspace"));
 
         let response =
-            run_tokio_command_with_timeout(tokio_output_then_sleep_command(), 1, &context).await;
+            run_tokio_command_with_timeout(tokio_output_then_sleep_command(), 1, None, &context)
+                .await;
 
         assert!(!response.success);
         assert_eq!(response.exit_code, -1);
@@ -684,10 +1493,91 @@ mod tests {
             "stdout should keep bytes read before timeout: {response:?}"
         );
         assert!(response.stderr.contains("Timed out after 1 seconds"));
-        assert!(response
-            .output
+        assert!(response.output["message"]
             .as_str()
             .unwrap_or_default()
             .contains("retained-output"));
+        assert_eq!(response.output["retry_safe"], false);
+    }
+
+    #[tokio::test]
+    async fn command_longer_than_legacy_fifteen_second_gate_completes_with_receipt() {
+        let workspace =
+            std::env::temp_dir().join(format!("tura-long-command-receipt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace");
+        let context = ToolContext::new(workspace.clone())
+            .with_call_id("runtime-command-run-1:long-command".to_string());
+
+        let response = run_tokio_command_with_timeout(
+            tokio_over_fifteen_seconds_command(),
+            20,
+            None,
+            &context,
+        )
+        .await;
+
+        assert!(response.success, "{response:?}");
+        assert!(response.stdout.contains("long-command-ok"));
+        assert_eq!(
+            response.output["terminal_receipt"]["terminal_state"],
+            "completed"
+        );
+        assert_eq!(response.output["terminal_receipt"]["outcome"], "known");
+        assert_eq!(
+            response.output["terminal_receipt"]["termination_proven"],
+            true
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn wrapper_timeout_writes_distinct_terminal_receipt_with_process_proof() {
+        let workspace =
+            std::env::temp_dir().join(format!("tura-timeout-receipt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace");
+        let context = ToolContext::new(workspace.clone())
+            .with_call_id("runtime-command-run-1:timeout/command".to_string());
+
+        let response =
+            run_tokio_command_with_timeout(tokio_output_then_sleep_command(), 1, None, &context)
+                .await;
+
+        assert!(!response.success);
+        assert_eq!(
+            response.output["terminal_receipt"]["failure_class"],
+            "wrapper_wall_clock_timeout"
+        );
+        assert_eq!(
+            response.output["terminal_receipt"]["termination_origin"],
+            "command_run_wrapper"
+        );
+        assert_eq!(
+            response.output["terminal_receipt"]["reconcile_required"],
+            true
+        );
+        assert_eq!(
+            response.output["terminal_receipt"]["termination_proven"],
+            true
+        );
+        let claim_path = fs::read_dir(workspace.join(".tura/run/command_receipts"))
+            .expect("command claim directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension().and_then(|value| value.to_str()) == Some("json")
+                    && path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|name| name.ends_with(".claim.json"))
+            })
+            .expect("terminal claim");
+        let claim: Value =
+            serde_json::from_str(&fs::read_to_string(claim_path).expect("read terminal claim"))
+                .expect("terminal claim JSON");
+        assert_eq!(claim["state"], "terminated");
+        assert_eq!(claim["reconcile_required"], true);
+        let _ = fs::remove_dir_all(workspace);
     }
 }

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use tura_agents::coding_agent::{CodingAgent, CodingAgentProviderConfig, CodingAgentToolChoice};
 
 const PROJECT_ROOT_ENV: &str = "TURA_PROJECT_ROOT";
+const RELEASE_ROOT_ENV: &str = "TURA_RELEASE_BIN_DIR";
 const DEFAULT_CODING_AGENT_NAME: &str = "balanced";
 
 fn default_op_manual() -> bool {
@@ -356,21 +357,49 @@ fn resolve_project_path(project_directory: &Path, path: PathBuf) -> PathBuf {
 }
 
 fn project_directory_with_agent_registry() -> Result<PathBuf, String> {
-    if let Ok(root) = std::env::var(PROJECT_ROOT_ENV) {
-        let root = PathBuf::from(root);
-        if tura_project_root_is_valid(&root) {
-            return Ok(root);
-        }
-    }
-
     let current = std::env::current_dir()
         .map_err(|err| format!("failed to resolve project directory: {err}"))?;
+    let executable_root = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    Ok(project_directory_with_agent_registry_from(
+        std::env::var_os(PROJECT_ROOT_ENV).map(PathBuf::from),
+        std::env::var_os(RELEASE_ROOT_ENV).map(PathBuf::from),
+        executable_root,
+        current,
+    ))
+}
+
+fn project_directory_with_agent_registry_from(
+    workspace_root: Option<PathBuf>,
+    release_root: Option<PathBuf>,
+    executable_root: Option<PathBuf>,
+    current: PathBuf,
+) -> PathBuf {
+    if let Some(root) = workspace_root
+        && tura_project_root_is_valid(&root)
+    {
+        return root;
+    }
+
+    if let Some(root) = release_root
+        && tura_project_root_is_valid(&root)
+    {
+        return root;
+    }
+
+    if let Some(root) = executable_root
+        && tura_project_root_is_valid(&root)
+    {
+        return root;
+    }
+
     for candidate in current.ancestors() {
         if tura_project_root_is_valid(candidate) {
-            return Ok(candidate.to_path_buf());
+            return candidate.to_path_buf();
         }
     }
-    Ok(current)
+    current
 }
 
 fn tura_project_root_is_valid(path: &Path) -> bool {
@@ -393,8 +422,8 @@ fn generate_agent_id(agent_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_agent_from_registry_entry, provider_config_from_coding_agent, resolve_project_path,
-        AgentRegistryEntry,
+        build_agent_from_registry_entry, project_directory_with_agent_registry_from,
+        provider_config_from_coding_agent, resolve_project_path, AgentRegistryEntry,
     };
     use crate::state_machine::agent_management::{
         AgentCapabilityItem, AgentPromptItem, ValidatorConfig,
@@ -536,5 +565,68 @@ mod tests {
             project.join("agents/custom")
         );
         assert_eq!(resolve_project_path(project, absolute.clone()), absolute);
+    }
+
+    #[test]
+    fn release_root_supplies_tools_when_execution_workspace_is_not_a_tura_checkout() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let release = tempfile::tempdir().expect("release root");
+        let schema = release
+            .path()
+            .join("crates/tools/src/command_run/schema.json");
+        std::fs::create_dir_all(schema.parent().expect("schema parent"))
+            .expect("tool schema directory");
+        std::fs::write(&schema, "{}").expect("tool schema");
+
+        let selected = project_directory_with_agent_registry_from(
+            Some(workspace.path().to_path_buf()),
+            Some(release.path().to_path_buf()),
+            None,
+            workspace.path().to_path_buf(),
+        );
+
+        assert_eq!(selected, release.path());
+    }
+
+    #[test]
+    fn valid_workspace_tura_checkout_precedes_release_root() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let release = tempfile::tempdir().expect("release root");
+        for root in [workspace.path(), release.path()] {
+            let schema = root.join("crates/tools/src/command_run/schema.json");
+            std::fs::create_dir_all(schema.parent().expect("schema parent"))
+                .expect("tool schema directory");
+            std::fs::write(schema, "{}").expect("tool schema");
+        }
+
+        let selected = project_directory_with_agent_registry_from(
+            Some(workspace.path().to_path_buf()),
+            Some(release.path().to_path_buf()),
+            None,
+            workspace.path().to_path_buf(),
+        );
+
+        assert_eq!(selected, workspace.path());
+    }
+
+    #[test]
+    fn executable_root_supplies_tools_without_inherited_release_environment() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let executable_root = tempfile::tempdir().expect("executable root");
+        let schema = executable_root
+            .path()
+            .join("crates/tools/src/command_run/schema.json");
+        std::fs::create_dir_all(schema.parent().expect("schema parent"))
+            .expect("tool schema directory");
+        std::fs::write(&schema, "{}").expect("tool schema");
+
+        let selected = project_directory_with_agent_registry_from(
+            Some(workspace.path().to_path_buf()),
+            None,
+            Some(executable_root.path().to_path_buf()),
+            workspace.path().to_path_buf(),
+        );
+
+        assert_eq!(selected, executable_root.path());
     }
 }

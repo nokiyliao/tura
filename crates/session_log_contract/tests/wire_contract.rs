@@ -1,9 +1,10 @@
-use lifecycle::{SessionAggregate, SessionInput, SessionManagement, SessionQuery};
+use lifecycle::{SessionAggregate, SessionInput, SessionManagement, SessionQuery, SessionState};
 use serde_json::json;
 use session_log_contract::{
-    GetSessionRequest, ServiceEndpoint, SessionFeedEvent, SessionLogCommand, SessionLogResponse,
-    SessionMetadata, SessionMetadataPatch, SessionSnapshot, UpdateSessionRequest,
-    UpdateSessionTodosRequest,
+    GetRuntimeLeaseRequest, GetSessionRequest, RecoveryCloseRuntimeReason,
+    RecoveryCloseRuntimeRequest, RuntimeRecoveryQuiescenceProof, ServiceEndpoint, SessionFeedEvent,
+    SessionLogCommand, SessionLogResponse, SessionMetadata, SessionMetadataPatch, SessionSnapshot,
+    UpdateSessionRequest, UpdateSessionTodosRequest,
 };
 
 fn snapshot_fixture(session_id: &str, workspace: &str) -> SessionSnapshot {
@@ -82,6 +83,67 @@ fn session_feed_subscription_command_shape_is_stable() {
         serde_json::to_value(SessionLogCommand::SubscribeSessionFeed)
             .expect("subscribe-session-feed command"),
         json!({ "command": "subscribe_session_feed" })
+    );
+}
+
+#[test]
+fn runtime_recovery_wire_contract_binds_exact_ledger_identity() {
+    assert_eq!(
+        serde_json::to_value(GetRuntimeLeaseRequest {
+            runtime_id: "runtime-1".to_string(),
+            database_path: None,
+        })
+        .expect("derived-route lease request"),
+        json!({ "runtime_id": "runtime-1" })
+    );
+    assert_eq!(
+        serde_json::to_value(GetRuntimeLeaseRequest {
+            runtime_id: "runtime-1".to_string(),
+            database_path: Some("/canonical/session_log.sqlite3".to_string()),
+        })
+        .expect("exact-path lease request"),
+        json!({
+            "runtime_id": "runtime-1",
+            "database_path": "/canonical/session_log.sqlite3"
+        })
+    );
+
+    let request = RecoveryCloseRuntimeRequest {
+        receipt_id: "receipt-1".to_string(),
+        database_path: "/canonical/session_log.sqlite3".to_string(),
+        runtime_id: "runtime-1".to_string(),
+        session_id: "session-1".to_string(),
+        lease_id: None,
+        expected_lease_active: false,
+        expected_revision: 7,
+        expected_last_event_seq: 7,
+        expected_session_event_seq: 5,
+        expected_session_state: SessionState::Interrupted,
+        reason: RecoveryCloseRuntimeReason::OrphanedRuntime,
+        quiescence: RuntimeRecoveryQuiescenceProof {
+            active_turn: false,
+            queued_turn: false,
+            running_turn: false,
+            worker_alive: false,
+            active_command_runs: 0,
+            retained_process_scopes: 0,
+            retained_slot: false,
+            global_active_session_count: 2,
+            global_retained_slot_count: 1,
+            global_active_command_runs: 3,
+        },
+    };
+    let value = serde_json::to_value(&request).expect("recovery request");
+    assert_eq!(value["database_path"], "/canonical/session_log.sqlite3");
+    assert_eq!(value["lease_id"], serde_json::Value::Null);
+    assert_eq!(value["expected_lease_active"], false);
+    assert_eq!(value["expected_session_event_seq"], 5);
+    assert_eq!(value["expected_session_state"], "interrupted");
+    assert!(request.quiescence.is_quiescent());
+    assert_eq!(
+        serde_json::from_value::<RecoveryCloseRuntimeRequest>(value)
+            .expect("recovery request round trip"),
+        request
     );
 }
 

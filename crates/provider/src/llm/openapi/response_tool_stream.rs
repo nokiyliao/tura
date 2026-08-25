@@ -339,7 +339,16 @@ fn complete_command_run_command_objects(arguments: &str) -> Vec<Value> {
         }
     }
 
-    commands
+    let mut wrapper = serde_json::from_str::<Value>(&format!("{}[]}}", &arguments[..array_start]))
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = wrapper.as_object_mut() {
+        object.insert("commands".to_string(), Value::Array(commands));
+    }
+    crate::utils::normalize_command_run_tool_input("command_run", wrapper)
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn find_commands_array_start(arguments: &str) -> Option<usize> {

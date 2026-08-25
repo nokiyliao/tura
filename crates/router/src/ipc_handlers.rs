@@ -49,10 +49,27 @@ pub(crate) async fn handle_ipc_request(state: &AppState, request: IpcRequest) ->
                 .enqueue_turn_request(state, request.payload, &request.request_id)
                 .await
         }
-        "execution.command_run" => state.command_run.execute(request.payload).await,
+        "execution.command_run" => {
+            state
+                .execution
+                .command_run_request(state, request.payload, &request.request_id)
+                .await
+        }
         "execution.cancel_turn" => Ok(state.execution.cancel_turn(state, request.payload).await),
         "execution.probe_sessions" => state.execution.probe_sessions(state, request.payload).await,
-        "execution.get_status" => Ok(json!({ "status": "ok" })),
+        "execution.get_status" => Ok(state.execution.status(state).await),
+        "execution.get_runtime_lease" => {
+            state
+                .execution
+                .get_runtime_lease(state, request.payload)
+                .await
+        }
+        "execution.recovery_close_runtime" => {
+            state
+                .execution
+                .recovery_close_runtime(state, request.payload)
+                .await
+        }
         "session.take_user_commands" => services::user_commands::take(&request.payload),
         "execution.kill_session_workers" => Ok(state
             .execution

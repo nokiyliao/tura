@@ -51,7 +51,7 @@ impl ToolHandler for ShellCommandHandler {
         let response = shell_executor::execute_async(
             &payload_command_line(&call.payload),
             &ctx.session_dir,
-            120,
+            300,
             ShellKind::ShellCommand,
             &ctx,
         )

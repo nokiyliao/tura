@@ -176,6 +176,19 @@ fn stores_workspaces_sessions_and_last_record_page() {
     );
     assert!(sessions[0].todos.is_empty());
 
+    let (summary_page, summaries) = store
+        .list_session_summaries(ListSessionsRequest {
+            workspace: normalized_workspace.clone(),
+            page: 0,
+            page_size: 10,
+        })
+        .expect("session summaries");
+    assert_eq!(summary_page.total, 1);
+    assert_eq!(summaries[0].session_id, session_id);
+    assert_eq!(summaries[0].metadata.session_type, "coding");
+    assert_eq!(summaries[0].metadata.session_directory, workspace);
+    assert_eq!(summaries[0].feed_cursor, 4);
+
     let loaded = store
         .get_session(GetSessionRequest {
             session_id: session_id.clone(),

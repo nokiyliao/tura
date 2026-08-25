@@ -18,11 +18,17 @@ use super::prompt_messages::messages_for_turn_with_context_limit;
 use super::tool_catalog::{
     command_run_commands_for_agent, extend_command_run_commands_with_capabilities,
     filter_tools_for_turn, load_agent_capabilities_with_commands, planning_tool_disabled,
-    tool_schema_name,
+    startup_task_state_required, tool_schema_name,
 };
 
 const FORCE_COMPACT_CONTEXT_TOKEN_CAP: u64 = 260_000;
 const PROMPT_INJECTION_CONTEXT_TOKEN_CAP: u64 = 240_000;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RetryProviderInput {
+    pub(crate) messages: Vec<serde_json::Value>,
+    pub(crate) tools: Vec<serde_json::Value>,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_turn(
@@ -37,6 +43,7 @@ pub(crate) fn execute_turn(
     force_no_tools: bool,
     runtime_id: Option<RuntimeId>,
     fallback_from_id: Option<RuntimeId>,
+    retry_provider_input: Option<RetryProviderInput>,
     mut runtime_event_writer: Option<&mut RuntimeEventWriter>,
 ) -> Result<(RuntimeAggregate, Vec<ToolCallData>), String> {
     let agent = agents
@@ -50,12 +57,17 @@ pub(crate) fn execute_turn(
     );
     let planning_enabled = agent_commands.contains(PLANNING_TOOL);
     let disable_tool_invocation = is_final_turn || force_no_tools;
-    let require_startup_task_state = session.task_type.is_empty();
-    let mut tools = load_agent_capabilities_with_commands(agent, session, &agent_commands)?;
-    if planning_tool_disabled() {
-        tools.retain(|tool| tool_schema_name(tool) != Some(PLANNING_TOOL));
-    }
-    tools = filter_tools_for_turn(tools, is_final_turn, force_no_tools)?;
+    let require_startup_task_state = startup_task_state_required(session, &agent_commands);
+    let tools = if let Some(retry_input) = retry_provider_input.as_ref() {
+        retry_input.tools.clone()
+    } else {
+        let mut tools = load_agent_capabilities_with_commands(agent, session, &agent_commands)?;
+        if planning_tool_disabled() {
+            tools.retain(|tool| tool_schema_name(tool) != Some(PLANNING_TOOL));
+        }
+        let tools = filter_tools_for_turn(tools, is_final_turn, force_no_tools)?;
+        move_command_run_to_end(tools)
+    };
     let mut allowed_tool_names: std::collections::HashSet<String> = tools
         .iter()
         .filter_map(tool_schema_name)
@@ -69,7 +81,7 @@ pub(crate) fn execute_turn(
     } else {
         allowed_tool_names.clone()
     };
-    tools = move_command_run_to_end(tools);
+    let mut retry_messages = retry_provider_input.map(|input| input.messages);
     if debug_runtime_enabled() {
         eprintln!(
             "tura runtime debug [{}]: agent={} provider_tools={:?} executable_tools={:?}",
@@ -95,47 +107,52 @@ pub(crate) fn execute_turn(
             force_compact_context_limit_tokens(settings.as_ref(), &runtime_provider_config);
         let prompt_injection_limit_tokens =
             compact_prompt_injection_limit_tokens(settings.as_ref(), &runtime_provider_config);
-        let language = session_language();
-        let user_name = session_user_name();
-        let identity = turn_identity(
-            agent,
-            &user_name,
-            &runtime_provider_config.model_name,
-            &runtime_provider_config.llm_provider_name,
-            compact_limit_tokens,
-            &language,
-        );
-        let mut runtime_messages = vec![serde_json::json!({
-            "role": "system",
-            "content": identity,
-        })];
-        runtime_messages.extend(load_agent_system_prompt_messages(agent)?);
-        let turn = messages_for_turn_with_context_limit(
-            current_messages,
-            session,
-            original_user_task,
-            compact_limit_tokens,
-        );
-        session.context_tokens = turn.context_tokens;
-        let mut turn_messages = turn.messages;
-        if let Some(prompt) = extra_tail_system_prompt {
-            crate::prompt_style::tail_injection::append_tail_prompt(
-                &mut turn_messages,
-                crate::prompt_style::tail_injection::TailPrompt::system(prompt),
+        let runtime_messages = if let Some(messages) = retry_messages.take() {
+            messages
+        } else {
+            let language = session_language();
+            let user_name = session_user_name();
+            let identity = turn_identity(
+                agent,
+                &user_name,
+                &runtime_provider_config.model_name,
+                &runtime_provider_config.llm_provider_name,
+                compact_limit_tokens,
+                &language,
             );
-        }
-        runtime_messages.extend(turn_messages);
-        if !disable_tool_invocation
-            && should_force_compact_prompt(session, prompt_injection_limit_tokens)
-        {
-            crate::prompt_style::tail_injection::append_tail_prompt(
-                &mut runtime_messages,
-                crate::prompt_style::tail_injection::TailPrompt::developer(
-                    compact_context_required_message(prompt_injection_limit_tokens),
-                ),
+            let mut runtime_messages = vec![serde_json::json!({
+                "role": "system",
+                "content": identity,
+            })];
+            runtime_messages.extend(load_agent_system_prompt_messages(agent)?);
+            let turn = messages_for_turn_with_context_limit(
+                current_messages,
+                session,
+                original_user_task,
+                compact_limit_tokens,
             );
-        }
-        append_self_reflection_tail_prompt(&mut runtime_messages, agent, session);
+            session.context_tokens = turn.context_tokens;
+            let mut turn_messages = turn.messages;
+            if let Some(prompt) = extra_tail_system_prompt {
+                crate::prompt_style::tail_injection::append_tail_prompt(
+                    &mut turn_messages,
+                    crate::prompt_style::tail_injection::TailPrompt::system(prompt),
+                );
+            }
+            runtime_messages.extend(turn_messages);
+            if !disable_tool_invocation
+                && should_force_compact_prompt(session, prompt_injection_limit_tokens)
+            {
+                crate::prompt_style::tail_injection::append_tail_prompt(
+                    &mut runtime_messages,
+                    crate::prompt_style::tail_injection::TailPrompt::developer(
+                        compact_context_required_message(prompt_injection_limit_tokens),
+                    ),
+                );
+            }
+            append_self_reflection_tail_prompt(&mut runtime_messages, agent, session);
+            runtime_messages
+        };
         session.context_tokens.input = provider_context_input_tokens(session).unwrap_or(0);
         session.context_tokens.limit = compact_limit_tokens;
         let (mut runtime, queue_item) = create_runtime(CreateRuntimeInput {
@@ -168,6 +185,8 @@ pub(crate) fn execute_turn(
                 tool_choice: tool_choice_for_turn(),
                 session_directory: session.session_directory.clone(),
                 allowed_command_run_commands: Some(agent_commands),
+                disable_permission_restrictions: session.disable_permission_restrictions,
+                jspace_contract: session.jspace_contract.clone(),
                 require_startup_task_state,
             },
             settings,

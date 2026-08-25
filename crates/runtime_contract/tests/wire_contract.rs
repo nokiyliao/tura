@@ -1,8 +1,9 @@
 use runtime_contract::{
     maximum_parallel_runtime_workers, maximum_runtime_llm_turns, CallContext, RunAgentRequest,
-    RuntimeWorkerResponse, WorkerEnvelope, DEFAULT_MAXIMUM_PARALLEL_RUNTIME_WORKERS,
-    DEFAULT_MAXIMUM_RUNTIME_LLM_TURNS, MAXIMUM_PARALLEL_RUNTIME_WORKER_OPTIONS,
-    MAXIMUM_RUNTIME_LLM_TURN_OPTIONS, WORKER_KIND_CALL, WORKER_KIND_HEALTH_CHECK,
+    RuntimeWorkerResponse, TaskContextCapsule, WorkerEnvelope,
+    DEFAULT_MAXIMUM_PARALLEL_RUNTIME_WORKERS, DEFAULT_MAXIMUM_RUNTIME_LLM_TURNS,
+    MAXIMUM_PARALLEL_RUNTIME_WORKER_OPTIONS, MAXIMUM_RUNTIME_LLM_TURN_OPTIONS,
+    TASK_CONTEXT_CAPSULE_SCHEMA_VERSION, WORKER_KIND_CALL, WORKER_KIND_HEALTH_CHECK,
 };
 use serde_json::json;
 
@@ -24,18 +25,97 @@ fn worker_envelopes_preserve_the_existing_wire_shape() {
 }
 
 #[test]
+fn task_context_capsule_validates_digest_and_jspace_binding() {
+    let jspace_digest = "a".repeat(64);
+    let mut value = json!({
+        "schema_version": TASK_CONTEXT_CAPSULE_SCHEMA_VERSION,
+        "mission": {
+            "mission_id": "mission-1",
+            "task_id": "task-1",
+            "mode": "GOVERNANCE",
+            "current_predicate": "source.compiles",
+            "objective": "Compile source"
+        },
+        "context_summary": "Use only the bound source and focused tests.",
+        "dcf_generation": {"generation_id": "generation-1"},
+        "surface": {"repo_root": "/workspace", "matched_surface_ids": ["surface-1"]},
+        "authority": {"forbidden_effects": ["live_runtime"]},
+        "evidence_refs": [{"id": "receipt-1", "kind": "receipt", "sha256": "b".repeat(64)}],
+        "focused_verifiers": [{"command": "cargo test -p runtime_contract"}],
+        "jspace_semantic_sha256": jspace_digest,
+    });
+    let digest = super_semantic_sha256(&value);
+    value["semantic_sha256"] = json!(digest);
+
+    let capsule = TaskContextCapsule::from_value(value).expect("valid capsule");
+    capsule
+        .bind_jspace(Some(&json!({"semantic_sha256": "a".repeat(64)})))
+        .expect("matching J-Space digest");
+    assert!(capsule
+        .bind_jspace(Some(&json!({"semantic_sha256": "c".repeat(64)})))
+        .unwrap_err()
+        .contains("TASK_CONTEXT_JSPACE_BINDING_MISMATCH"));
+}
+
+fn super_semantic_sha256(value: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn canonical(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Null => "null".to_string(),
+            serde_json::Value::Bool(value) => value.to_string(),
+            serde_json::Value::Number(value) => value.to_string(),
+            serde_json::Value::String(value) => serde_json::to_string(value).unwrap(),
+            serde_json::Value::Array(values) => format!(
+                "[{}]",
+                values.iter().map(canonical).collect::<Vec<_>>().join(",")
+            ),
+            serde_json::Value::Object(values) => {
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort();
+                format!(
+                    "{{{}}}",
+                    keys.into_iter()
+                        .map(|key| format!(
+                            "{}:{}",
+                            serde_json::to_string(key).unwrap(),
+                            canonical(&values[key])
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            }
+        }
+    }
+
+    format!("{:x}", Sha256::digest(canonical(value).as_bytes()))
+}
+
+#[test]
 fn run_agent_request_is_strict_and_defaults_optional_worker_inputs() {
     let request: RunAgentRequest = serde_json::from_value(json!({
         "runtime_id": "runtime-1",
         "lease_id": "lease-1",
         "session_id": "session-1",
-        "prompt": "hello"
+        "prompt": "hello",
+        "jspace_contract": {
+            "schema_version": "jspace_contract_v1",
+            "semantic_sha256": "jspace-digest"
+        }
     }))
     .expect("run-agent request");
     assert_eq!(request.runtime_id, "runtime-1");
     assert_eq!(request.lease_id, "lease-1");
     assert_eq!(request.session_id.as_deref(), Some("session-1"));
     assert_eq!(request.prompt.as_deref(), Some("hello"));
+    assert_eq!(
+        request.jspace_contract.as_ref().and_then(|contract| {
+            contract
+                .get("semantic_sha256")
+                .and_then(serde_json::Value::as_str)
+        }),
+        Some("jspace-digest")
+    );
     assert!(!request.no_op_manual);
     assert!(!request.return_log);
     assert_eq!(request.maximum_parallel_runtime_workers, None);

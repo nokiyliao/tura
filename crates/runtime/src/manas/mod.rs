@@ -57,6 +57,8 @@ pub fn run_session(
             initial_messages: Vec::new(),
             redis_url: "redis://localhost:6379",
             initial_runtime_id: None,
+            initial_fallback_from_id: None,
+            initial_retry_provider_input: None,
             runtime_event_writer: None,
             session_delta_writer: None,
         },

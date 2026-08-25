@@ -14,7 +14,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 const ROUTER_ADDR_ENV: &str = "TURA_ROUTER_ADDR";
-const DEFAULT_COMMAND_RUN_TIMEOUT_SECS: u64 = 900;
 const COMMAND_RUN_ENV_KEYS: &[&str] = &[
     "TURA_FORCED_CAPABILITY_DIRECTORIES",
     "TURA_MCP_STDIO_BRIDGE_BIN",
@@ -35,6 +34,25 @@ pub async fn execute_command_run_value(
     runtime_id: Option<&str>,
     allowed_commands: Option<BTreeSet<String>>,
 ) -> Result<Value, String> {
+    execute_command_run_value_with_jspace(
+        arguments,
+        session_directory,
+        session_id,
+        runtime_id,
+        allowed_commands,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_command_run_value_with_jspace(
+    arguments: Value,
+    session_directory: PathBuf,
+    session_id: Option<&str>,
+    runtime_id: Option<&str>,
+    allowed_commands: Option<BTreeSet<String>>,
+    jspace_contract: Option<Value>,
+) -> Result<Value, String> {
     let addr = std::env::var(ROUTER_ADDR_ENV).map_err(|_| {
         format!("{ROUTER_ADDR_ENV} is not set; command_run must be owned by router")
     })?;
@@ -47,25 +65,26 @@ pub async fn execute_command_run_value(
         "session_directory": session_directory,
         "arguments": arguments,
         "allowed_commands": allowed_commands,
+        "jspace_contract": jspace_contract,
         "command_env": command_run_environment(),
         "sandbox": command_run_sandbox_enabled(),
     });
-    let request_id = format!(
-        "runtime-command-run-{}-{}",
-        std::process::id(),
-        REQUEST_SEQ.fetch_add(1, Ordering::SeqCst)
-    );
+    let request_id = command_run_request_id(&arguments);
+    let execution_id = request_id.clone();
     let request = IpcRequest::call(request_id, "execution.command_run", payload);
 
-    let timeout = command_run_router_timeout();
-    let response = tokio::time::timeout(timeout, call_router(addr, request))
-        .await
-        .map_err(|_| {
-            format!(
-                "router command_run timed out after {} seconds",
-                timeout.as_secs()
-            )
-        })??;
+    let response = if let Some(timeout) = command_run_router_timeout() {
+        tokio::time::timeout(timeout, call_router(addr, request))
+            .await
+            .map_err(|_| {
+                format!(
+                    "router command_run control observation expired after {} seconds; execution_id={execution_id}; reconcile the durable terminal receipt before replay",
+                    timeout.as_secs()
+                )
+            })??
+    } else {
+        call_router(addr, request).await?
+    };
     if !response.ok {
         return Err(response
             .error
@@ -76,6 +95,20 @@ pub async fn execute_command_run_value(
         .get("result")
         .cloned()
         .ok_or_else(|| "router command_run response did not contain payload.result".to_string())
+}
+
+fn command_run_request_id(arguments: &Value) -> String {
+    arguments
+        .get("execution_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "runtime-command-run-{}-{}",
+                std::process::id(),
+                REQUEST_SEQ.fetch_add(1, Ordering::SeqCst)
+            )
+        })
 }
 
 fn command_run_environment() -> BTreeMap<String, String> {
@@ -97,12 +130,33 @@ pub async fn execute_command_run_value_or_error(
     runtime_id: Option<&str>,
     allowed_commands: Option<BTreeSet<String>>,
 ) -> Value {
-    execute_command_run_value(
+    execute_command_run_value_with_jspace(
         arguments,
         session_directory,
         session_id,
         runtime_id,
         allowed_commands,
+        None,
+    )
+    .await
+    .unwrap_or_else(command_run_error_payload)
+}
+
+pub async fn execute_command_run_value_or_error_with_jspace(
+    arguments: Value,
+    session_directory: PathBuf,
+    session_id: Option<&str>,
+    runtime_id: Option<&str>,
+    allowed_commands: Option<BTreeSet<String>>,
+    jspace_contract: Option<Value>,
+) -> Value {
+    execute_command_run_value_with_jspace(
+        arguments,
+        session_directory,
+        session_id,
+        runtime_id,
+        allowed_commands,
+        jspace_contract,
     )
     .await
     .unwrap_or_else(command_run_error_payload)
@@ -115,12 +169,44 @@ pub async fn execute_streamed_command_value_or_error(
     runtime_id: Option<&str>,
     allowed_commands: Option<BTreeSet<String>>,
 ) -> Value {
-    execute_command_run_value_or_error(
-        json!({ "commands": [command] }),
+    execute_streamed_command_value_or_error_with_jspace(
+        command,
         session_directory,
         session_id,
         runtime_id,
         allowed_commands,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_streamed_command_value_or_error_with_jspace(
+    command: Value,
+    session_directory: PathBuf,
+    session_id: Option<&str>,
+    runtime_id: Option<&str>,
+    allowed_commands: Option<BTreeSet<String>>,
+    jspace_contract: Option<Value>,
+) -> Value {
+    let execution_id = command
+        .get("command_id")
+        .and_then(Value::as_str)
+        .or_else(|| command.get("command_run_id").and_then(Value::as_str))
+        .map(str::to_string);
+    let arguments = match execution_id {
+        Some(execution_id) => json!({
+            "execution_id": execution_id,
+            "commands": [command],
+        }),
+        None => json!({ "commands": [command] }),
+    };
+    execute_command_run_value_or_error_with_jspace(
+        arguments,
+        session_directory,
+        session_id,
+        runtime_id,
+        allowed_commands,
+        jspace_contract,
     )
     .await
 }
@@ -128,6 +214,7 @@ pub async fn execute_streamed_command_value_or_error(
 pub struct RouterCommandRunExecutor {
     session_directory: PathBuf,
     allowed_commands: Option<BTreeSet<String>>,
+    jspace_contract: Option<Value>,
     ctx: code_tools::runtime::tool::ToolContext,
     session_id: String,
     runtime_id: String,
@@ -149,10 +236,27 @@ impl RouterCommandRunExecutor {
         session_id: String,
         runtime_id: String,
     ) -> Self {
+        Self::new_with_allowed_and_jspace(
+            session_directory,
+            allowed_commands,
+            session_id,
+            runtime_id,
+            None,
+        )
+    }
+
+    pub fn new_with_allowed_and_jspace(
+        session_directory: PathBuf,
+        allowed_commands: Option<BTreeSet<String>>,
+        session_id: String,
+        runtime_id: String,
+        jspace_contract: Option<Value>,
+    ) -> Self {
         Self {
             ctx: code_tools::runtime::tool::ToolContext::new(session_directory.clone()),
             session_directory,
             allowed_commands,
+            jspace_contract,
             session_id,
             runtime_id,
             active_step: None,
@@ -183,6 +287,7 @@ impl RouterCommandRunExecutor {
             Some(&self.session_id),
             Some(&self.runtime_id),
             self.allowed_commands.clone(),
+            self.jspace_contract.clone(),
         )
         .await;
         annotate_router_results_from_command(&mut result.results, &command_metadata);
@@ -290,14 +395,28 @@ pub(crate) async fn execute_command_value_results(
     session_id: Option<&str>,
     runtime_id: Option<&str>,
     allowed_commands: Option<BTreeSet<String>>,
+    jspace_contract: Option<Value>,
 ) -> RouterCommandRunCommandResult {
     let fallback_command = command.clone();
-    let output = match execute_command_run_value(
-        json!({ "commands": [command] }),
+    let execution_id = command
+        .get("command_id")
+        .and_then(Value::as_str)
+        .or_else(|| command.get("command_run_id").and_then(Value::as_str))
+        .map(str::to_string);
+    let arguments = match execution_id {
+        Some(execution_id) => json!({
+            "execution_id": execution_id,
+            "commands": [command],
+        }),
+        None => json!({ "commands": [command] }),
+    };
+    let output = match execute_command_run_value_with_jspace(
+        arguments,
         session_directory,
         session_id,
         runtime_id,
         allowed_commands,
+        jspace_contract,
     )
     .await
     {
@@ -408,20 +527,20 @@ async fn call_router(addr: SocketAddr, request: IpcRequest) -> Result<IpcRespons
         .map_err(|error| format!("failed to decode router command_run response: {error}"))
 }
 
-fn command_run_router_timeout() -> Duration {
+fn command_run_router_timeout() -> Option<Duration> {
     std::env::var("TURA_ROUTER_COMMAND_RUN_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_COMMAND_RUN_TIMEOUT_SECS))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        annotate_router_results_from_command, command_run_error_payload, command_run_results,
-        resolve_router_command_bindings, RouterCommandRunExecutor, COMMAND_RUN_ENV_KEYS,
+        annotate_router_results_from_command, command_run_error_payload, command_run_request_id,
+        command_run_results, resolve_router_command_bindings, RouterCommandRunExecutor,
+        COMMAND_RUN_ENV_KEYS,
     };
     use serde_json::json;
 
@@ -432,6 +551,14 @@ mod tests {
         assert_eq!(payload["ok"], false);
         assert_eq!(payload["results"][0]["success"], false);
         assert_eq!(payload["results"][0]["error"], "missing router");
+    }
+
+    #[test]
+    fn command_run_request_id_preserves_explicit_execution_identity() {
+        assert_eq!(
+            command_run_request_id(&json!({ "execution_id": "stream-call:0:0" })),
+            "stream-call:0:0"
+        );
     }
 
     #[tokio::test]

@@ -143,7 +143,7 @@ fn state_text_uses_canonical_snake_case() {
 }
 
 #[test]
-fn workspace_schema_rejects_pre_canonical_database() {
+fn workspace_schema_migrates_legacy_database_without_rewriting_rows() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("legacy-workspace.sqlite3");
     let conn = rusqlite::Connection::open(&db_path).expect("legacy db");
@@ -162,15 +162,96 @@ fn workspace_schema_rejects_pre_canonical_database() {
             task_management_json TEXT NOT NULL,
             management_json TEXT NOT NULL,
             session_json TEXT NOT NULL,
-            todos_json TEXT NOT NULL DEFAULT '[]'
+            todos_json TEXT NOT NULL DEFAULT '[]',
+            execution_id TEXT,
+            execution_epoch INTEGER NOT NULL DEFAULT 0,
+            snapshot_revision INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE session_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            record_json TEXT NOT NULL
+        );
+        INSERT INTO sessions(
+            session_id, workspace, created_at, updated_at, message_count,
+            task_management_json, management_json, session_json, execution_id
+        ) VALUES ('legacy-session', '/tmp/legacy', 1, 2, 0, '{}', '{}', '{}', 'exec-1');",
+    )
+    .expect("legacy schema");
+    init_workspace_db(&conn).expect("legacy schema should migrate additively");
+    init_workspace_db(&conn).expect("migration should be idempotent");
+
+    let row = conn
+        .query_row(
+            "SELECT execution_id, next_context_sequence, retained_from_sequence,
+                    next_management_sequence
+             FROM sessions WHERE session_id = 'legacy-session'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .expect("migrated session row");
+    assert_eq!(row, ("exec-1".to_string(), 0, 0, 0));
+    let tables = conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .expect("prepare tables")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query tables")
+        .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()
+        .expect("collect tables");
+    assert!(tables.contains("session_feed_events"));
+    assert!(tables.contains("runtime_events"));
+}
+
+#[test]
+fn workspace_schema_rejects_unknown_legacy_column() {
+    let conn = rusqlite::Connection::open_in_memory().expect("legacy db");
+    conn.execute_batch(
+        "CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            workspace TEXT NOT NULL,
+            name TEXT,
+            parent_id TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            last_user_message_at INTEGER,
+            state TEXT,
+            status TEXT,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            task_management_json TEXT NOT NULL,
+            management_json TEXT NOT NULL,
+            session_json TEXT NOT NULL,
+            todos_json TEXT NOT NULL DEFAULT '[]',
+            unknown_legacy_value TEXT
+        );
+        CREATE TABLE session_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            record_json TEXT NOT NULL
         );",
     )
     .expect("legacy schema");
     let error = init_workspace_db(&conn)
-        .expect_err("pre-canonical schema must be rejected")
+        .expect_err("unknown legacy column must remain fail closed")
         .to_string();
-    assert!(error.contains("incompatible workspace session database schema"));
-    assert!(error.contains("start with a clean canonical database"));
+    assert!(error.contains("unsupported legacy sessions columns"));
 }
 
 #[test]

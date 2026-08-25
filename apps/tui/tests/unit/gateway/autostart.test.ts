@@ -2,17 +2,27 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   ensureGatewayAvailable,
+  connectGatewayAvailable,
   _gatewayProbeForTest,
+  _gatewayStartTimeoutMsFromEnvForTest,
   _setGatewayLauncherForTest,
   _setGatewayProcessTerminatorForTest,
   _setGatewayStartTimeoutMsForTest,
 } from "../../../src/gateway/autostart.js";
 import { plainCapabilities } from "../../../src/tui/capabilities.js";
+
+test("gateway startup deadline admits bounded long cold starts", () => {
+  assert.equal(_gatewayStartTimeoutMsFromEnvForTest(undefined), 180_000);
+  assert.equal(_gatewayStartTimeoutMsFromEnvForTest("240000"), 240_000);
+  for (const invalid of ["0", "29999", "900001", "1.5", "not-a-number"]) {
+    assert.equal(_gatewayStartTimeoutMsFromEnvForTest(invalid), 180_000);
+  }
+});
 
 test("gateway probe accepts an existing healthy gateway", async () => {
   const server = createServer((req, res) => {
@@ -58,6 +68,28 @@ test("ensureGatewayAvailable fails when explicit gateway is absent", async () =>
     ensureGatewayAvailable(`http://127.0.0.1:${address.port}`, plainCapabilities(), false, true),
     /Explicit gateway URLs are only connected/u,
   );
+});
+
+test("thin CLI reports an absent Gateway without launching one", async () => {
+  const server = createServer();
+  await listen(server);
+  const address = server.address() as AddressInfo;
+  await close(server);
+  let launches = 0;
+  const restoreLauncher = _setGatewayLauncherForTest(async () => {
+    launches += 1;
+    return `http://127.0.0.1:${address.port}`;
+  });
+
+  try {
+    await assert.rejects(
+      connectGatewayAvailable(`http://127.0.0.1:${address.port}`, plainCapabilities(), true),
+      /No healthy Tura Gateway is available/u,
+    );
+    assert.equal(launches, 0);
+  } finally {
+    restoreLauncher();
+  }
 });
 
 test("ensureGatewayAvailable rejects foreign active gateway and starts same-root gateway", async () => {
@@ -159,6 +191,55 @@ test("ensureGatewayAvailable reuses same-home active gateway even when project r
     rmSync(home, { recursive: true, force: true });
     rmSync(projectRoot, { recursive: true, force: true });
     rmSync(otherRoot, { recursive: true, force: true });
+  }
+});
+
+test("thin CLI self-heals a stale pointer without launching a Gateway", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tura-cli-stale-pointer-home-"));
+  const projectRoot = mkdtempSync(join(tmpdir(), "tura-cli-stale-pointer-root-"));
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ healthy: true, root: projectRoot, home }));
+  });
+  await listen(server);
+  const previousHome = process.env.TURA_HOME;
+  const previousRoot = process.env.TURA_PROJECT_ROOT;
+  const previousUrl = process.env.TURA_GATEWAY_URL;
+  let restoreLauncher: (() => void) | undefined;
+  try {
+    const address = server.address() as AddressInfo;
+    const healthyUrl = `http://127.0.0.1:${address.port}`;
+    process.env.TURA_HOME = home;
+    process.env.TURA_PROJECT_ROOT = projectRoot;
+    delete process.env.TURA_GATEWAY_URL;
+    mkdirSync(join(home, ".tura"), { recursive: true });
+    writeFileSync(
+      join(home, ".tura", "gateway-active.env"),
+      "TURA_GATEWAY_URL=http://127.0.0.1:65530\n",
+    );
+    let launches = 0;
+    restoreLauncher = _setGatewayLauncherForTest(async () => {
+      launches += 1;
+      return healthyUrl;
+    });
+
+    assert.equal(await connectGatewayAvailable(healthyUrl, plainCapabilities(), false), healthyUrl);
+    assert.equal(launches, 0);
+    assert.match(
+      readFileSync(join(home, ".tura", "gateway-active.env"), "utf8"),
+      new RegExp(healthyUrl),
+    );
+  } finally {
+    restoreLauncher?.();
+    if (previousHome === undefined) delete process.env.TURA_HOME;
+    else process.env.TURA_HOME = previousHome;
+    if (previousRoot === undefined) delete process.env.TURA_PROJECT_ROOT;
+    else process.env.TURA_PROJECT_ROOT = previousRoot;
+    if (previousUrl === undefined) delete process.env.TURA_GATEWAY_URL;
+    else process.env.TURA_GATEWAY_URL = previousUrl;
+    await close(server);
+    rmSync(home, { recursive: true, force: true });
+    rmSync(projectRoot, { recursive: true, force: true });
   }
 });
 

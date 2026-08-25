@@ -6,9 +6,26 @@
     "required": ["commands"],
     "additionalProperties": false,
     "properties": {
+      "timeout_ms": {
+        "type": ["number", "null"],
+        "minimum": 1,
+        "x-tura-optional": true,
+        "description": "Optional default timeout in milliseconds for commands that do not declare their own timeout_ms."
+      },
+      "stall_timeout_ms": {
+        "type": ["number", "null"],
+        "minimum": 1000,
+        "x-tura-optional": true,
+        "description": "Optional progress watchdog in milliseconds. It is independent from timeout_ms and expires only after no stdout or stderr activity. Omit for silent workloads that have another liveness signal."
+      },
+      "execution_id": {
+        "type": ["string", "null"],
+        "x-tura-optional": true,
+        "description": "Stable Router execution identity used to bind claims, terminal receipts, and diagnosed replay."
+      },
       "commands": {
         "type": "array",
-        "minItems": 5,
+        "minItems": 1,
         "maxItems": 20,
         "description": "Executable command-line instructions. During task execution, complete all currently needed steps in one batch; prefer 5 or more commands. For simple, standalone user tasks such as quick information lookups (e.g., checking current time) or single-step queries, 1-2 commands are acceptable when that fully answers the request. Independent read/search/list commands with no output dependency must share one step. A later step may consume an earlier step's JSON output through a command output placeholder.",
         "items": {
@@ -28,6 +45,18 @@
               "type": ["string", "null"],
               "x-tura-optional": true,
               "description": "Optional stable output binding name for this command. Later steps may reference this id; otherwise the resolved command_type is used."
+            },
+            "timeout_ms": {
+              "type": ["number", "null"],
+              "minimum": 1,
+              "x-tura-optional": true,
+              "description": "Optional timeout in milliseconds for this command. Overrides the top-level timeout_ms allowance."
+            },
+            "stall_timeout_ms": {
+              "type": ["number", "null"],
+              "minimum": 1000,
+              "x-tura-optional": true,
+              "description": "Optional no-output progress watchdog in milliseconds for this command. Overrides the top-level stall_timeout_ms allowance."
             },
             "step": {
               "type": "integer",

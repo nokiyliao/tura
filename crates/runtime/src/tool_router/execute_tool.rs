@@ -17,6 +17,7 @@ pub struct ExecuteToolInput {
     pub tools_directory: PathBuf,
     pub disable_permission_restrictions: bool,
     pub allowed_command_run_commands: Option<BTreeSet<String>>,
+    pub jspace_contract: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,14 +50,16 @@ pub async fn execute_tool(input: ExecuteToolInput) -> Result<ToolExecutionResult
         .map_err(|e| format!("failed to parse tool interface: {e}"))?;
 
     if execution_tool_name == "command_run" {
-        let output_value = crate::router_command_run::execute_command_run_value_or_error(
-            input.arguments.clone(),
-            input.session_directory.clone(),
-            Some(&input.session_id),
-            Some(&input.runtime_id),
-            input.allowed_command_run_commands.clone(),
-        )
-        .await;
+        let output_value =
+            crate::router_command_run::execute_command_run_value_or_error_with_jspace(
+                input.arguments.clone(),
+                input.session_directory.clone(),
+                Some(&input.session_id),
+                Some(&input.runtime_id),
+                input.allowed_command_run_commands.clone(),
+                input.jspace_contract.clone(),
+            )
+            .await;
         return Ok(ToolExecutionResult {
             tool_name: input.tool_name.clone(),
             arguments: input.arguments,

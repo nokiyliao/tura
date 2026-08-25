@@ -6,7 +6,7 @@ use crate::services::managed_process::repo_root;
 use crate::services::manager::{ServiceManager, WorkerAlreadyRunning};
 use crate::services::models::WorkerSpec;
 use crate::services::runtime_workers::runtime_worker_limit;
-use runtime_contract::{CallContext, RunAgentRequest};
+use runtime_contract::{CallContext, LifecycleExecutionContext, RunAgentRequest};
 use tura_router::registry::{binary_target_diagnostics, resolve_binary_target};
 
 /// Maximum recursion depth for child sub-sessions (fork-bomb guard, T5.4).
@@ -33,15 +33,43 @@ pub(crate) async fn dispatch_run_agent_with_runtime_slot(
 
 async fn dispatch_run_agent_inner(
     state: &AppState,
-    req: RunAgentRequest,
+    mut req: RunAgentRequest,
     ipc_request_id: String,
     runtime_slot_acquired: bool,
 ) -> (u16, Value) {
-    let session_id = req
+    let Some(session_id) = req
         .session_id
         .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("router-{}", uuid::Uuid::new_v4()));
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            400,
+            json!({
+                "ok": false,
+                "code": "LIFECYCLE_IDENTITY_MISSING",
+                "error": "session_id is required; replacement Session creation is forbidden"
+            }),
+        );
+    };
+    let request_id = if ipc_request_id.trim().is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        ipc_request_id
+    };
+    if req.lifecycle.is_none() {
+        req.lifecycle = Some(LifecycleExecutionContext {
+            transaction_id: request_id.clone(),
+            commander_session_id: req
+                .parent_session_id
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| session_id.clone()),
+            task_id: None,
+            goal_id: None,
+            operator_override: false,
+        });
+    }
     if router_debug_enabled() {
         eprintln!(
             "router debug: dispatch_run_agent start session_id={} agent={:?} model={:?}",
@@ -225,11 +253,7 @@ async fn dispatch_run_agent_inner(
 
     let call_input = runtime_worker_call_input(&req, &session_id, &agent_spec, &prompt);
     let ctx = CallContext {
-        request_id: if ipc_request_id.trim().is_empty() {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            ipc_request_id
-        },
+        request_id,
         method: "POST".to_string(),
         path: format!("/runtime_worker/{session_id}"),
         input: call_input,
@@ -288,6 +312,8 @@ fn runtime_worker_call_input(
     json!({
         "runtime_id": req.runtime_id,
         "lease_id": req.lease_id,
+        "fallback_from_id": req.fallback_from_id,
+        "lifecycle": req.lifecycle,
         "session_id": session_id,
         "directory": req.directory,
         "model": req.model,
@@ -296,6 +322,7 @@ fn runtime_worker_call_input(
         "prompt": prompt,
         "runtime_context": req.runtime_context,
         "planning_mode_override": req.planning_mode_override,
+        "jspace_contract": req.jspace_contract,
         "no_op_manual": req.no_op_manual,
         "return_log": req.return_log,
     })
@@ -381,8 +408,13 @@ mod tests {
         let request: RunAgentRequest = serde_json::from_value(json!({
             "runtime_id": "runtime-lease-regression",
             "lease_id": "lease-regression",
+            "fallback_from_id": "runtime-failed",
             "session_id": "session-lease-regression",
-            "prompt": "exercise the runtime worker envelope"
+            "prompt": "exercise the runtime worker envelope",
+            "jspace_contract": {
+                "schema_version": "jspace_contract_v1",
+                "semantic_sha256": "jspace-digest"
+            }
         }))?;
         let agent_spec = state
             .registry
@@ -398,8 +430,10 @@ mod tests {
 
         assert_eq!(input["runtime_id"], "runtime-lease-regression");
         assert_eq!(input["lease_id"], "lease-regression");
+        assert_eq!(input["fallback_from_id"], "runtime-failed");
         assert_eq!(input["session_id"], "session-lease-regression");
         assert_eq!(input["prompt"], "exercise the runtime worker envelope");
+        assert_eq!(input["jspace_contract"]["semantic_sha256"], "jspace-digest");
         Ok(())
     }
 

@@ -59,8 +59,8 @@ impl CommandManifest {
             binary: None,
             supports_macro_command: false,
             mutating: false,
-            default_timeout_ms: 15_000,
-            max_timeout_ms: 300_000,
+            default_timeout_ms: 300_000,
+            max_timeout_ms: 14_400_000,
             manifest_path: PathBuf::new(),
         }
     }
@@ -73,8 +73,8 @@ impl CommandManifest {
             binary: Some(binary.to_string()),
             supports_macro_command: false,
             mutating: false,
-            default_timeout_ms: 15_000,
-            max_timeout_ms: 300_000,
+            default_timeout_ms: 300_000,
+            max_timeout_ms: 14_400_000,
             manifest_path: PathBuf::new(),
         }
     }

@@ -1,7 +1,8 @@
 use crate::CommandCheckpoint;
 use lifecycle::{
     ContextTokenStats, RuntimeAggregate, RuntimeEvent, RuntimeProjection, SessionCommand,
-    SessionEvent, SessionManagement, SessionManagementDelta, SessionProjection, UsageReport,
+    SessionEvent, SessionManagement, SessionManagementDelta, SessionProjection, SessionState,
+    UsageReport,
 };
 use serde::{Deserialize, Serialize};
 
@@ -145,7 +146,10 @@ pub struct SessionSummary {
     pub state: Option<String>,
     pub status: Option<String>,
     pub message_count: u64,
+    #[serde(default)]
+    pub feed_cursor: u64,
     pub task_management: serde_json::Value,
+    pub metadata: SessionMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,6 +473,133 @@ pub struct ReplayRuntimeRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GetRuntimeLeaseRequest {
+    pub runtime_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLeaseSnapshot {
+    pub runtime_id: String,
+    pub session_id: String,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub lease_id: Option<String>,
+    pub lease_active: bool,
+    pub revision: u64,
+    pub last_event_seq: u64,
+    pub terminal: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryCloseRuntimeReason {
+    OrphanedRuntime,
+    UnbornRuntime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeRecoveryQuiescenceProof {
+    pub active_turn: bool,
+    pub queued_turn: bool,
+    pub running_turn: bool,
+    pub worker_alive: bool,
+    pub active_command_runs: u64,
+    pub retained_process_scopes: u64,
+    pub retained_slot: bool,
+    pub global_active_session_count: u64,
+    pub global_retained_slot_count: u64,
+    pub global_active_command_runs: u64,
+}
+
+impl RuntimeRecoveryQuiescenceProof {
+    pub fn is_quiescent(&self) -> bool {
+        !self.active_turn
+            && !self.queued_turn
+            && !self.running_turn
+            && !self.worker_alive
+            && self.active_command_runs == 0
+            && self.retained_process_scopes == 0
+            && !self.retained_slot
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryCloseRuntimeRequest {
+    pub receipt_id: String,
+    pub database_path: String,
+    pub runtime_id: String,
+    pub session_id: String,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub lease_id: Option<String>,
+    pub expected_lease_active: bool,
+    pub expected_revision: u64,
+    pub expected_last_event_seq: u64,
+    pub expected_session_event_seq: u64,
+    pub expected_session_state: SessionState,
+    pub reason: RecoveryCloseRuntimeReason,
+    pub quiescence: RuntimeRecoveryQuiescenceProof,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeRecoveryReceipt {
+    pub receipt_id: String,
+    pub database_path: String,
+    pub runtime_id: String,
+    pub session_id: String,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub lease_id: Option<String>,
+    pub revision: u64,
+    pub last_event_seq: u64,
+    pub session_event_seq: u64,
+    pub reason: RecoveryCloseRuntimeReason,
+    pub lease_active: bool,
+    pub terminal: bool,
+    pub session_state: SessionState,
+    pub quiescence: RuntimeRecoveryQuiescenceProof,
+    pub closed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecoveryCloseRuntimeOutcome {
+    Closed {
+        receipt: RuntimeRecoveryReceipt,
+    },
+    AlreadyClosed {
+        receipt: RuntimeRecoveryReceipt,
+    },
+    RuntimeLive {
+        proof: RuntimeRecoveryQuiescenceProof,
+    },
+    RuntimeNotFound,
+    IdentityMismatch {
+        field: String,
+    },
+    CasConflict {
+        current_revision: u64,
+        current_last_event_seq: u64,
+    },
+    LeaseStateConflict {
+        lease_active: bool,
+        terminal: bool,
+    },
+    SessionCasConflict {
+        current_event_seq: u64,
+        current_state: SessionState,
+    },
+    InvalidRecoveryShape {
+        error: String,
+    },
+    ReceiptConflict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuntimeRegistrationOutcome {
     Registered {
@@ -587,6 +718,8 @@ pub enum SessionLogCommand {
     ReadSessionFeed(ReadSessionFeedRequest),
     SubscribeSessionFeed,
     ReplayRuntime(ReplayRuntimeRequest),
+    GetRuntimeLease(GetRuntimeLeaseRequest),
+    RecoveryCloseRuntime(RecoveryCloseRuntimeRequest),
     PersistSessionDelta(Box<PersistSessionDeltaRequest>),
     ReadContextSlice(ReadContextSliceRequest),
     ApplyCommandCheckpoint(Box<CommandCheckpoint>),
@@ -637,6 +770,12 @@ pub enum SessionLogResponse {
     },
     RuntimeReplayed {
         runtime: Option<Box<RuntimeReplay>>,
+    },
+    RuntimeLeaseRead {
+        runtime: Option<RuntimeLeaseSnapshot>,
+    },
+    RuntimeRecoveryClosed {
+        result: RecoveryCloseRuntimeOutcome,
     },
     SessionDeltaPersisted {
         next_sequence: u64,

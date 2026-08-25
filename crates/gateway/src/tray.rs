@@ -839,7 +839,24 @@ mod tests {
             state: state.map(str::to_string),
             status: status.map(str::to_string),
             message_count: 1,
+            feed_cursor: 3,
             task_management: json!({}),
+            metadata: session_log_contract::SessionMetadata {
+                session_directory: "/tmp/workspace/sessions".to_string(),
+                model: None,
+                agent: None,
+                session_type: "coding".to_string(),
+                kill_processes_on_start: false,
+                validator_enabled: false,
+                force_planning: false,
+                model_variant: None,
+                model_acceleration_enabled: false,
+                disable_permission_restrictions: false,
+                use_last_tool_call_response: true,
+                auto_session_name: true,
+                context_tokens: lifecycle::ContextTokenStats::default(),
+                runtime_usage: json!({}),
+            },
         }
     }
 

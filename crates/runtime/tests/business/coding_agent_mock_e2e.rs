@@ -130,6 +130,160 @@ fn coding_agent_can_call_command_run_tool_e2e() {
 }
 
 #[test]
+fn codex_apply_patch_only_agent_executes_before_task_type_exists() {
+    let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
+    let workspace = create_rust_workspace();
+    let provider = MockProvider::start_codex_apply_patch_only();
+    let llm_config = write_codex_llm_config(&workspace);
+    let endpoint = format!("http://{}", provider.addr);
+    let router_addr = mock_command_run_router_addr();
+    let agent_spec = serde_json::json!({
+        "agent_name": "apply-patch-only",
+        "config": {
+            "agent_name": "apply-patch-only",
+            "agent_directory": "agents/src/direct",
+            "parent_agent_id": null,
+            "report_to_user": true,
+            "default_config": false,
+            "reflection": false,
+            "op_manual": false,
+            "self_reflection": false,
+            "provider": {
+                "tura_llm_name": "fast",
+                "default_model_tier": "fast",
+                "current_model": "codex/gpt-5.6-sol",
+                "stream": true,
+                "temperature": 0.0,
+                "max_tokens": 0,
+                "tool_choice": "Auto",
+                "time_out_ms": 30000
+            },
+            "agent_prompt": [],
+            "agent_capabilities": [{
+                "capability_name": "apply_patch",
+                "capability_directory": "crates/tools/src"
+            }],
+            "validator": {
+                "need_validator": false,
+                "validator_name": null
+            }
+        }
+    })
+    .to_string();
+    let _env = EnvGuard::set(&[
+        (
+            "TURA_PROVIDER_CONFIG",
+            llm_config.to_string_lossy().as_ref(),
+        ),
+        ("TURA_ROUTER_AGENT_SPEC", agent_spec.as_str()),
+        ("OPENAI_LOGIN", "oauth"),
+        ("OPENAI_API_KEY", "test-key"),
+        ("OPENAI_TOKEN_EXPIRES", MOCK_OPENAI_TOKEN_EXPIRES),
+        ("OPENAI_CODEX_ENDPOINT", endpoint.as_str()),
+        ("TURA_ROUTER_ADDR", router_addr.as_str()),
+        ("TURA_GATEWAY_CALLBACKS", "0"),
+        ("TURA_MANAS_MAX_TURNS", "2"),
+        ("TURA_NO_TOOL_RETRY_LIMIT", "0"),
+        ("TURA_PROVIDER_TOTAL_TIMEOUT_MS", MOCK_PROVIDER_TIMEOUT_MS),
+        (
+            "TURA_PROVIDER_FIRST_OUTPUT_TIMEOUT_MS",
+            MOCK_PROVIDER_STREAM_TIMEOUT_MS,
+        ),
+        (
+            "TURA_PROVIDER_IDLE_OUTPUT_TIMEOUT_MS",
+            MOCK_PROVIDER_STREAM_TIMEOUT_MS,
+        ),
+    ]);
+
+    let result = mano::process_from_gateway_session_in_directory(
+        "e2e-codex-apply-patch-only".to_string(),
+        SessionInput {
+            user_input: "Create apply-only-created.txt using your only available command, then report completion."
+                .to_string(),
+            file_input: vec![],
+            agent: Some("apply-patch-only".to_string()),
+            runtime_context: None,
+            planning_mode_override: None,
+        },
+        workspace.clone(),
+    )
+    .expect("apply_patch-only Codex agent should complete");
+
+    assert_eq!(result.agents[0].agent_name, "apply-patch-only");
+    assert_eq!(
+        result.session.state,
+        SessionState::Completed,
+        "final_error={:?}; session log: {:#?}",
+        result.final_error,
+        result.session.session_log
+    );
+    assert!(result.session.task_type.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("apply-only-created.txt"))
+            .expect("apply-only target should exist"),
+        "created by apply-only agent\n"
+    );
+
+    let requests = provider
+        .requests
+        .lock()
+        .expect("mock provider requests lock");
+    assert_eq!(
+        requests.len(),
+        2,
+        "one tool turn and one terminal assistant turn are required: {requests:#?}"
+    );
+    let commands_schema = requests[0]
+        .pointer("/tools/0/parameters/properties/commands")
+        .expect("first Codex request should expose command_run commands schema");
+    assert_eq!(commands_schema["minItems"], 1);
+    assert_eq!(commands_schema["maxItems"], 20);
+    assert_eq!(
+        commands_schema["items"]["properties"]["command_type"]["enum"],
+        serde_json::json!(["apply_patch"])
+    );
+    let function_output = requests[1]
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|input| {
+            input.iter().find(|item| {
+                item.get("type").and_then(Value::as_str) == Some("function_call_output")
+            })
+        })
+        .expect("second Codex request should replay command_run output");
+    assert_eq!(function_output["call_id"], "call_stream_apply_patch_only");
+    let provider_output = function_output["output"]
+        .as_str()
+        .and_then(|output| serde_json::from_str::<Value>(output).ok())
+        .expect("function_call_output should contain structured command results");
+    assert_eq!(provider_output["results"].as_array().map(Vec::len), Some(1));
+    assert_eq!(provider_output["results"][0]["success"], true);
+    drop(requests);
+
+    let tool_results = tool_results(&result.session.session_log);
+    let output = tool_results
+        .iter()
+        .find(|entry| entry["tool_name"] == "command_run")
+        .and_then(|entry| entry.get("output"))
+        .expect("command_run output should be persisted");
+    assert_eq!(output["commands"].as_array().map(Vec::len), Some(1));
+    assert_eq!(output["results"].as_array().map(Vec::len), Some(1));
+    assert_eq!(output["results"][0]["success"], true);
+    let assistant_records = result
+        .session
+        .session_log
+        .iter()
+        .map(|entry| entry.value())
+        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("assistant"))
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_records.len(), 1);
+    assert_eq!(
+        assistant_records[0].get("content").and_then(Value::as_str),
+        Some("Apply-only repair completed.")
+    );
+}
+
+#[test]
 fn coding_agent_executes_command_run_command_before_stream_finishes() {
     let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
     let workspace = create_rust_workspace();

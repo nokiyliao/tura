@@ -556,6 +556,11 @@ fn read_timeout_for(method: &str) -> Option<Duration> {
         // Keep the socket attached to that one execution unless an operator
         // explicitly configures a deadline.
         router_execution_timeout_override()
+    } else if method == "execution.command_run" {
+        // command_run has its own per-command deadline and durable terminal
+        // receipt. A front read timeout must not turn a live workload into a
+        // synthetic workload failure.
+        router_execution_timeout_override()
     } else {
         Some(router_execution_timeout_override().unwrap_or(DEFAULT_ROUTER_EXECUTION_TIMEOUT))
     }

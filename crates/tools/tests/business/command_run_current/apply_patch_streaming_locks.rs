@@ -74,6 +74,23 @@ fn pass_apply_patch_add_delete_and_move_are_tracked_in_output() {
         .iter()
         .any(|change| change["move_path"] == "moved.txt"));
     assert!(changes.iter().any(|change| change["kind"] == "delete"));
+    let receipt = &output["results"][0]["output"]["terminal_receipt"];
+    assert_eq!(
+        receipt["schema_version"],
+        "tura_command_terminal_receipt_v1"
+    );
+    assert_eq!(receipt["terminal_state"], "completed");
+    assert_eq!(receipt["termination_origin"], "in_process_apply_patch");
+    assert_eq!(receipt["outcome"], "known");
+    assert_eq!(receipt["termination_proven"], true);
+    assert_eq!(receipt["reconcile_required"], false);
+    let receipt_path = output["results"][0]["output"]["terminal_receipt_path"]
+        .as_str()
+        .expect("terminal receipt path");
+    let durable_receipt: Value =
+        serde_json::from_str(&fs::read_to_string(receipt_path).expect("durable terminal receipt"))
+            .expect("terminal receipt JSON");
+    assert_eq!(&durable_receipt, receipt);
 }
 
 #[test]

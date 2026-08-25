@@ -6,7 +6,12 @@
 //! cleanup paths.
 
 use anyhow::{anyhow, bail, Context, Result};
+use lifecycle::{SessionCommand, TaskPlan};
 use serde_json::json;
+use session_log_contract::{
+    CreateSessionRequest, ExecuteSessionCommandRequest, RegisterRuntimeRequest, SessionLogCommand,
+    SessionLogResponse, SessionRecordProjection,
+};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
@@ -114,6 +119,163 @@ fn gateway_stdin_eof_shuts_down_router_session_db_and_runtime_e2e() -> Result<()
     assert!(!router_endpoint_reachable(&home));
     assert!(!session_db_endpoint_reachable(&home));
     Ok(())
+}
+
+#[test]
+fn gateway_listener_survives_if_the_durable_session_feed_reducer_terminates() -> Result<()> {
+    let repo = repo_root();
+    ensure_backend_binary(&repo, "router", "tura_router")?;
+    ensure_backend_binary(&repo, "session_log", "tura_session_db")?;
+
+    let root = temp_root("gateway-feed-owner-e2e")?;
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&workspace)?;
+
+    let port = free_port()?;
+    let mut gateway = GatewayGuard::start(&repo, &home, &workspace, port)?;
+    wait_for_http_ok(port, "/global/health", Duration::from_secs(30))?;
+    wait_for_endpoint(&service_addr_path(&home), Duration::from_secs(30))?;
+
+    publish_runtime_terminal_projection(&home, &workspace, "completed", false)?;
+    wait_for_http_ok(port, "/global/health", Duration::from_secs(5))?;
+    publish_runtime_terminal_projection(&home, &workspace, "failed", true)?;
+    wait_for_http_ok(port, "/global/health", Duration::from_secs(5))?;
+
+    publish_reducer_invalid_terminal_message(&home, &workspace)?;
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        gateway
+            .child
+            .as_mut()
+            .expect("gateway child")
+            .try_wait()?
+            .is_none(),
+        "unexpected feed termination must not exit the gateway owner"
+    );
+    wait_for_http_ok(port, "/global/health", Duration::from_secs(5))?;
+    gateway.stop()?;
+    Ok(())
+}
+
+fn publish_runtime_terminal_projection(
+    home: &Path,
+    workspace: &Path,
+    label: &str,
+    failed: bool,
+) -> Result<()> {
+    let session_id = format!("feed-{label}-{}", uuid::Uuid::new_v4());
+    let runtime_id = format!("runtime-{label}-{}", uuid::Uuid::new_v4());
+    create_and_register_runtime(home, workspace, &session_id, &runtime_id)?;
+    let terminal = if failed {
+        SessionCommand::RuntimeFailed {
+            runtime_id: runtime_id.clone(),
+        }
+    } else {
+        SessionCommand::RuntimeCompleted {
+            runtime_id: runtime_id.clone(),
+        }
+    };
+    expect_session_command(call_session_db(
+        home,
+        SessionLogCommand::ExecuteSessionCommand(ExecuteSessionCommandRequest {
+            command_id: format!("terminal-{label}"),
+            session_id: session_id.clone(),
+            session_command: terminal,
+            message_projection: None,
+        }),
+    )?)
+}
+
+fn publish_reducer_invalid_terminal_message(home: &Path, workspace: &Path) -> Result<()> {
+    let session_id = format!("feed-invalid-{}", uuid::Uuid::new_v4());
+    let runtime_id = format!("runtime-invalid-{}", uuid::Uuid::new_v4());
+    create_and_register_runtime(home, workspace, &session_id, &runtime_id)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    expect_session_command(call_session_db(
+        home,
+        SessionLogCommand::ExecuteSessionCommand(ExecuteSessionCommandRequest {
+            command_id: "terminal-invalid-message".to_string(),
+            session_id: session_id.clone(),
+            session_command: SessionCommand::RuntimeFailed { runtime_id },
+            message_projection: Some(SessionRecordProjection {
+                session_id: session_id.clone(),
+                message_id: "invalid-message".to_string(),
+                role: "assistant".to_string(),
+                created_at: now,
+                updated_at: now,
+                record: json!({
+                    "id": "invalid-message",
+                    "session_id": session_id,
+                    "role": "assistant"
+                }),
+            }),
+        }),
+    )?)
+}
+
+fn create_and_register_runtime(
+    home: &Path,
+    workspace: &Path,
+    session_id: &str,
+    runtime_id: &str,
+) -> Result<()> {
+    expect_session_command(call_session_db(
+        home,
+        SessionLogCommand::CreateSession(Box::new(CreateSessionRequest {
+            command_id: format!("create-{session_id}"),
+            session_id: session_id.to_string(),
+            creation_command: SessionCommand::CreateSession {
+                task_plan: TaskPlan::default(),
+            },
+            copy_context: false,
+            workspace: workspace.display().to_string(),
+            session_directory: workspace.display().to_string(),
+            name: session_id.to_string(),
+            created_at: chrono::Utc::now().timestamp_millis(),
+            model: None,
+            agent: None,
+            session_type: "coding".to_string(),
+            kill_processes_on_start: false,
+            validator_enabled: false,
+            force_planning: false,
+            model_variant: None,
+            model_acceleration_enabled: false,
+            disable_permission_restrictions: false,
+            use_last_tool_call_response: false,
+            auto_session_name: false,
+            initial_task_plan_patch: None,
+        })),
+    )?)?;
+    match call_session_db(
+        home,
+        SessionLogCommand::RegisterRuntime(RegisterRuntimeRequest {
+            runtime_id: runtime_id.to_string(),
+            session_id: session_id.to_string(),
+            fallback_from_id: None,
+        }),
+    )? {
+        SessionLogResponse::RuntimeRegistered { .. } => Ok(()),
+        response => bail!("unexpected register runtime response: {response:?}"),
+    }
+}
+
+fn expect_session_command(response: SessionLogResponse) -> Result<()> {
+    match response {
+        SessionLogResponse::SessionCommandApplied { .. } => Ok(()),
+        response => bail!("unexpected session command response: {response:?}"),
+    }
+}
+
+fn call_session_db(home: &Path, command: SessionLogCommand) -> Result<SessionLogResponse> {
+    let endpoint = read_endpoint(&service_addr_path(home))?;
+    let addr = endpoint
+        .get("addr")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("session_db endpoint missing addr: {endpoint}"))?;
+    let response = call_jsonl(addr, &serde_json::to_value(command)?)?;
+    serde_json::from_value(response).context("decode session_db response")
 }
 
 struct GatewayGuard {

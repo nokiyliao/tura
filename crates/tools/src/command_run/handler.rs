@@ -4,7 +4,10 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 #[path = "handler_parse.rs"]
 mod handler_parse;
@@ -13,16 +16,18 @@ use handler_parse::{
     command_values, parse_arguments_value, parse_command_item, string_field, u64_field,
 };
 
-const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 15_000;
+const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 300_000;
 const APPLY_PATCH_FAILURE_CANCEL_REASON: &str =
     "apply_patch failed; command_run stopped before later commands";
 const COMMAND_RUN_SANDBOX_ENV: &str = "TURA_COMMAND_RUN_SANDBOX";
 
 #[derive(Clone, Debug)]
 struct CommandRunArgs {
+    execution_id: String,
     commands: Vec<CommandItem>,
     workdir: Option<String>,
     timeout_ms: Option<u64>,
+    stall_timeout_ms: Option<u64>,
     allowed_commands: Option<BTreeSet<String>>,
     sandbox: bool,
 }
@@ -36,6 +41,7 @@ struct CommandItem {
     workdir: Option<String>,
     step: Option<u64>,
     timeout_ms: Option<u64>,
+    stall_timeout_ms: Option<u64>,
     binding_id: Option<String>,
 }
 
@@ -183,12 +189,16 @@ pub fn normalize_command_value_for_execution(
     if let Some(timeout_ms) = item.timeout_ms {
         object.insert("timeout_ms".to_string(), json!(timeout_ms));
     }
+    if let Some(stall_timeout_ms) = item.stall_timeout_ms {
+        object.insert("stall_timeout_ms".to_string(), json!(stall_timeout_ms));
+    }
     Ok(Value::Object(object))
 }
 
 pub struct StreamingCommandRunExecutor {
     router: Arc<CommandRouter>,
     ctx: ToolContext,
+    execution_id: String,
     allowed_commands: Option<BTreeSet<String>>,
     sandbox: bool,
     active_step: Option<u64>,
@@ -222,6 +232,7 @@ impl StreamingCommandRunExecutor {
         Self {
             router: Arc::new(CommandRouter::new()),
             ctx: ToolContext::new_with_lock_scope(session_dir, lock_scope),
+            execution_id: new_execution_id(),
             allowed_commands,
             sandbox: command_run_sandbox_enabled(),
             active_step: None,
@@ -276,11 +287,12 @@ impl StreamingCommandRunExecutor {
         }
 
         let macro_command_safe = command
-            .is_macro_command_safe(&self.router, &self.ctx.child())
+            .is_macro_command_safe(&self.router, &self.ctx.child(), &self.execution_id)
             .await;
         if macro_command_safe {
             let router = Arc::clone(&self.router);
             let ctx = self.ctx.child();
+            let execution_id = self.execution_id.clone();
             let allowed_commands = self.allowed_commands.clone();
             let sandbox = self.sandbox;
             self.macro_command_batch.push(tokio::spawn(async move {
@@ -288,6 +300,7 @@ impl StreamingCommandRunExecutor {
                     &router,
                     command,
                     ctx,
+                    &execution_id,
                     false,
                     allowed_commands.as_ref(),
                     sandbox,
@@ -303,6 +316,7 @@ impl StreamingCommandRunExecutor {
             &self.router,
             command,
             self.ctx.child(),
+            &self.execution_id,
             true,
             self.allowed_commands.as_ref(),
             self.sandbox,
@@ -443,6 +457,7 @@ async fn execute_async_args_with_lock_scope(
 async fn execute_async(args: CommandRunArgs, ctx: ToolContext) -> CommandRunOutput {
     let mut by_step: BTreeMap<u64, Vec<CommandItem>> = BTreeMap::new();
     let CommandRunArgs {
+        execution_id,
         mut commands,
         allowed_commands,
         sandbox,
@@ -480,6 +495,7 @@ async fn execute_async(args: CommandRunArgs, ctx: ToolContext) -> CommandRunOutp
             &router,
             commands,
             ctx.child(),
+            &execution_id,
             allowed_commands.as_ref(),
             sandbox,
         )
@@ -546,6 +562,7 @@ async fn run_command_run_step(
     router: &CommandRouter,
     commands: Vec<CommandItem>,
     ctx: ToolContext,
+    execution_id: &str,
     allowed_commands: Option<&BTreeSet<String>>,
     sandbox: bool,
 ) -> CommandRunStepOutput {
@@ -553,7 +570,9 @@ async fn run_command_run_step(
     let mut macro_command_batch = Vec::new();
 
     for command in commands {
-        let force_exclusive = !command.is_macro_command_safe(router, &ctx).await;
+        let force_exclusive = !command
+            .is_macro_command_safe(router, &ctx, execution_id)
+            .await;
         if !force_exclusive {
             macro_command_batch.push(command);
             continue;
@@ -564,6 +583,7 @@ async fn run_command_run_step(
                 router,
                 std::mem::take(&mut macro_command_batch),
                 ctx.child(),
+                execution_id,
                 allowed_commands,
                 sandbox,
             )
@@ -573,6 +593,7 @@ async fn run_command_run_step(
             router,
             command,
             ctx.child(),
+            execution_id,
             true,
             allowed_commands,
             sandbox,
@@ -591,7 +612,15 @@ async fn run_command_run_step(
     }
 
     results.extend(
-        run_macro_command_batch(router, macro_command_batch, ctx, allowed_commands, sandbox).await,
+        run_macro_command_batch(
+            router,
+            macro_command_batch,
+            ctx,
+            execution_id,
+            allowed_commands,
+            sandbox,
+        )
+        .await,
     );
     CommandRunStepOutput {
         results,
@@ -608,6 +637,7 @@ async fn run_macro_command_batch(
     router: &CommandRouter,
     commands: Vec<CommandItem>,
     ctx: ToolContext,
+    execution_id: &str,
     allowed_commands: Option<&BTreeSet<String>>,
     sandbox: bool,
 ) -> Vec<CommandRunItemResult> {
@@ -621,6 +651,7 @@ async fn run_macro_command_batch(
             router,
             command,
             ctx.child(),
+            execution_id,
             false,
             allowed_commands,
             sandbox,
@@ -638,6 +669,7 @@ async fn run_command_run_item(
     router: &CommandRouter,
     command: CommandItem,
     ctx: ToolContext,
+    execution_id: &str,
     force_exclusive: bool,
     allowed_commands: Option<&BTreeSet<String>>,
     sandbox: bool,
@@ -679,7 +711,7 @@ async fn run_command_run_item(
             );
         }
     };
-    let call = match build_tool_call(&command_name, &command) {
+    let call = match build_tool_call(&command_name, &command, execution_id) {
         Ok(call) => call,
         Err(message) => {
             return CommandRunItemResult::failed(
@@ -723,7 +755,10 @@ fn command_allowed(command: &str, allowed_commands: Option<&BTreeSet<String>>) -
     let Some(allowed_commands) = allowed_commands else {
         return true;
     };
-    allowed_commands.contains(&crate::commands::canonical_command(command))
+    let canonical_command = crate::commands::canonical_command(command);
+    allowed_commands
+        .iter()
+        .any(|allowed| crate::commands::canonical_command(allowed) == canonical_command)
 }
 
 fn command_run_sandbox_enabled() -> bool {
@@ -855,7 +890,11 @@ fn command_run_task_status_result(command: CommandItem) -> CommandRunItemResult 
     }
 }
 
-fn build_tool_call(command_name: &str, command: &CommandItem) -> Result<ToolCall, String> {
+fn build_tool_call(
+    command_name: &str,
+    command: &CommandItem,
+    execution_id: &str,
+) -> Result<ToolCall, String> {
     let router = CommandRouter::new();
     let payload = match command_name {
         "apply_patch" => ToolPayload::Freeform {
@@ -887,9 +926,23 @@ fn build_tool_call(command_name: &str, command: &CommandItem) -> Result<ToolCall
     };
     Ok(ToolCall {
         tool_name: command_name.to_string(),
-        call_id: format!("command_run:{}:{}", command.effective_step(), command.index),
+        call_id: command_call_id(execution_id, command),
         payload,
     })
+}
+
+fn command_call_id(execution_id: &str, command: &CommandItem) -> String {
+    if let Some(binding_id) = command.binding_id.as_deref() {
+        if binding_id == execution_id || binding_id.starts_with(&format!("{execution_id}:")) {
+            return binding_id.to_string();
+        }
+        return format!("{execution_id}:{binding_id}");
+    }
+    format!(
+        "{execution_id}:step:{}:index:{}",
+        command.effective_step(),
+        command.index
+    )
 }
 
 fn normalize_shell_command_arguments(command: &CommandItem) -> Result<Value, String> {
@@ -924,8 +977,19 @@ fn parse_args(arguments: &Value) -> Result<CommandRunArgs, String> {
     let Some(object) = arguments.as_object() else {
         return Err("failed to parse command_run arguments: expected object".to_string());
     };
+    let execution_id = string_field(
+        object,
+        &[
+            "execution_id",
+            "executionId",
+            "command_run_id",
+            "commandRunId",
+        ],
+    )
+    .unwrap_or_else(new_execution_id);
     let top_workdir = string_field(object, &["workdir", "cwd"]);
     let top_timeout_ms = u64_field(object, &["timeout_ms", "timeoutMs"]);
+    let top_stall_timeout_ms = u64_field(object, &["stall_timeout_ms", "stallTimeoutMs"]);
     let command_values = if let Some(commands) = object.get("commands") {
         command_values(commands)
     } else if let Some(steps) = object.get("steps") {
@@ -934,9 +998,11 @@ fn parse_args(arguments: &Value) -> Result<CommandRunArgs, String> {
         vec![arguments.clone()]
     };
     let mut args = CommandRunArgs {
+        execution_id,
         commands: Vec::new(),
         workdir: top_workdir,
         timeout_ms: top_timeout_ms,
+        stall_timeout_ms: top_stall_timeout_ms,
         allowed_commands: None,
         sandbox: command_run_sandbox_enabled(),
     };
@@ -953,6 +1019,9 @@ fn parse_args(arguments: &Value) -> Result<CommandRunArgs, String> {
         }
         if command.timeout_ms.is_none() {
             command.timeout_ms = args.timeout_ms;
+        }
+        if command.stall_timeout_ms.is_none() {
+            command.stall_timeout_ms = args.stall_timeout_ms;
         }
         if let Some(patch) = command
             .command_line
@@ -1007,6 +1076,28 @@ fn parse_args(arguments: &Value) -> Result<CommandRunArgs, String> {
         }
     }
     validate_task_status_compact_context_position(&args.commands)?;
+    let router = CommandRouter::new();
+    for command in &args.commands {
+        let maximum = router
+            .max_timeout_ms_for_command(&command.command)
+            .unwrap_or(14_400_000);
+        if command.effective_timeout_ms() > maximum {
+            return Err(format!(
+                "command_run timeout_ms exceeds bounded maximum for {}: requested={},maximum={maximum}",
+                command.command,
+                command.effective_timeout_ms()
+            ));
+        }
+        if command
+            .stall_timeout_ms
+            .is_some_and(|stall_timeout_ms| stall_timeout_ms >= command.effective_timeout_ms())
+        {
+            return Err(format!(
+                "command_run stall_timeout_ms must be lower than timeout_ms for {}",
+                command.command
+            ));
+        }
+    }
     Ok(args)
 }
 
@@ -1040,6 +1131,11 @@ fn with_command_timeout(mut arguments: Value, command: &CommandItem) -> Value {
                 "timeout_ms".to_string(),
                 json!(command.effective_timeout_ms()),
             );
+        }
+        let has_stall_timeout =
+            object.contains_key("stall_timeout_ms") || object.contains_key("stallTimeoutMs");
+        if !has_stall_timeout && let Some(stall_timeout_ms) = command.stall_timeout_ms {
+            object.insert("stall_timeout_ms".to_string(), json!(stall_timeout_ms));
         }
     }
     arguments
@@ -1266,14 +1362,19 @@ impl CommandItem {
             .max(1)
     }
 
-    async fn is_macro_command_safe(&self, router: &CommandRouter, ctx: &ToolContext) -> bool {
+    async fn is_macro_command_safe(
+        &self,
+        router: &CommandRouter,
+        ctx: &ToolContext,
+        execution_id: &str,
+    ) -> bool {
         let Some(tool_name) = router.resolve_command_tool_name(&self.command) else {
             return false;
         };
         if tool_name == "apply_patch" {
             return false;
         }
-        let Ok(call) = build_tool_call(&tool_name, self) else {
+        let Ok(call) = build_tool_call(&tool_name, self, execution_id) else {
             return false;
         };
         if !router.tool_supports_macro_command(&call) {
@@ -1281,6 +1382,15 @@ impl CommandItem {
         }
         !router.command_is_mutating(&call, ctx).await
     }
+}
+
+fn new_execution_id() -> String {
+    static NEXT_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "command-run-{}-{}",
+        std::process::id(),
+        NEXT_EXECUTION_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn default_timeout_ms_for_command(command: &str) -> u64 {

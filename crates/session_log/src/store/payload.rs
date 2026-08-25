@@ -36,7 +36,9 @@ pub(super) struct WorkspaceSessionSummaryPayload {
     pub(super) state: Option<String>,
     pub(super) status: Option<String>,
     pub(super) message_count: i64,
+    pub(super) feed_cursor: u64,
     pub(super) task_management: Value,
+    pub(super) metadata: SessionMetadata,
 }
 
 pub(super) fn index_session_from_row(row: &Row<'_>) -> rusqlite::Result<IndexSessionRow> {
@@ -126,7 +128,9 @@ pub(super) fn load_workspace_session_summary_payload(
     let payload = with_connection(workspace_db_path, init_workspace_db, |conn| {
         conn.query_row(
             "SELECT workspace, name, parent_id, created_at, updated_at, last_user_message_at, state, status,
-                    message_count, task_management_json
+                    message_count,
+                    (SELECT COALESCE(MAX(cursor), 0) FROM session_feed_events WHERE session_id = ?1),
+                    task_management_json, session_json
              FROM sessions
              WHERE session_id = ?1",
             params![session_id],
@@ -141,7 +145,9 @@ pub(super) fn load_workspace_session_summary_payload(
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, i64>(8)?,
-                    row.get::<_, String>(9)?,
+                    row.get::<_, u64>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             },
         )
@@ -160,7 +166,9 @@ pub(super) fn load_workspace_session_summary_payload(
                 state,
                 status,
                 message_count,
+                feed_cursor,
                 task_management_json,
+                session_json,
             )| {
                 Ok(WorkspaceSessionSummaryPayload {
                     workspace,
@@ -172,11 +180,13 @@ pub(super) fn load_workspace_session_summary_payload(
                     state,
                     status,
                     message_count,
+                    feed_cursor,
                     task_management: parse_json_field(
                         &task_management_json,
                         "task_management_json",
                         Some(session_id),
                     )?,
+                    metadata: parse_json_field(&session_json, "session_json", Some(session_id))?,
                 })
             },
         )

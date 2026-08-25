@@ -5,7 +5,8 @@ use crate::profile_timings;
 use session_log_contract::{
     CommandCheckpoint, ContextSlice, GetSessionRequest, ListSessionRecordsRequest,
     ListSessionsRequest, Page, PersistSessionDeltaRequest, ReadContextSliceRequest,
-    SessionLogCommand, SessionLogResponse, SessionRecord, SessionSnapshot, WorkspaceSummary,
+    ReplayRuntimeRequest, RuntimeReplay, SessionLogCommand, SessionLogResponse, SessionRecord,
+    SessionSnapshot, WorkspaceSummary,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -27,13 +28,7 @@ impl SessionLogClient {
         &self,
         command: SessionLogCommand,
     ) -> Result<SessionLogResponse, String> {
-        if !session_log_contract::client::service_is_running() {
-            return Err(
-                "session_db service is not running; start the per-home tura_router/tura_session_db owner before accessing session data"
-                    .to_string(),
-            );
-        }
-        session_log_contract::client::call_service(&command).map_err(|error| error.to_string())
+        call_session_service(&command).map_err(|error| error.to_string())
     }
 
     pub(crate) fn persist_session_delta(
@@ -71,6 +66,23 @@ impl SessionLogClient {
             }
             other => Err(format!(
                 "unexpected session_log response for read_context_slice: {other:?}"
+            )),
+        }
+    }
+
+    pub(crate) fn replay_runtime(
+        &self,
+        runtime_id: String,
+    ) -> Result<Option<RuntimeReplay>, String> {
+        match self.call_typed_sync(SessionLogCommand::ReplayRuntime(ReplayRuntimeRequest {
+            runtime_id,
+        }))? {
+            SessionLogResponse::RuntimeReplayed { runtime } => Ok(runtime.map(|runtime| *runtime)),
+            SessionLogResponse::Error { error } => {
+                Err(format!("session_log replay_runtime failed: {error}"))
+            }
+            other => Err(format!(
+                "unexpected session_log response for replay_runtime: {other:?}"
             )),
         }
     }
@@ -178,39 +190,19 @@ impl SessionLogClient {
             );
             return Ok(SessionLogResponse::Ok);
         }
-        let service_check_start = Instant::now();
-        let service_running = session_log_contract::client::service_is_running();
+        let ipc_start = Instant::now();
+        let ipc_result = call_session_service(&command);
         profile_timings::log_elapsed(
-            "session_log_client.service_is_running",
-            service_check_start,
+            "session_log_client.call_service",
+            ipc_start,
             serde_json::json!({
                 "command": command_name,
                 "async_write": async_write,
                 "command_bytes": command_bytes,
-                "service_running": service_running,
+                "success": ipc_result.is_ok(),
             }),
         );
-        if service_running {
-            let ipc_start = Instant::now();
-            let ipc_result = session_log_contract::client::call_service(&command);
-            profile_timings::log_elapsed(
-                "session_log_client.call_service",
-                ipc_start,
-                serde_json::json!({
-                    "command": command_name,
-                    "async_write": async_write,
-                    "command_bytes": command_bytes,
-                    "success": ipc_result.is_ok(),
-                }),
-            );
-            match ipc_result {
-                Ok(response) => return Ok(response),
-                Err(error) => return Err(error),
-            }
-        }
-        Err(anyhow!(
-            "session_db service is not running; start the per-home tura_router/tura_session_db owner before reading session data"
-        ))
+        ipc_result
     }
 }
 
@@ -228,6 +220,8 @@ fn session_log_command_name(command: &SessionLogCommand) -> &'static str {
         SessionLogCommand::ReadSessionFeed(_) => "read_session_feed",
         SessionLogCommand::SubscribeSessionFeed => "subscribe_session_feed",
         SessionLogCommand::ReplayRuntime(_) => "replay_runtime",
+        SessionLogCommand::GetRuntimeLease(_) => "get_runtime_lease",
+        SessionLogCommand::RecoveryCloseRuntime(_) => "recovery_close_runtime",
         SessionLogCommand::PersistSessionDelta(_) => "persist_session_delta",
         SessionLogCommand::ReadContextSlice(_) => "read_context_slice",
         SessionLogCommand::ApplyCommandCheckpoint(_) => "apply_command_checkpoint",
@@ -249,4 +243,40 @@ fn session_log_error(operation: &str, error: String) -> anyhow::Error {
 
 fn unexpected_session_log_response(operation: &str, response: SessionLogResponse) -> anyhow::Error {
     anyhow!("unexpected session_log response for {operation}: {response:?}")
+}
+
+fn call_session_service(command: &SessionLogCommand) -> Result<SessionLogResponse> {
+    call_session_service_with(command, session_log_contract::client::call_service)
+}
+
+fn call_session_service_with(
+    command: &SessionLogCommand,
+    transport: impl FnOnce(&SessionLogCommand) -> Result<SessionLogResponse>,
+) -> Result<SessionLogResponse> {
+    transport(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_operation_invokes_exactly_one_transport_without_a_health_preflight() {
+        let calls = std::cell::Cell::new(0);
+        let command = SessionLogCommand::GetSession(GetSessionRequest {
+            session_id: "direct-data-operation".to_string(),
+        });
+        let response = call_session_service_with(&command, |actual| {
+            calls.set(calls.get() + 1);
+            assert!(matches!(actual, SessionLogCommand::GetSession(_)));
+            Ok(SessionLogResponse::Session { session: None })
+        })
+        .expect("direct session read");
+
+        assert!(matches!(
+            response,
+            SessionLogResponse::Session { session: None }
+        ));
+        assert_eq!(calls.get(), 1);
+    }
 }

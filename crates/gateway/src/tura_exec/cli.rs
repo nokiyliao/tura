@@ -29,6 +29,7 @@ Options:
   -p, --priority                  enable priority model routing for this model
   -a, --agent-id ID               agent id loaded from agents/src/
       --session-id ID             reuse a deterministic session id
+      --timeout SECONDS           outer observation budget; command deadlines remain per-command
       --goal                      keep the CLI session running until task_status marks done/question
       --no-op                     disable operation manual injection unless goal/reflection overrides it
       --json                      emit JSONL events instead of final text only
@@ -49,7 +50,7 @@ Options:
                                   command_run_shell=bash|zsh|shll
       --skip-git-repo-check       accepted for compatibility
       --dangerously-bypass-approvals-and-sandbox
-                                  accepted for Codex CLI compatibility; does not enable sandboxing
+                                  allow the exact CLI session to approve required file/process access
   -h, --help                      show this help
 
 Output:
@@ -87,9 +88,11 @@ pub(crate) struct CliConfig {
     pub(crate) max_tokens: Option<u64>,
     pub(crate) command_run_shell: Option<String>,
     pub(crate) command_run_sandbox: bool,
+    pub(crate) disable_permission_restrictions: Option<bool>,
     pub(crate) agent: Option<String>,
     pub(crate) capability_directories: Vec<PathBuf>,
     pub(crate) session_id: Option<String>,
+    pub(crate) timeout_secs: Option<u64>,
     pub(crate) last_message_path: Option<PathBuf>,
     /// `--embedded`: run the runtime in-process (codex-style in-process transport),
     /// still connecting to the per-home single session_db owner. Default is the
@@ -118,9 +121,11 @@ impl CliConfig {
             max_tokens: None,
             command_run_shell: None,
             command_run_sandbox: false,
+            disable_permission_restrictions: None,
             agent: None,
             capability_directories: Vec::new(),
             session_id: None,
+            timeout_secs: None,
             last_message_path: None,
             embedded: false,
             prompt_parts: Vec::new(),
@@ -164,8 +169,22 @@ impl CliConfig {
                 index += 1;
                 continue;
             }
+            if let Some(value) = arg.strip_prefix("--timeout=") {
+                config.timeout_secs = parse_timeout_secs(value)?;
+                index += 1;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--config=") {
+                apply_config_arg(&mut config, value);
+                index += 1;
+                continue;
+            }
             match arg {
-                "--skip-git-repo-check" | "--dangerously-bypass-approvals-and-sandbox" => {
+                "--skip-git-repo-check" => {
+                    index += 1;
+                }
+                "--dangerously-bypass-approvals-and-sandbox" => {
+                    config.disable_permission_restrictions = Some(true);
                     index += 1;
                 }
                 "--sandbox" => {
@@ -233,6 +252,10 @@ impl CliConfig {
                     config.session_id = Some(take_value(&args, index)?);
                     index += 2;
                 }
+                "--timeout" | "--timeout-secs" => {
+                    config.timeout_secs = parse_timeout_secs(&take_value(&args, index)?)?;
+                    index += 2;
+                }
                 "--capability" => {
                     let value = take_value(&args, index)?;
                     extend_capability_directories(&mut config.capability_directories, &value)?;
@@ -270,6 +293,17 @@ impl CliConfig {
         }
         Ok(stdin)
     }
+}
+
+fn parse_timeout_secs(value: &str) -> Result<Option<u64>, String> {
+    let seconds = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("timeout must be a positive number of seconds: {value}"))?;
+    if seconds == 0 {
+        return Err("timeout must be greater than zero".to_string());
+    }
+    Ok(Some(seconds))
 }
 
 fn extend_capability_directories(
@@ -325,6 +359,12 @@ fn apply_config_arg(config: &mut CliConfig, value: &str) {
             if let Ok(shell) = parse_command_run_shell_surface(value) {
                 config.command_run_shell = Some(shell);
             }
+        }
+        "disable_permission_restrictions" if is_truthy(value) => {
+            config.disable_permission_restrictions = Some(true)
+        }
+        "disable_permission_restrictions" if is_falsy(value) => {
+            config.disable_permission_restrictions = Some(false)
         }
         _ => {}
     }
@@ -623,6 +663,27 @@ mod tests {
 
         assert!(config.command_run_sandbox);
         assert!(!compat.command_run_sandbox);
+        assert_eq!(compat.disable_permission_restrictions, Some(true));
+    }
+
+    #[test]
+    fn config_parses_explicit_permission_restriction_override() {
+        let enabled = CliConfig::parse(vec![
+            "exec".to_string(),
+            "-c".to_string(),
+            "disable_permission_restrictions=true".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse enabled permission override");
+        let disabled = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--config=disable_permission_restrictions=false".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse disabled permission override");
+
+        assert_eq!(enabled.disable_permission_restrictions, Some(true));
+        assert_eq!(disabled.disable_permission_restrictions, Some(false));
     }
 
     #[test]
@@ -656,5 +717,38 @@ mod tests {
         .expect_err("empty capability list should fail");
 
         assert!(error.contains("at least one directory"), "{error}");
+    }
+
+    #[test]
+    fn timeout_is_an_outer_observation_budget_not_a_command_deadline() {
+        let equals = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--timeout=14400".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse equals timeout");
+        let separated = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--timeout-secs".to_string(),
+            "900".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse separated timeout");
+
+        assert_eq!(equals.timeout_secs, Some(14_400));
+        assert_eq!(separated.timeout_secs, Some(900));
+    }
+
+    #[test]
+    fn timeout_rejects_zero_and_non_numeric_values() {
+        for value in ["0", "not-a-duration"] {
+            let error = CliConfig::parse(vec![
+                "exec".to_string(),
+                format!("--timeout={value}"),
+                "inspect".to_string(),
+            ])
+            .expect_err("invalid timeout should fail closed");
+            assert!(error.contains("timeout"), "{error}");
+        }
     }
 }

@@ -81,7 +81,13 @@ pub fn service_is_running() -> bool {
     if probe_session_db(&addr, probe_response_timeout(owner_lock_held)) {
         true
     } else {
-        remove_endpoint_if_unchanged(&endpoint);
+        // A client must not tear down the published endpoint while the
+        // lifecycle owner still holds its lock. The router owns replacement:
+        // it first terminates its managed child, which releases the lock, and
+        // only then may the stale endpoint be removed.
+        if !owner_lock_held {
+            remove_endpoint_if_unchanged(&endpoint);
+        }
         false
     }
 }

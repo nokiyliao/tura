@@ -341,6 +341,12 @@ impl CommandRouter {
             .map(|manifest| manifest.default_timeout_ms)
     }
 
+    pub fn max_timeout_ms_for_command(&self, command: &str) -> Option<u64> {
+        let command_name = crate::commands::canonical_command(command);
+        self.external_manifest(&command_name)
+            .map(|manifest| manifest.max_timeout_ms)
+    }
+
     pub async fn dispatch(
         &self,
         call: ToolCall,
@@ -450,7 +456,7 @@ fn take_external_command_timeout(command_id: &str, arguments: &mut Value) -> Dur
 fn default_external_command_timeout_ms(command_id: &str) -> u64 {
     CommandRouter::new()
         .default_timeout_ms_for_command(command_id)
-        .unwrap_or(15_000)
+        .unwrap_or(300_000)
 }
 
 fn take_u64_field(object: &mut serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {

@@ -27,6 +27,7 @@ lifecycle.workspace = true
 agents = { workspace = true }
 personas = { workspace = true }
 session_log_contract.workspace = true
+session_lifecycle.workspace = true
 router_contract.workspace = true
 runtime_contract.workspace = true
 tura_path = { workspace = true }

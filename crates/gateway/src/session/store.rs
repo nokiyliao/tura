@@ -19,7 +19,8 @@ use lifecycle::{PlanStatus, SessionCommand, SessionEvent, SessionProjection, Sta
 use parking_lot::RwLock;
 use session_log_contract::{
     CreateSessionRequest as CreateSessionDbRequest, SessionCommandResult, SessionMetadataPatch,
-    SessionRecordProjection, SessionSnapshot, UpdateSessionRequest as UpdateSessionDbRequest,
+    SessionRecordProjection, SessionSnapshot, SessionSummary,
+    UpdateSessionRequest as UpdateSessionDbRequest,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -67,7 +68,10 @@ struct LiveMessageOverlay {
 
 #[derive(Clone)]
 pub struct SessionStore {
+    summaries: Arc<RwLock<HashMap<String, ApiSession>>>,
+    summary_cursors: Arc<RwLock<HashMap<String, u64>>>,
     sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
+    resident_access: Arc<RwLock<HashMap<String, i64>>>,
     messages: Arc<RwLock<HashMap<String, Vec<Message>>>>,
     live_messages: Arc<RwLock<HashMap<String, Vec<LiveMessageOverlay>>>>,
     todos: Arc<RwLock<HashMap<String, Vec<serde_json::Value>>>>,
@@ -153,7 +157,10 @@ impl SessionStore {
 
     pub(crate) fn empty() -> Self {
         Self {
+            summaries: Arc::new(RwLock::new(HashMap::new())),
+            summary_cursors: Arc::new(RwLock::new(HashMap::new())),
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            resident_access: Arc::new(RwLock::new(HashMap::new())),
             messages: Arc::new(RwLock::new(HashMap::new())),
             live_messages: Arc::new(RwLock::new(HashMap::new())),
             todos: Arc::new(RwLock::new(HashMap::new())),
@@ -167,7 +174,11 @@ impl SessionStore {
     fn init_default_session(&self) {
         let info = SessionManager::create_session(None, None, None, Some("coding".to_string()));
         let session_id = info.id.clone();
+        let summary = api_session_from_info(&info, None);
+        self.summaries.write().insert(session_id.clone(), summary);
+        self.summary_cursors.write().insert(session_id.clone(), 0);
         self.sessions.write().insert(session_id.clone(), info);
+        self.touch_resident(&session_id);
         self.current_session_id.write().replace(session_id.clone());
 
         let now = Utc::now().timestamp_millis();
@@ -208,7 +219,7 @@ impl SessionStore {
             }
         };
         if let Err(err) = crate::session_feed::replay_directory(&client, self.clone(), &directory) {
-            tracing::warn!(directory, error = %err, "failed to replay typed Session feed");
+            tracing::warn!(directory, error = %err, "failed to hydrate Session summaries");
         }
     }
 
@@ -243,14 +254,29 @@ impl SessionStore {
 
     pub fn list_sessions(&self) -> Vec<ApiSession> {
         let parent_by_child = self.parent_by_child();
-        self.sessions
-            .read()
-            .values()
-            .map(|info| api_session_from_info(info, parent_by_child.get(&info.id).cloned()))
-            .collect()
+        let mut listed = self.summaries.read().clone();
+        for info in self.sessions.read().values() {
+            listed.insert(
+                info.id.clone(),
+                api_session_from_info(info, parent_by_child.get(&info.id).cloned()),
+            );
+        }
+        listed.into_values().collect()
     }
 
     pub fn get_session(&self, session_id: &str) -> Option<ApiSession> {
+        if let Some(session) = self.resident_session(session_id) {
+            self.touch_resident(session_id);
+            return Some(session);
+        }
+        if let Err(error) = self.ensure_hydrated(session_id) {
+            tracing::debug!(session_id, error, "failed to hydrate exact cold session");
+            return None;
+        }
+        self.resident_session(session_id)
+    }
+
+    fn resident_session(&self, session_id: &str) -> Option<ApiSession> {
         let parent_id = self.parent_for_child(session_id);
         self.sessions
             .read()
@@ -259,14 +285,100 @@ impl SessionStore {
     }
 
     pub fn get_session_info(&self, session_id: &str) -> Option<SessionInfo> {
+        if let Err(error) = self.ensure_hydrated(session_id) {
+            tracing::debug!(
+                session_id,
+                error,
+                "failed to hydrate exact session metadata"
+            );
+            return None;
+        }
         self.sessions.read().get(session_id).cloned()
     }
 
     pub fn session_lifecycle_projection(&self, session_id: &str) -> Option<SessionProjection> {
+        if let Err(error) = self.ensure_hydrated(session_id) {
+            tracing::debug!(
+                session_id,
+                error,
+                "failed to hydrate exact session lifecycle"
+            );
+            return None;
+        }
         self.sessions
             .read()
             .get(session_id)
             .map(|info| info.projection.clone())
+    }
+
+    pub(crate) fn has_resident_session(&self, session_id: &str) -> bool {
+        self.sessions.read().contains_key(session_id)
+    }
+
+    pub(crate) fn ensure_hydrated(&self, session_id: &str) -> Result<(), String> {
+        if self.has_resident_session(session_id) {
+            self.touch_resident(session_id);
+            return Ok(());
+        }
+        crate::session_feed::hydrate_exact_session(self.clone(), session_id)?;
+        self.touch_resident(session_id);
+        self.evict_idle_residents();
+        Ok(())
+    }
+
+    pub(crate) fn upsert_summary_cache(&self, summary: SessionSummary) -> ApiSession {
+        let session = api_session_from_summary(&summary);
+        self.replace_parent_cache(&session.id, session.parent_id.clone());
+        self.summaries
+            .write()
+            .insert(session.id.clone(), session.clone());
+        self.summary_cursors
+            .write()
+            .insert(session.id.clone(), summary.feed_cursor);
+        let mut current = self.current_session_id.write();
+        if current.is_none() {
+            current.replace(session.id.clone());
+        }
+        session
+    }
+
+    pub(crate) fn upsert_snapshot_summary_cache(
+        &self,
+        snapshot: &SessionSnapshot,
+        feed_cursor: u64,
+    ) -> Result<ApiSession, String> {
+        let info = session_info_from_snapshot(snapshot)?;
+        let session = api_session_from_info(&info, snapshot.lifecycle_projection.parent_id.clone());
+        self.replace_parent_cache(&session.id, session.parent_id.clone());
+        self.summaries
+            .write()
+            .insert(session.id.clone(), session.clone());
+        if feed_cursor == 1 {
+            // Cursor one is a new feed generation. It must replace the prior
+            // generation's high-water instead of being hidden by max().
+            self.summary_cursors
+                .write()
+                .insert(session.id.clone(), feed_cursor);
+        } else {
+            self.update_summary_cursor(&session.id, feed_cursor);
+        }
+        Ok(session)
+    }
+
+    pub(crate) fn summary_cursor(&self, session_id: &str) -> Option<u64> {
+        self.summary_cursors.read().get(session_id).copied()
+    }
+
+    pub(crate) fn update_summary_cursor(&self, session_id: &str, cursor: u64) {
+        self.summary_cursors
+            .write()
+            .entry(session_id.to_string())
+            .and_modify(|current| *current = (*current).max(cursor))
+            .or_insert(cursor);
+    }
+
+    pub(crate) fn summary_session_ids(&self) -> HashSet<String> {
+        self.summaries.read().keys().cloned().collect()
     }
 
     pub fn insert_projection_cache(
@@ -320,6 +432,10 @@ impl SessionStore {
         let session = api_session_from_info(&info, parent_id.clone());
         sessions.insert(session_id.clone(), info);
         drop(sessions);
+        self.touch_resident(&session_id);
+        self.summaries
+            .write()
+            .insert(session_id.clone(), session.clone());
         self.messages.write().entry(session_id.clone()).or_default();
         self.todos.write().entry(session_id.clone()).or_default();
         {
@@ -530,6 +646,7 @@ impl SessionStore {
         metadata: SessionMetadataPatch,
         task_plan_patch: Option<lifecycle::SessionTaskPlanPatch>,
     ) -> Result<ApiSession, String> {
+        self.ensure_hydrated(session_id)?;
         let snapshot = SessionDbClient::discover()
             .and_then(|client| {
                 client.update_session(UpdateSessionDbRequest {
@@ -554,7 +671,9 @@ impl SessionStore {
         name: Option<String>,
         task_instruction: Option<String>,
     ) -> Result<ApiSession, String> {
-        if self.sessions.read().contains_key(child_session_id) {
+        self.ensure_hydrated(parent_session_id)?;
+        if self.summaries.read().contains_key(child_session_id) {
+            self.ensure_hydrated(child_session_id)?;
             self.execute_canonical_session_command(
                 child_session_id,
                 SessionCommand::RegisterChildSession {
@@ -601,6 +720,7 @@ impl SessionStore {
         session_id: &str,
         command: SessionCommand,
     ) -> Result<SessionCommandResult, String> {
+        self.ensure_hydrated(session_id)?;
         let result = SessionDbClient::discover()
             .and_then(|client| client.execute_session_command(session_id.to_string(), command))
             .map_err(|error| format!("failed to execute canonical session command: {error}"))?;
@@ -632,6 +752,7 @@ impl SessionStore {
         session_id: &str,
         runtime_id: &str,
     ) -> Result<session_log_contract::RuntimeRegistrationOutcome, String> {
+        self.ensure_hydrated(session_id)?;
         let outcome = SessionDbClient::discover()
             .and_then(|client| {
                 client.register_runtime(runtime_id.to_string(), session_id.to_string())
@@ -670,6 +791,10 @@ impl SessionStore {
         command: SessionCommand,
         message: Message,
     ) -> Result<(SessionCommandResult, Message), String> {
+        self.ensure_hydrated(command_session_id)?;
+        if message.session_id != command_session_id {
+            self.ensure_hydrated(&message.session_id)?;
+        }
         let message_projection = SessionRecordProjection {
             session_id: message.session_id.clone(),
             message_id: message.id.clone(),
@@ -753,6 +878,9 @@ impl SessionStore {
         }
         let session = api_session_from_info(info, parent_id.clone());
         drop(sessions);
+        self.summaries
+            .write()
+            .insert(session_id.clone(), session.clone());
         self.replace_parent_cache(&session_id, parent_id);
         Some(ProjectionCacheWrite {
             session,
@@ -824,14 +952,10 @@ impl SessionStore {
             .get(parent_session_id)
             .cloned()
             .unwrap_or_default();
-        let sessions = self.sessions.read();
+        let sessions = self.summaries.read();
         child_ids
             .into_iter()
-            .filter_map(|child_id| {
-                sessions
-                    .get(&child_id)
-                    .map(|info| api_session_from_info(info, Some(parent_session_id.to_string())))
-            })
+            .filter_map(|child_id| sessions.get(&child_id).cloned())
             .collect()
     }
 
@@ -942,6 +1066,11 @@ impl SessionStore {
         );
         let session = api_session_from_info(&info, None);
         self.sessions.write().insert(info.id.clone(), info);
+        self.summaries
+            .write()
+            .insert(session.id.clone(), session.clone());
+        self.summary_cursors.write().insert(session.id.clone(), 0);
+        self.touch_resident(&session.id);
         self.messages.write().insert(session.id.clone(), Vec::new());
         self.todos.write().insert(session.id.clone(), Vec::new());
         self.persist_active_config(&session);
@@ -1109,8 +1238,15 @@ impl SessionStore {
 
     pub(crate) fn remove_session_projection(&self, session_id: &str) -> Option<ApiSession> {
         let parent_id = self.parent_for_child(session_id);
-        let info = self.sessions.write().remove(session_id)?;
-        let session = api_session_from_info(&info, parent_id);
+        let resident = self
+            .sessions
+            .write()
+            .remove(session_id)
+            .map(|info| api_session_from_info(&info, parent_id));
+        let summary = self.summaries.write().remove(session_id);
+        self.summary_cursors.write().remove(session_id);
+        self.resident_access.write().remove(session_id);
+        let session = resident.or(summary)?;
         self.messages.write().remove(session_id);
         self.live_messages.write().remove(session_id);
         let mut todo_cursors = self.todo_cursors.write();
@@ -1124,7 +1260,7 @@ impl SessionStore {
             }
         }
 
-        let replacement_current = self.sessions.read().keys().next().cloned();
+        let replacement_current = self.summaries.read().keys().next().cloned();
         let mut current = self.current_session_id.write();
         if current.as_deref() == Some(session_id) {
             *current = replacement_current;
@@ -1137,8 +1273,8 @@ impl SessionStore {
         parent_session_id: &str,
         child_session_id: &str,
     ) -> Option<ApiSession> {
-        if !self.sessions.read().contains_key(parent_session_id)
-            || !self.sessions.read().contains_key(child_session_id)
+        if self.get_session(parent_session_id).is_none()
+            || self.get_session(child_session_id).is_none()
         {
             return None;
         }
@@ -1158,7 +1294,8 @@ impl SessionStore {
     }
 
     pub fn set_current_session(&self, session_id: &str) -> bool {
-        if self.sessions.read().contains_key(session_id) {
+        if self.summaries.read().contains_key(session_id) && self.get_session(session_id).is_some()
+        {
             *self.current_session_id.write() = Some(session_id.to_string());
             true
         } else {
@@ -1344,7 +1481,94 @@ impl SessionStore {
     }
 
     pub fn session_count(&self) -> usize {
+        self.summaries.read().len()
+    }
+
+    fn touch_resident(&self, session_id: &str) {
+        self.resident_access
+            .write()
+            .insert(session_id.to_string(), Utc::now().timestamp_millis());
+    }
+
+    fn evict_idle_residents(&self) -> usize {
+        let limit = resident_cache_limit();
+        let ttl_ms = resident_cache_ttl_ms();
+        self.evict_idle_residents_at(Utc::now().timestamp_millis(), limit, ttl_ms)
+    }
+
+    fn evict_idle_residents_at(&self, now_ms: i64, limit: usize, ttl_ms: i64) -> usize {
+        let current = self.current_session_id.read().clone();
+        let access = self.resident_access.read().clone();
+        let scheduler_now = DateTime::<Utc>::from_timestamp_millis(now_ms).unwrap_or_else(Utc::now);
+        let sessions = self.sessions.read();
+        let resident_count = sessions.len();
+        let mut candidates = sessions
+            .iter()
+            .filter(|(session_id, info)| {
+                current.as_deref() != Some(session_id.as_str())
+                    && info.projection.state.ui_status() != "busy"
+                    && info.projection.active_runtime_id.is_none()
+                    && !info
+                        .projection
+                        .task_plan
+                        .detailed_tasks
+                        .iter()
+                        .any(|task| task.scheduler_eligible(scheduler_now))
+            })
+            .map(|(session_id, _)| {
+                (
+                    session_id.clone(),
+                    access.get(session_id).copied().unwrap_or(i64::MIN),
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(sessions);
+        candidates.sort_by_key(|(_, last_access)| *last_access);
+
+        let mut evicted = 0;
+        for (session_id, last_access) in candidates {
+            let over_limit = resident_count.saturating_sub(evicted) > limit;
+            let expired = now_ms.saturating_sub(last_access) >= ttl_ms;
+            if !over_limit && !expired {
+                continue;
+            }
+            if self.evict_resident_cache(&session_id) {
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    fn evict_resident_cache(&self, session_id: &str) -> bool {
+        let Some(info) = self.sessions.write().remove(session_id) else {
+            return false;
+        };
+        let parent_id = self.parent_for_child(session_id);
+        self.summaries.write().insert(
+            session_id.to_string(),
+            api_session_from_info(&info, parent_id),
+        );
+        self.messages.write().remove(session_id);
+        self.live_messages.write().remove(session_id);
+        self.todos.write().remove(session_id);
+        self.todo_cursors.write().remove(session_id);
+        self.resident_access.write().remove(session_id);
+        true
+    }
+
+    #[cfg(any(test, feature = "business-tests", feature = "os-tests"))]
+    pub fn resident_session_count_for_business_test(&self) -> usize {
         self.sessions.read().len()
+    }
+
+    #[cfg(any(test, feature = "business-tests", feature = "os-tests"))]
+    pub fn evict_idle_residents_for_business_test(
+        &self,
+        now_ms: i64,
+        limit: usize,
+        ttl_ms: i64,
+    ) -> usize {
+        self.evict_idle_residents_at(now_ms, limit, ttl_ms)
     }
 
     pub fn push_event(&self, event: GlobalEvent) {
@@ -1417,6 +1641,124 @@ impl SessionStore {
         }
         current
     }
+}
+
+fn resident_cache_limit() -> usize {
+    std::env::var("TURA_GATEWAY_RESIDENT_SESSION_CACHE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 256))
+        .unwrap_or(32)
+}
+
+fn resident_cache_ttl_ms() -> i64 {
+    std::env::var("TURA_GATEWAY_RESIDENT_SESSION_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|value| value.clamp(30, 86_400).saturating_mul(1_000))
+        .unwrap_or(15 * 60 * 1_000)
+}
+
+fn api_session_from_summary(summary: &SessionSummary) -> ApiSession {
+    let task_management = &summary.task_management;
+    let plan_summary = task_management
+        .get("plan_summary")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let task_summary = task_management
+        .get("task_summary")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            task_management
+                .get("tasks")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|tasks| tasks.first())
+                .and_then(|task| task.get("task_summary"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let name = summary
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let context_tokens = SessionContextTokens {
+        input: summary.metadata.context_tokens.input,
+        limit: summary.metadata.context_tokens.limit,
+    };
+    ApiSession {
+        id: summary.session_id.clone(),
+        name: name.clone(),
+        parent_id: summary.parent_id.clone(),
+        created_at: summary.created_at,
+        updated_at: summary.updated_at,
+        last_user_message_at: summary.last_user_message_at,
+        task_start_at: task_management_start_at(task_management).or(Some(summary.created_at)),
+        directory: (!summary.workspace.trim().is_empty()).then(|| summary.workspace.clone()),
+        model: summary.metadata.model.clone(),
+        agent: summary.metadata.agent.clone(),
+        session_type: Some(summary.metadata.session_type.clone()),
+        auto_session_name: summary.metadata.auto_session_name,
+        kill_processes_on_start: summary.metadata.kill_processes_on_start,
+        validator_enabled: summary.metadata.validator_enabled,
+        force_planning: summary.metadata.force_planning,
+        model_variant: summary.metadata.model_variant.clone(),
+        model_acceleration_enabled: summary.metadata.model_acceleration_enabled,
+        disable_permission_restrictions: summary.metadata.disable_permission_restrictions,
+        status: summary_status(summary),
+        message_count: summary.message_count as usize,
+        task_management: task_management.clone(),
+        context_tokens,
+        usage: crate::contracts::SessionUsage::new(
+            context_tokens,
+            summary.metadata.runtime_usage.clone(),
+        ),
+        plan_summary: plan_summary.clone(),
+        session_display_name: name
+            .or(plan_summary)
+            .or(task_summary)
+            .or_else(|| Some("New Session".to_string())),
+    }
+}
+
+fn summary_status(summary: &SessionSummary) -> ApiSessionStatus {
+    match summary
+        .status
+        .as_deref()
+        .or(summary.state.as_deref())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "active" | "busy" | "queued" | "running" | "starting" => ApiSessionStatus::Busy,
+        "error" | "failed" | "interrupted" => ApiSessionStatus::Error,
+        _ => ApiSessionStatus::Idle,
+    }
+}
+
+fn task_management_start_at(task_management: &serde_json::Value) -> Option<i64> {
+    task_management
+        .get("start_at")
+        .or_else(|| {
+            task_management
+                .get("tasks")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|tasks| tasks.first())
+                .and_then(|task| task.get("start_at"))
+        })
+        .and_then(|value| {
+            value.as_i64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                    .map(|datetime| datetime.timestamp_millis())
+            })
+        })
 }
 
 fn api_session_from_info(info: &SessionInfo, parent_id: Option<String>) -> ApiSession {
@@ -1522,6 +1864,7 @@ fn session_info_from_snapshot(snapshot: &SessionSnapshot) -> Result<SessionInfo,
         projection: snapshot.lifecycle_projection.clone(),
         context_tokens: snapshot.metadata.context_tokens,
         runtime_usage: snapshot.metadata.runtime_usage.clone(),
+        jspace_contract: snapshot.management.jspace_contract.clone(),
     })
 }
 

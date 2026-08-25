@@ -137,6 +137,25 @@ pub(crate) fn configure_runtime_env(config: &CliConfig) -> Result<(), String> {
             std::env::remove_var("TURA_COMMAND_RUN_SANDBOX")
         };
     }
+    if let Some(timeout_secs) = config.timeout_secs {
+        // This is an outer observation budget only. Router command_run keeps
+        // its own explicit per-command deadline and terminal receipt.
+        // SAFETY: CLI startup performs process-environment mutation before worker threads exist.
+        #[allow(
+            unsafe_code,
+            reason = "Rust 2024 process-environment mutation audited at CLI startup"
+        )]
+        unsafe {
+            std::env::set_var(
+                "TURA_EXEC_ROUTER_READ_TIMEOUT_SECS",
+                timeout_secs.to_string(),
+            );
+            std::env::set_var(
+                "TURA_EXEC_EMBEDDED_RUNTIME_TIMEOUT_SECS",
+                timeout_secs.to_string(),
+            );
+        }
+    }
     configure_release_runtime_env();
     configure_progress_env(config);
     Ok(())

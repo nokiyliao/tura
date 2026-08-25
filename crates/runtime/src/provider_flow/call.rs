@@ -10,6 +10,9 @@ use crate::provider_flow::checkpointing;
 use crate::provider_flow::errors::{
     finish_provider_call_failure, finish_runtime_failure, runtime_timeout,
 };
+use crate::provider_flow::official_codex::{
+    call_runtime_official_codex, OfficialCodexRuntimeInput,
+};
 use crate::provider_flow::provider_response::apply_provider_response;
 use crate::provider_flow::provider_streaming::{call_runtime_streaming, RuntimeStreamingInput};
 pub use crate::provider_flow::request_options::route_by_name;
@@ -34,6 +37,8 @@ pub struct CallRuntimeInput {
     pub tool_choice: Option<serde_json::Value>,
     pub session_directory: PathBuf,
     pub allowed_command_run_commands: Option<BTreeSet<String>>,
+    pub disable_permission_restrictions: bool,
+    pub jspace_contract: Option<serde_json::Value>,
     pub require_startup_task_state: bool,
 }
 
@@ -188,7 +193,25 @@ pub(crate) async fn call_runtime_with_writer(
         }),
     );
 
-    let call_result = if input.stream || !input_tools.is_empty() {
+    let official_provider = route_config
+        .official_codex_app_server_provider()
+        .map_err(|error| format!("official Codex admission rejected route: {error}"))?;
+    let call_result = if let Some(provider) = official_provider {
+        call_runtime_official_codex(
+            &mut runtime,
+            provider,
+            OfficialCodexRuntimeInput {
+                messages: provider_messages,
+                dynamic_tools: input_tools,
+                session_directory: input.session_directory.clone(),
+                allowed_command_run_commands: input.allowed_command_run_commands.clone(),
+                disable_permission_restrictions: input.disable_permission_restrictions,
+                jspace_contract: input.jspace_contract.clone(),
+            },
+            runtime_event_writer.as_deref_mut(),
+        )
+        .await
+    } else if input.stream || !input_tools.is_empty() {
         call_runtime_streaming(
             &mut runtime,
             route_config,
@@ -198,6 +221,7 @@ pub(crate) async fn call_runtime_with_writer(
                 options: call_options,
                 session_directory: input.session_directory.clone(),
                 allowed_command_run_commands: input.allowed_command_run_commands.clone(),
+                jspace_contract: input.jspace_contract.clone(),
                 require_startup_task_state: input.require_startup_task_state,
             },
             runtime_event_writer.as_deref_mut(),
@@ -443,6 +467,8 @@ mod tests {
                 tool_choice: None,
                 session_directory: std::env::temp_dir(),
                 allowed_command_run_commands: Some(BTreeSet::new()),
+                disable_permission_restrictions: false,
+                jspace_contract: None,
                 require_startup_task_state: false,
             },
             settings,

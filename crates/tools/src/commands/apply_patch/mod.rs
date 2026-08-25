@@ -51,7 +51,11 @@ impl ToolHandler for ApplyPatchHandler {
         ctx: ToolContext,
     ) -> Result<FunctionToolOutput, ToolError> {
         let patch_text = patch_text_from_payload(&call.payload);
-        let response = execute(&patch_text, &ctx.session_dir);
+        let response = shell_executor::run_in_process_command_with_terminal_receipt(
+            &ctx,
+            "in_process_apply_patch",
+            || execute(&patch_text, &ctx.session_dir),
+        );
         let success = response.success;
         Ok(FunctionToolOutput::from_value(
             shell_executor::json_like_output(
@@ -290,6 +294,21 @@ pub(crate) fn validate_paths_within_session_dir(
         }
     }
     Ok(())
+}
+
+/// Return the parsed patch paths for Router-owned J-Space admission.
+///
+/// The normal apply-patch parser remains the source of truth; this helper only
+/// exposes its already-parsed path and operation classification to the local
+/// contract matcher before mutation begins.
+pub fn jspace_changes(patch_text: &str) -> Result<Vec<(String, String, Option<String>)>, String> {
+    let normalized = normalize_apply_patch_text(patch_text);
+    parse_patch(&normalized).map(|changes| {
+        changes
+            .into_iter()
+            .map(|change| (change.kind, change.path, change.move_path))
+            .collect()
+    })
 }
 
 fn validate_patch_path_within_session_dir(session_dir: &Path, raw: &str) -> Result<(), String> {

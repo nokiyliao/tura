@@ -70,6 +70,69 @@ pub(crate) fn finish_provider_call_failure(
     )
 }
 
+pub(crate) fn finish_provider_call_failure_after_command_effect(
+    runtime: &mut RuntimeAggregate,
+    finished_at: DateTime<Utc>,
+    error: &tura_llm_rust::TuraError,
+    terminal_state: RuntimeState,
+) -> Result<(), String> {
+    finish_runtime_failure_with_policy(
+        runtime,
+        finished_at,
+        "CALL_FAILED_AFTER_COMMAND_EFFECT",
+        error.to_string(),
+        terminal_state,
+        RuntimeFailurePolicy {
+            usage: None,
+            retry_allowed: false,
+            fallback_allowed: false,
+        },
+    )
+}
+
+pub(crate) fn finish_runtime_failure_after_command_effect(
+    runtime: &mut RuntimeAggregate,
+    finished_at: DateTime<Utc>,
+    error_code: &str,
+    error_text: String,
+    terminal_state: RuntimeState,
+) -> Result<(), String> {
+    finish_runtime_failure_with_policy(
+        runtime,
+        finished_at,
+        error_code,
+        error_text,
+        terminal_state,
+        RuntimeFailurePolicy {
+            usage: None,
+            retry_allowed: false,
+            fallback_allowed: false,
+        },
+    )
+}
+
+pub(crate) fn finish_runtime_failure_with_retry_policy(
+    runtime: &mut RuntimeAggregate,
+    finished_at: DateTime<Utc>,
+    error_code: &str,
+    error_text: String,
+    terminal_state: RuntimeState,
+    retry_allowed: bool,
+) -> Result<(), String> {
+    finish_runtime_failure_with_policy(
+        runtime,
+        finished_at,
+        error_code,
+        error_text,
+        terminal_state,
+        RuntimeFailurePolicy {
+            usage: None,
+            retry_allowed,
+            fallback_allowed: false,
+        },
+    )
+}
+
 struct RuntimeFailurePolicy {
     usage: Option<UsageReport>,
     retry_allowed: bool,
@@ -129,6 +192,14 @@ pub(crate) fn runtime_failure_allows_retry(runtime: &RuntimeAggregate) -> bool {
             .as_ref()
             .map(|error| error.retry_allowed)
             .unwrap_or(false)
+}
+
+pub(crate) fn runtime_failure_requires_exact_input(runtime: &RuntimeAggregate) -> bool {
+    runtime
+        .error
+        .as_ref()
+        .and_then(|error| error.error_code.as_deref())
+        == Some("OFFICIAL_CODEX_APP_SERVER_FAILED")
 }
 
 pub(crate) fn runtime_failure_text(runtime: &RuntimeAggregate) -> Option<String> {
@@ -298,6 +369,45 @@ mod tests {
             super::runtime_failure_text(&runtime).as_deref(),
             Some("provider rejected invalid request")
         );
+    }
+
+    #[test]
+    fn command_effect_failure_is_not_retryable() {
+        let mut runtime = runtime_for_retry_test("command-effect-runtime");
+        super::finish_runtime_failure_after_command_effect(
+            &mut runtime,
+            Utc::now(),
+            "CALL_TIMED_OUT_AFTER_COMMAND_EFFECT",
+            "command receipt is uncertain".to_string(),
+            RuntimeState::TimedOut,
+        )
+        .expect("command-effect failure should be recorded");
+
+        let error = runtime.error.expect("runtime error");
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("CALL_TIMED_OUT_AFTER_COMMAND_EFFECT")
+        );
+        assert!(!error.retry_allowed);
+        assert!(!error.fallback_allowed);
+    }
+
+    #[test]
+    fn official_codex_transport_retry_preserves_exact_input_policy() {
+        let mut runtime = runtime_for_retry_test("official-codex-transport-runtime");
+        super::finish_runtime_failure_with_retry_policy(
+            &mut runtime,
+            Utc::now(),
+            "OFFICIAL_CODEX_APP_SERVER_FAILED",
+            "official Codex App Server closed stdout before turn completion".to_string(),
+            RuntimeState::Failed,
+            true,
+        )
+        .expect("official Codex transport failure should be recorded");
+
+        assert!(super::runtime_failure_allows_retry(&runtime));
+        assert!(super::runtime_failure_requires_exact_input(&runtime));
+        assert!(!runtime.error.as_ref().unwrap().fallback_allowed);
     }
 
     fn runtime_for_retry_test(runtime_id: &str) -> RuntimeAggregate {

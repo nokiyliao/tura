@@ -136,6 +136,7 @@ pub(crate) struct MockProvider {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MockMode {
     CommandRun,
+    CodexApplyPatchOnly,
     CodexStreamingProbe,
     CodexStreamingSingleTaskStatusMissingFinalToolCall,
     RateLimit,
@@ -148,6 +149,10 @@ pub(crate) enum MockMode {
 impl MockProvider {
     pub(crate) fn start_command_run() -> Self {
         Self::start_with_mode(MockMode::CommandRun, None)
+    }
+
+    pub(crate) fn start_codex_apply_patch_only() -> Self {
+        Self::start_with_mode(MockMode::CodexApplyPatchOnly, None)
     }
 
     pub(crate) fn start_codex_streaming_probe(workspace: PathBuf) -> Self {
@@ -250,6 +255,13 @@ pub(crate) fn handle_provider_connection(
         MockMode::CommandRun => {
             write_command_run_responses(stream, &response);
         }
+        MockMode::CodexApplyPatchOnly => {
+            if index == 0 {
+                write_codex_streaming_apply_patch_missing_final_tool_call(stream);
+            } else {
+                write_codex_final_response(stream, "Apply-only repair completed.");
+            }
+        }
         MockMode::CodexStreamingProbe => {
             if index == 0 {
                 write_codex_streaming_probe_response(
@@ -289,6 +301,7 @@ pub(crate) fn handle_provider_connection(
 pub(crate) fn provider_response(index: usize, mode: MockMode) -> Value {
     match mode {
         MockMode::CommandRun => command_run_provider_response(index),
+        MockMode::CodexApplyPatchOnly => assistant_response("Apply-only repair completed."),
         MockMode::CodexStreamingProbe => assistant_response("streaming probe completed."),
         MockMode::CodexStreamingSingleTaskStatusMissingFinalToolCall => {
             assistant_response("streamed task_status fallback completed.")
@@ -511,6 +524,61 @@ pub(crate) fn write_codex_streaming_single_task_status_missing_final_tool_call(
             "type": "response.completed",
             "response": {
                 "id": "resp_stream_task_status_only",
+                "output": [],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2
+                }
+            }
+        }),
+    );
+    write_codex_sse_raw(stream, "data: [DONE]\n\n");
+    let _ = write!(stream, "0\r\n\r\n");
+    let _ = stream.flush();
+}
+
+pub(crate) fn write_codex_streaming_apply_patch_missing_final_tool_call(stream: &mut TcpStream) {
+    let _ = write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    );
+    write_codex_sse(
+        stream,
+        json!({
+            "type": "response.output_item.added",
+            "item": {
+                "id": "fc_stream_apply_patch_only",
+                "type": "function_call",
+                "call_id": "call_stream_apply_patch_only",
+                "name": "command_run",
+                "arguments": ""
+            }
+        }),
+    );
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: apply-only-created.txt\n+created by apply-only agent\n*** End Pat{}",
+        "ch"
+    );
+    let command = json!({
+        "step": 1,
+        "command_type": "apply_patch",
+        "command_line": patch
+    });
+    write_codex_sse(
+        stream,
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_stream_apply_patch_only",
+            "delta": format!("{{\"commands\":[{command}")
+        }),
+    );
+    write_codex_sse(
+        stream,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_stream_apply_patch_only",
                 "output": [],
                 "usage": {
                     "input_tokens": 1,

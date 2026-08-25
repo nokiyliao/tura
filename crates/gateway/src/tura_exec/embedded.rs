@@ -13,7 +13,6 @@ use super::cli::CliConfig;
 use super::output::{write_jsonl, write_last_message, write_turn_log_stderr};
 use super::router::worker_env_from_current_process;
 
-const RUNTIME_TIMEOUT: Duration = Duration::from_secs(900);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) fn run_via_runtime_worker(
@@ -93,10 +92,11 @@ pub(crate) fn run_via_runtime_worker(
     let stdout_reader = std::thread::spawn(move || read_pipe(stdout));
     let stderr_reader = std::thread::spawn(move || read_pipe(stderr));
     let started = Instant::now();
+    let runtime_timeout = embedded_runtime_timeout();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < RUNTIME_TIMEOUT => {
+            Ok(None) if started.elapsed() < runtime_timeout => {
                 std::thread::sleep(RUNTIME_POLL_INTERVAL);
             }
             Ok(None) => {
@@ -106,7 +106,7 @@ pub(crate) fn run_via_runtime_worker(
                 let stderr = join_pipe(stderr_reader, "stderr")?;
                 return Err(format!(
                     "runtime worker timed out after {} seconds{}",
-                    RUNTIME_TIMEOUT.as_secs(),
+                    runtime_timeout.as_secs(),
                     stderr_suffix(&stderr)
                 ));
             }
@@ -134,6 +134,21 @@ pub(crate) fn run_via_runtime_worker(
             .unwrap_or_else(|| "runtime worker failed without an error message".to_string()));
     }
     render_response(config, session_id, response)
+}
+
+fn embedded_runtime_timeout() -> Duration {
+    embedded_runtime_timeout_from(
+        std::env::var("TURA_EXEC_EMBEDDED_RUNTIME_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn embedded_runtime_timeout_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(14_700))
 }
 
 fn register_and_activate_runtime(
@@ -238,6 +253,24 @@ fn resolve_runtime_binary() -> Option<PathBuf> {
     candidates.push(root.join("target").join("debug").join(file_name));
     candidates.push(root.join("target").join("release").join(file_name));
     candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embedded_runtime_timeout_from;
+
+    #[test]
+    fn embedded_runtime_budget_supports_bounded_four_hour_commands() {
+        assert_eq!(embedded_runtime_timeout_from(None).as_secs(), 14_700);
+        assert_eq!(
+            embedded_runtime_timeout_from(Some("14400")).as_secs(),
+            14_400
+        );
+        assert_eq!(
+            embedded_runtime_timeout_from(Some("invalid")).as_secs(),
+            14_700
+        );
+    }
 }
 
 fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {

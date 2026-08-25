@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub healthy: bool,
+    /// True only after startup Session feed projection replay has completed.
+    #[serde(default = "default_ready")]
+    pub ready: bool,
+    /// `ready` while the projection can be served, `starting` during replay, or
+    /// `failed` if startup reconstruction did not complete.
+    #[serde(default = "default_status")]
+    pub status: String,
+    /// Reconstruction failure when `status` is `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub version: String,
     /// Canonical runtime/project root this gateway is serving (TURA_PROJECT_ROOT).
     /// Lets clients tell whether a reachable gateway belongs to their own package.
@@ -26,10 +36,21 @@ pub struct HealthResponse {
     pub dev_log_path: Option<String>,
 }
 
+fn default_ready() -> bool {
+    true
+}
+
+fn default_status() -> String {
+    "ready".to_string()
+}
+
 impl Default for HealthResponse {
     fn default() -> Self {
         Self {
             healthy: true,
+            ready: true,
+            status: default_status(),
+            error: None,
             version: env!("CARGO_PKG_VERSION").to_string(),
             root: String::new(),
             home: String::new(),

@@ -510,13 +510,13 @@ fn load_runtime_events(conn: &rusqlite::Connection, runtime_id: &str) -> Result<
     Ok(events)
 }
 
-struct SessionProjectionRow {
+pub(super) struct SessionProjectionRow {
     management: SessionManagement,
     metadata: SessionMetadata,
     updated_at: i64,
 }
 
-fn load_session_projection_row(
+pub(super) fn load_session_projection_row(
     tx: &Transaction<'_>,
     session_id: &str,
 ) -> Result<Option<SessionProjectionRow>> {
@@ -543,7 +543,7 @@ fn load_session_projection_row(
     .transpose()
 }
 
-fn persist_session_projection(
+pub(super) fn persist_session_projection(
     tx: &Transaction<'_>,
     session_id: &str,
     aggregate: &SessionAggregate,

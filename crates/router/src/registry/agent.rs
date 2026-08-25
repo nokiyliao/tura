@@ -5,9 +5,12 @@
 //! The router does not own prompt assembly, provider formatting, or agent loops.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tura_agents::store::{discover_agents, project_root_from_env_or_cwd};
+
+const RELEASE_ROOT_ENV: &str = "TURA_RELEASE_BIN_DIR";
 
 /// Resolved agent spec delivered from the router to a runtime worker.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,27 +119,17 @@ impl AgentRegistry {
                 session_type_index.insert((*session_type).to_string(), index);
             }
         }
-        for agent in discover_agents(&project_root_from_env_or_cwd()) {
-            let spec = AgentSpec {
-                agent_name: agent.summary.id.clone(),
-                provider: agent
-                    .summary
-                    .provider
-                    .unwrap_or_else(|| "default".to_string()),
-                capabilities: agent.summary.capabilities,
-                session_types: vec![agent.summary.id.clone()],
-                validator_enabled: agent
-                    .config
-                    .validator
-                    .get("need_validator")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-                default_config: agent.config.default_config,
-                config: Some(agent.config),
-            };
-            dynamic_specs.insert(agent.summary.id.to_ascii_lowercase(), spec.clone());
-            for alias in agent.summary.aliases {
-                dynamic_specs.insert(alias.to_ascii_lowercase(), spec.clone());
+        for root in agent_lookup_roots() {
+            for agent in discover_agents(&root) {
+                let id = agent.summary.id.to_ascii_lowercase();
+                let aliases = agent.summary.aliases.clone();
+                let spec = spec_from_stored_agent(agent);
+                dynamic_specs.entry(id).or_insert_with(|| spec.clone());
+                for alias in aliases {
+                    dynamic_specs
+                        .entry(alias.to_ascii_lowercase())
+                        .or_insert_with(|| spec.clone());
+                }
             }
         }
         Self {
@@ -148,13 +141,30 @@ impl AgentRegistry {
 
     /// Resolve by explicit agent name.
     pub fn resolve_by_name(&self, name: &str) -> Option<AgentSpec> {
+        self.resolve_by_name_from_roots(name, &agent_lookup_roots())
+    }
+
+    #[cfg(test)]
+    fn resolve_by_name_from_root(&self, name: &str, project_root: &Path) -> Option<AgentSpec> {
+        self.resolve_by_name_from_roots(name, &[project_root.to_path_buf()])
+    }
+
+    fn resolve_by_name_from_roots(&self, name: &str, roots: &[PathBuf]) -> Option<AgentSpec> {
         let key = name.trim().to_ascii_lowercase();
         if let Some(spec) = self.dynamic_specs.get(&key) {
             return Some(spec.clone());
         }
-        self.name_index
+        if let Some(spec) = self
+            .name_index
             .get(&key)
             .map(|index| spec_from(&AGENT_TABLE[*index]))
+        {
+            return Some(spec);
+        }
+
+        roots
+            .iter()
+            .find_map(|root| tura_agents::store::load_agent(root, &key).map(spec_from_stored_agent))
     }
 
     /// Resolve by session type or topic when no explicit agent is selected.
@@ -224,6 +234,27 @@ impl AgentRegistry {
     }
 }
 
+fn agent_lookup_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    push_unique_root(&mut roots, project_root_from_env_or_cwd());
+    if let Some(root) = std::env::var_os(RELEASE_ROOT_ENV).map(PathBuf::from) {
+        push_unique_root(&mut roots, root);
+    }
+    if let Some(root) = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    {
+        push_unique_root(&mut roots, root);
+    }
+    roots
+}
+
+fn push_unique_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
+    if !roots.contains(&root) {
+        roots.push(root);
+    }
+}
+
 impl Default for AgentRegistry {
     fn default() -> Self {
         Self::from_static()
@@ -239,6 +270,26 @@ fn spec_from(def: &AgentDefinition) -> AgentSpec {
         validator_enabled: def.validator_enabled,
         default_config: true,
         config: None,
+    }
+}
+
+fn spec_from_stored_agent(agent: tura_agents::store::StoredAgent) -> AgentSpec {
+    AgentSpec {
+        agent_name: agent.summary.id.clone(),
+        provider: agent
+            .summary
+            .provider
+            .unwrap_or_else(|| "default".to_string()),
+        capabilities: agent.summary.capabilities,
+        session_types: vec![agent.summary.id],
+        validator_enabled: agent
+            .config
+            .validator
+            .get("need_validator")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        default_config: agent.config.default_config,
+        config: Some(agent.config),
     }
 }
 
@@ -319,5 +370,89 @@ mod tests {
         assert!(
             spec.session_types.contains(&"coding".to_string()) || spec.agent_name == "thoughtful"
         );
+    }
+
+    #[test]
+    fn resolves_dynamic_agent_created_after_registry_startup() {
+        let project = tempfile::tempdir().expect("project");
+        let registry = AgentRegistry::from_static();
+        let config = tura_agents::store::AgentConfig {
+            agent_name: "fresh-executor".to_string(),
+            description: Some("fresh executor".to_string()),
+            aliases: vec![],
+            icon_emoji: None,
+            agent_directory: "agents/src/fresh-executor".into(),
+            parent_agent_id: None,
+            report_to_user: true,
+            default_config: false,
+            reflection: false,
+            op_manual: false,
+            self_reflection: false,
+            provider: serde_json::json!({
+                "tura_llm_name": "thinking",
+                "tool_choice": "Auto"
+            }),
+            agent_prompt: vec![],
+            agent_capabilities: vec![serde_json::json!({
+                "capability_name": "apply_patch"
+            })],
+            validator: serde_json::json!({
+                "need_validator": false,
+                "validator_name": null
+            }),
+        };
+        tura_agents::store::save_dynamic_agent(project.path(), &config, Some("prompt"))
+            .expect("save dynamic agent");
+
+        let spec = registry
+            .resolve_by_name_from_root("fresh-executor", project.path())
+            .expect("fresh dynamic agent should resolve without router restart");
+
+        assert_eq!(spec.agent_name, "fresh-executor");
+        assert_eq!(spec.capabilities, vec!["apply_patch"]);
+        assert!(spec.config.is_some());
+    }
+
+    #[test]
+    fn resolves_packaged_agent_after_empty_workspace_root() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let release = tempfile::tempdir().expect("release");
+        let registry = AgentRegistry::from_static();
+        let config = tura_agents::store::AgentConfig {
+            agent_name: "packaged-executor".to_string(),
+            description: Some("packaged executor".to_string()),
+            aliases: vec!["packaged-alias".to_string()],
+            icon_emoji: None,
+            agent_directory: "agents/src/packaged-executor".into(),
+            parent_agent_id: None,
+            report_to_user: true,
+            default_config: true,
+            reflection: false,
+            op_manual: false,
+            self_reflection: false,
+            provider: serde_json::json!({
+                "tura_llm_name": "thinking",
+                "tool_choice": "Auto"
+            }),
+            agent_prompt: vec![],
+            agent_capabilities: vec![serde_json::json!({
+                "capability_name": "shells"
+            })],
+            validator: serde_json::json!({
+                "need_validator": false,
+                "validator_name": null
+            }),
+        };
+        tura_agents::store::save_dynamic_agent(release.path(), &config, Some("prompt"))
+            .expect("save packaged agent");
+
+        let roots = vec![workspace.path().to_path_buf(), release.path().to_path_buf()];
+        let spec = registry
+            .resolve_by_name_from_roots("packaged-alias", &roots)
+            .expect("release registry should be used after an empty workspace registry");
+
+        assert_eq!(spec.agent_name, "packaged-executor");
+        assert_eq!(spec.capabilities, vec!["shells"]);
+        assert!(spec.config.is_some());
     }
 }

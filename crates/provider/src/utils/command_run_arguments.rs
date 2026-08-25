@@ -13,6 +13,9 @@ fn normalize_command_run_input(input: Value) -> Value {
     let mut object = match input {
         Value::Object(object) => object,
         Value::String(text) => {
+            if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&text) {
+                return normalize_command_run_input(Value::Object(object));
+            }
             return json!({ "commands": command_run_commands_from_text(&text) });
         }
         other => return json!({ "commands": [other] }),
@@ -102,7 +105,15 @@ fn inherit_command_fields(command: &mut Value, parent: &Map<String, Value>) {
     let Some(command_object) = command.as_object_mut() else {
         return;
     };
-    for key in ["command_type", "command", "step"] {
+    for key in [
+        "command_type",
+        "command",
+        "step",
+        "timeout_ms",
+        "timeoutMs",
+        "stall_timeout_ms",
+        "stallTimeoutMs",
+    ] {
         if let Some(value) = parent.get(key).cloned() {
             command_object.entry(key.to_string()).or_insert(value);
         }
@@ -196,6 +207,9 @@ fn normalize_command_value(value: Value) -> Value {
                 }
                 continue;
             }
+            if key == "command_line" && explicit_shell_command_has_json_line(&object, &text) {
+                continue;
+            }
             if let Some(Value::Object(fragment)) = command_json_fragment(&text) {
                 object.remove(key);
                 for (fragment_key, fragment_value) in fragment {
@@ -216,6 +230,25 @@ fn normalize_command_value(value: Value) -> Value {
             .or_insert(Value::String(command));
     }
     Value::Object(object)
+}
+
+fn explicit_shell_command_has_json_line(object: &Map<String, Value>, command_line: &str) -> bool {
+    let Some(command_type) = object
+        .get("command_type")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+    else {
+        return false;
+    };
+    if !matches!(
+        command_type.as_str(),
+        "shell_command" | "shell" | "shells" | "shll" | "shall" | "bash" | "zsh"
+    ) {
+        return false;
+    }
+    serde_json::from_str::<Value>(command_line.trim())
+        .ok()
+        .is_some_and(|value| value.is_object())
 }
 
 fn command_json_fragment(text: &str) -> Option<Value> {
@@ -277,6 +310,26 @@ mod tests {
     }
 
     #[test]
+    fn explicit_shell_command_keeps_valid_json_command_line_payload() {
+        let input = json!({
+            "commands": [{
+                "command_type": "shell_command",
+                "command_line": "{\"command\":\"printf ready\",\"timeout_ms\":3000}"
+            }]
+        });
+
+        let normalized = normalize_command_run_tool_input("command_run", input);
+        let command = &normalized["commands"][0];
+
+        assert_eq!(command["command_type"], "shell_command");
+        assert_eq!(
+            command["command_line"],
+            "{\"command\":\"printf ready\",\"timeout_ms\":3000}"
+        );
+        assert_eq!(command["command"], "shell_command");
+    }
+
+    #[test]
     fn command_run_input_prefers_top_level_command_over_partial_commands_xml() {
         let input = json!({
             "command_type": "shell_command",
@@ -313,5 +366,25 @@ mod tests {
             .as_str()
             .expect("command line")
             .starts_with("*** Begin Patch"));
+    }
+
+    #[test]
+    fn command_run_input_inherits_wall_and_stall_budgets_independently() {
+        let normalized = normalize_command_run_tool_input(
+            "command_run",
+            json!({
+                "timeout_ms": 120_000,
+                "stall_timeout_ms": 10_000,
+                "commands": [
+                    {"command_type": "bash", "command_line": "builder"},
+                    {"command_type": "bash", "command_line": "pytest", "stall_timeout_ms": 20_000}
+                ]
+            }),
+        );
+
+        assert_eq!(normalized["commands"][0]["timeout_ms"], 120_000);
+        assert_eq!(normalized["commands"][0]["stall_timeout_ms"], 10_000);
+        assert_eq!(normalized["commands"][1]["timeout_ms"], 120_000);
+        assert_eq!(normalized["commands"][1]["stall_timeout_ms"], 20_000);
     }
 }

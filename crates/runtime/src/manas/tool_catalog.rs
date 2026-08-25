@@ -7,6 +7,7 @@ use lifecycle::SessionManagement;
 
 use super::constants::{
     COMMAND_RUN_TOOL, DISABLE_EXECUTE_TOOLS_TOOL_ENV, DISABLE_PLANNING_TOOL_ENV, PROJECT_ROOT_ENV,
+    RELEASE_ROOT_ENV, TASK_STATUS_COMMAND,
 };
 
 pub(super) fn load_agent_capabilities_with_commands(
@@ -14,7 +15,18 @@ pub(super) fn load_agent_capabilities_with_commands(
     session: &SessionManagement,
     allowed_commands: &BTreeSet<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    load_agent_capabilities_for_task_state(agent, allowed_commands, session.task_type.is_empty())
+    load_agent_capabilities_for_task_state(
+        agent,
+        allowed_commands,
+        startup_task_state_required(session, allowed_commands),
+    )
+}
+
+pub(crate) fn startup_task_state_required(
+    session: &SessionManagement,
+    allowed_commands: &BTreeSet<String>,
+) -> bool {
+    session.task_type.is_empty() && allowed_commands.contains(TASK_STATUS_COMMAND)
 }
 
 fn load_agent_capabilities_for_task_state(
@@ -102,6 +114,34 @@ pub(crate) fn project_directory_with_tools() -> Result<PathBuf, String> {
         }
     }
 
+    if let Ok(root) = std::env::var(RELEASE_ROOT_ENV) {
+        let root = PathBuf::from(root);
+        if root
+            .join("crates")
+            .join("tools")
+            .join("src")
+            .join("command_run")
+            .join("schema.json")
+            .exists()
+        {
+            return Ok(root);
+        }
+    }
+
+    if let Some(root) = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        && root
+            .join("crates")
+            .join("tools")
+            .join("src")
+            .join("command_run")
+            .join("schema.json")
+            .exists()
+    {
+        return Ok(root);
+    }
+
     let current = std::env::current_dir()
         .map_err(|err| format!("failed to resolve project directory: {err}"))?;
     for candidate in current.ancestors() {
@@ -125,22 +165,45 @@ fn command_run_capability_directory(agent: &AgentManagement) -> Result<Option<Pa
         return Ok(None);
     }
 
+    let fallback_directory = project_directory_with_tools()?
+        .join("crates")
+        .join("tools")
+        .join("src");
+    Ok(command_run_capability_directory_with_fallback(
+        agent,
+        fallback_directory,
+    ))
+}
+
+fn command_run_capability_directory_with_fallback(
+    agent: &AgentManagement,
+    fallback_directory: PathBuf,
+) -> Option<PathBuf> {
+    let has_command_run_schema = |directory: &PathBuf| {
+        directory
+            .join(COMMAND_RUN_TOOL)
+            .join("schema.json")
+            .is_file()
+    };
+
     if let Some(capability) = agent
         .agent_capabilities
         .iter()
         .find(|capability| capability.capability_name == COMMAND_RUN_TOOL)
+        .filter(|capability| has_command_run_schema(&capability.capability_directory))
     {
-        return Ok(Some(capability.capability_directory.clone()));
+        return Some(capability.capability_directory.clone());
     }
 
-    if let Some(capability) = agent.agent_capabilities.first() {
-        return Ok(Some(capability.capability_directory.clone()));
+    if let Some(capability) = agent
+        .agent_capabilities
+        .first()
+        .filter(|capability| has_command_run_schema(&capability.capability_directory))
+    {
+        return Some(capability.capability_directory.clone());
     }
 
-    let project_directory = project_directory_with_tools()?;
-    Ok(Some(
-        project_directory.join("crates").join("tools").join("src"),
-    ))
+    Some(fallback_directory)
 }
 
 #[cfg(test)]
@@ -531,7 +594,7 @@ fn command_run_usage_patterns_for(
     }
     patterns.extend([
         "- Example frontend batch: step 1 write or reuse the focused frontend test script, step 2 run that script and inspect generated textual outputs.",
-        "- Example long-running database check: step 1 run `sleep 60` with `timeout_ms` comfortably above 60000, step 2 run the known database probe script, step 3 read the script output log such as `logs/db-check.log` and summarize the findings.",
+        "- Example long-running database check: step 1 run the finite workload in the foreground with `timeout_ms` comfortably above 60000 and optional `stall_timeout_ms` only when the workload emits progress, step 2 run the known database probe script, step 3 read the script output log such as `logs/db-check.log` and summarize the findings.",
     ]);
     if allowed_commands.contains("task_status") {
         patterns.push("- Context compaction: after a meaningful phase completes, or when context is near the active context limit and feels crowded, put the handoff summary in `task_status.compact_context` after the work it summarizes.");
@@ -554,16 +617,16 @@ fn current_apply_patch_command_format() -> String {
 
 fn current_shell_command_format(shell_prompt: &str) -> String {
     let guidance = format!(
-        "Use for tests, builds, scripts, package tools, and host-shell behavior. Default timeout is 15 seconds; set timeout_ms explicitly for legitimate long-running one-shot commands. Put verification after edits in a later step only when that verification command is already known. Delete commands are allowed only when every delete target is a literal path inside the workspace; variable targets such as `$file.FullName` may be blocked. {} {}",
+        "Use for tests, builds, scripts, package tools, and host-shell behavior. Default timeout is 5 minutes; finite long-running commands may set timeout_ms up to 4 hours. stall_timeout_ms is an independent no-output progress watchdog and must be used only when the workload emits progress. Put verification after edits in a later step only when that verification command is already known. Delete commands are allowed only when every delete target is a literal path inside the workspace; variable targets such as `$file.FullName` may be blocked. {} {}",
         compact_prompt(shell_prompt),
         long_running_service_guidance(),
     );
-    let schema = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell script to execute in the user's default shell\"},\"workdir\":{\"type\":\"string\",\"description\":\"The working directory to execute the command in\"},\"timeout_ms\":{\"type\":\"number\",\"description\":\"The timeout for the command in milliseconds\"}},\"required\":[\"command\"],\"additionalProperties\":false}";
+    let schema = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell script to execute in the user's default shell\"},\"workdir\":{\"type\":\"string\",\"description\":\"The working directory to execute the command in\"},\"timeout_ms\":{\"type\":\"number\",\"description\":\"The wall-clock budget for the command in milliseconds\"},\"stall_timeout_ms\":{\"type\":[\"number\",\"null\"],\"minimum\":1000,\"description\":\"Optional no-output progress watchdog in milliseconds\"}},\"required\":[\"command\"],\"additionalProperties\":false}";
     format!("{guidance} JSON object string matching this schema: {schema}")
 }
 
 fn long_running_service_guidance() -> &'static str {
-    "Persistent services must never be used as blocking foreground commands. If a command can keep running after readiness, it must be backgrounded or wrapped in a persisted startup script with bounded readiness checks and cleanup; otherwise the command is considered hung and incorrect."
+    "Finite builders, tests, rehashes, and backtests must stay attached to command_run until a terminal receipt exists. Persistent services are different: use an existing managed lifecycle surface with bounded readiness checks and cleanup, never an untracked background process as a timeout workaround."
 }
 
 fn compact_prompt(text: &str) -> String {
@@ -656,6 +719,26 @@ mod tests {
         agent
     }
 
+    #[test]
+    fn missing_workspace_tool_schema_falls_back_to_tura_tool_root() {
+        let stale_workspace = tempfile::tempdir().expect("stale workspace");
+        let tura_root = tempfile::tempdir().expect("Tura root");
+        let fallback_directory = tura_root.path().join("crates/tools/src");
+        std::fs::create_dir_all(fallback_directory.join("command_run"))
+            .expect("create fallback command_run directory");
+        std::fs::write(fallback_directory.join("command_run/schema.json"), "{}")
+            .expect("write fallback command_run schema");
+
+        let mut agent = command_run_agent_with_capabilities(&["shells"]);
+        agent.agent_capabilities[0].capability_directory =
+            stale_workspace.path().join("crates/tools/src");
+
+        assert_eq!(
+            command_run_capability_directory_with_fallback(&agent, fallback_directory.clone()),
+            Some(fallback_directory)
+        );
+    }
+
     fn command_run_interface() -> serde_json::Value {
         serde_json::json!({
             "name": COMMAND_RUN_TOOL,
@@ -722,6 +805,90 @@ mod tests {
                 .iter()
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    fn command_batch_cardinality_is_valid(
+        commands_schema: &serde_json::Value,
+        command_count: usize,
+    ) -> bool {
+        let minimum = commands_schema["minItems"]
+            .as_u64()
+            .expect("commands minItems should be an unsigned integer")
+            as usize;
+        let maximum = commands_schema["maxItems"]
+            .as_u64()
+            .expect("commands maxItems should be an unsigned integer")
+            as usize;
+        command_count >= minimum && command_count <= maximum
+    }
+
+    #[test]
+    fn apply_patch_only_provider_schema_accepts_bounded_command_batches() {
+        let interface = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tools/src/command_run/schema.json"
+        ))
+        .expect("command_run schema should parse");
+        let allowed_commands = BTreeSet::from(["apply_patch".to_string()]);
+        let schema = tool_interface_to_provider_schema_with_commands(
+            interface,
+            Some(&allowed_commands),
+            false,
+        );
+        let commands_schema = &schema["function"]["parameters"]["properties"]["commands"];
+        let description = commands_schema["description"]
+            .as_str()
+            .expect("commands description should be a string");
+
+        assert_eq!(commands_schema["minItems"], 1);
+        assert_eq!(commands_schema["maxItems"], 20);
+        assert_command_type_enum(&schema, &["apply_patch"]);
+        assert!(description.contains("prefer 5 or more commands"));
+        assert!(description.contains("1-2 commands are acceptable"));
+        assert_eq!(
+            commands_schema["items"]["required"],
+            serde_json::json!(["command_type", "command_line"])
+        );
+        assert!(command_batch_cardinality_is_valid(commands_schema, 1));
+        assert!(!command_batch_cardinality_is_valid(commands_schema, 0));
+        assert!(command_batch_cardinality_is_valid(commands_schema, 5));
+        assert!(!command_batch_cardinality_is_valid(commands_schema, 21));
+    }
+
+    #[test]
+    fn command_run_provider_schema_exposes_top_level_and_per_command_timeout_ms() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let interface = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tools/src/command_run/schema.json"
+        ))
+        .expect("command_run schema should parse");
+        let allowed_commands = BTreeSet::from([active_shell_command_name().to_string()]);
+        let schema = tool_interface_to_provider_schema_with_commands(
+            interface,
+            Some(&allowed_commands),
+            false,
+        );
+        let parameters = &schema["function"]["parameters"];
+
+        assert_eq!(
+            parameters["properties"]["timeout_ms"]["type"],
+            serde_json::json!(["number", "null"]),
+            "top-level timeout_ms must be accepted by the provider schema: {schema}"
+        );
+        assert_eq!(
+            parameters["properties"]["commands"]["items"]["properties"]["timeout_ms"]["type"],
+            serde_json::json!(["number", "null"]),
+            "per-command timeout_ms must be accepted by the provider schema: {schema}"
+        );
+        assert_eq!(
+            parameters["properties"]["stall_timeout_ms"]["type"],
+            serde_json::json!(["number", "null"]),
+            "top-level stall_timeout_ms must be accepted by the provider schema: {schema}"
+        );
+        assert_eq!(
+            parameters["properties"]["commands"]["items"]["properties"]["stall_timeout_ms"]["type"],
+            serde_json::json!(["number", "null"]),
+            "per-command stall_timeout_ms must be accepted by the provider schema: {schema}"
         );
     }
 
@@ -859,6 +1026,22 @@ mod tests {
         assert!(commands.contains("task_status"));
         assert!(commands.contains(active_shell_command_name()));
         assert!(!commands.contains("shells"));
+    }
+
+    #[test]
+    fn startup_task_state_is_required_only_when_agent_can_set_it() {
+        let empty_session = session_with_task_type(Vec::new());
+        let restricted = command_run_agent_with_capabilities(&["apply_patch"]);
+        let capable = command_run_agent_with_capabilities(&["apply_patch", "task_status"]);
+
+        assert!(!startup_task_state_required(
+            &empty_session,
+            &command_run_commands_for_agent(&restricted)
+        ));
+        assert!(startup_task_state_required(
+            &empty_session,
+            &command_run_commands_for_agent(&capable)
+        ));
     }
 
     #[test]
@@ -1163,10 +1346,13 @@ max_timeout_ms = 2000
             .expect("commands item required should be an array");
 
         assert_eq!(schema["function"]["strict"], true);
-        assert_eq!(parameters["required"], serde_json::json!(["commands"]));
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["commands", "timeout_ms"])
+        );
         assert_eq!(
             parameters["properties"]["commands"]["items"]["required"],
-            serde_json::json!(["command_type", "command_line", "id", "step"])
+            serde_json::json!(["command_type", "command_line", "id", "step", "timeout_ms"])
         );
         assert!(parameters["properties"].get("sandbox").is_none());
         assert!(parameters["properties"].get("task_status").is_none());
@@ -1176,6 +1362,14 @@ max_timeout_ms = 2000
         assert_eq!(
             parameters["properties"]["commands"]["items"]["properties"]["id"]["type"],
             serde_json::json!(["string", "null"])
+        );
+        assert_eq!(
+            parameters["properties"]["timeout_ms"]["type"],
+            serde_json::json!(["number", "null"])
+        );
+        assert_eq!(
+            parameters["properties"]["commands"]["items"]["properties"]["timeout_ms"]["type"],
+            serde_json::json!(["number", "null"])
         );
         // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
         #[allow(

@@ -134,6 +134,7 @@ pub(crate) struct SpawnStreamedCommandRunTask {
     pub(crate) stream_rx: mpsc::Receiver<tura_llm_rust::ProviderStreamEvent>,
     pub(crate) session_directory: PathBuf,
     pub(crate) allowed_command_run_commands: Option<BTreeSet<String>>,
+    pub(crate) jspace_contract: Option<Value>,
     pub(crate) session_id: String,
     pub(crate) runtime_id: String,
     pub(crate) provider: Value,
@@ -688,6 +689,7 @@ fn start_stream_command(
     let resolution_error = resolve_router_command_bindings(&mut command, output_bindings).err();
     let session_directory = input.session_directory.clone();
     let allowed_commands = input.allowed_command_run_commands.clone();
+    let jspace_contract = input.jspace_contract.clone();
     let session_id = input.session_id.clone();
     let runtime_id = input.runtime_id.clone();
     let order = queued.order;
@@ -710,6 +712,7 @@ fn start_stream_command(
                     Some(&session_id),
                     Some(&runtime_id),
                     allowed_commands,
+                    jspace_contract,
                 )),
                 Err(error) => crate::router_command_run::RouterCommandRunCommandResult {
                     results: vec![serde_json::json!({
@@ -1215,6 +1218,7 @@ mod tests {
             stream_rx,
             session_directory: std::env::temp_dir(),
             allowed_command_run_commands: None,
+            jspace_contract: None,
             session_id: "stream-session".to_string(),
             runtime_id: "stream-runtime".to_string(),
             provider: json!({ "provider": "test" }),
@@ -1286,6 +1290,7 @@ mod tests {
             stream_rx,
             session_directory: std::env::temp_dir(),
             allowed_command_run_commands: None,
+            jspace_contract: None,
             session_id: "stream-session-binding".to_string(),
             runtime_id: "stream-runtime-binding".to_string(),
             provider: json!({ "provider": "test" }),
@@ -1348,6 +1353,7 @@ mod tests {
             stream_rx,
             session_directory: std::env::temp_dir(),
             allowed_command_run_commands: None,
+            jspace_contract: None,
             session_id: "stream-session-late-lower".to_string(),
             runtime_id: "stream-runtime-late-lower".to_string(),
             provider: json!({ "provider": "test" }),
@@ -1435,6 +1441,7 @@ mod tests {
             stream_rx,
             session_directory: std::env::temp_dir(),
             allowed_command_run_commands: None,
+            jspace_contract: None,
             session_id: "stream-session-callback".to_string(),
             runtime_id: "stream-runtime-callback".to_string(),
             provider: json!({ "provider": "test" }),
@@ -1474,6 +1481,7 @@ mod tests {
             stream_rx,
             session_directory: std::env::temp_dir(),
             allowed_command_run_commands: None,
+            jspace_contract: None,
             session_id: "stream-session-startup-discard".to_string(),
             runtime_id: "stream-runtime-startup-discard".to_string(),
             provider: json!({ "provider": "test" }),

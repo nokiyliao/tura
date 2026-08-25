@@ -6,6 +6,7 @@ pub mod content_type_fallback;
 pub mod llm;
 pub mod logging;
 pub mod metrics;
+pub mod official_codex_app_server;
 pub mod response_extraction;
 pub mod streaming;
 pub mod tura_conf;

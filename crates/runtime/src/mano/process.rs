@@ -3,6 +3,7 @@ use tracing::{error, info};
 
 use crate::agent_router::activate_agents_by_session_type;
 use crate::checkpoint::session_snapshot::{persist_session_checkpoint, SessionDeltaWriter};
+use crate::manas::runtime_turn::RetryProviderInput;
 use crate::manas::{process_manas_internal, ManasInput};
 use crate::mano::{ManoOverrides, ManoProcessResult};
 use crate::runtime_event_writer::RuntimeEventWriter;
@@ -11,13 +12,21 @@ use crate::session_bootstrap::{
 };
 use crate::session_log_client::SessionLogClient;
 use crate::state_machine::agent_management::{AgentCapabilityItem, AgentManagement};
-use lifecycle::{RuntimeId, SessionCommand, SessionInput, SessionManagement};
-use session_log_contract::{CreateSessionRequest, SessionLogCommand, SessionLogResponse};
+use lifecycle::{RuntimeId, RuntimeState, SessionCommand, SessionInput, SessionManagement};
+use runtime_contract::LifecycleExecutionContext;
+use serde_json::Value;
+use session_log_contract::{
+    CreateSessionRequest, RuntimeReplay, SessionLogCommand, SessionLogResponse,
+};
+use std::collections::HashSet;
 use std::path::PathBuf;
+
+const MAX_RUNTIME_RETRY_LINEAGE_DEPTH: usize = 64;
 
 pub struct OrchestrationConfig {
     pub redis_url: String,
     pub session_directory: Option<PathBuf>,
+    pub jspace_contract: Option<Value>,
 }
 
 impl Default for OrchestrationConfig {
@@ -25,12 +34,20 @@ impl Default for OrchestrationConfig {
         Self {
             redis_url: "redis://localhost:6379".to_string(),
             session_directory: None,
+            jspace_contract: None,
         }
     }
 }
 
 pub fn orchestrate(input: SessionInput) -> Result<ManoProcessResult, String> {
-    orchestrate_with_config_and_session(input, OrchestrationConfig::default(), None, None, None)
+    orchestrate_with_config_and_session(
+        input,
+        OrchestrationConfig::default(),
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 pub fn orchestrate_for_session(
@@ -41,6 +58,7 @@ pub fn orchestrate_for_session(
         input,
         OrchestrationConfig::default(),
         Some(session_id),
+        None,
         None,
         None,
     )
@@ -60,6 +78,7 @@ pub fn orchestrate_for_session_in_directory(
         Some(session_id),
         None,
         None,
+        None,
     )
 }
 
@@ -70,15 +89,61 @@ pub fn orchestrate_for_session_with_lease_in_directory(
     lease_id: String,
     session_directory: PathBuf,
 ) -> Result<ManoProcessResult, String> {
+    orchestrate_for_session_with_lease_and_lifecycle_in_directory(
+        input,
+        session_id,
+        runtime_id,
+        lease_id,
+        session_directory,
+        None,
+        None,
+    )
+}
+
+pub fn orchestrate_for_session_with_lease_and_lifecycle_in_directory(
+    input: SessionInput,
+    session_id: String,
+    runtime_id: RuntimeId,
+    lease_id: String,
+    session_directory: PathBuf,
+    lifecycle: Option<LifecycleExecutionContext>,
+    fallback_from_id: Option<RuntimeId>,
+) -> Result<ManoProcessResult, String> {
+    orchestrate_for_session_with_lease_and_lifecycle_and_jspace_in_directory(
+        input,
+        session_id,
+        runtime_id,
+        lease_id,
+        session_directory,
+        lifecycle,
+        None,
+        fallback_from_id,
+    )
+}
+
+pub fn orchestrate_for_session_with_lease_and_lifecycle_and_jspace_in_directory(
+    input: SessionInput,
+    session_id: String,
+    runtime_id: RuntimeId,
+    lease_id: String,
+    session_directory: PathBuf,
+    lifecycle: Option<LifecycleExecutionContext>,
+    jspace_contract: Option<Value>,
+    fallback_from_id: Option<RuntimeId>,
+) -> Result<ManoProcessResult, String> {
     orchestrate_with_config_and_session(
         input,
         OrchestrationConfig {
             session_directory: Some(session_directory),
+            jspace_contract,
             ..OrchestrationConfig::default()
         },
         Some(session_id.clone()),
         Some(runtime_id.clone()),
-        Some(RuntimeEventWriter::new(session_id, runtime_id, lease_id)?),
+        fallback_from_id,
+        Some(RuntimeEventWriter::new_with_lifecycle(
+            session_id, runtime_id, lease_id, lifecycle,
+        )?),
     )
 }
 
@@ -87,6 +152,7 @@ fn orchestrate_with_config_and_session(
     config: OrchestrationConfig,
     gateway_session_id: Option<String>,
     initial_runtime_id: Option<RuntimeId>,
+    initial_fallback_from_id: Option<RuntimeId>,
     runtime_event_writer: Option<RuntimeEventWriter>,
 ) -> Result<ManoProcessResult, String> {
     let now = Utc::now();
@@ -107,6 +173,9 @@ fn orchestrate_with_config_and_session(
         error!(error = %e, "failed to bootstrap session");
         format!("failed to bootstrap session: {e}")
     })?;
+    if let Some(jspace_contract) = config.jspace_contract {
+        session.jspace_contract = Some(jspace_contract);
+    }
 
     info!(
         session_id = %session.session_id,
@@ -132,6 +201,14 @@ fn orchestrate_with_config_and_session(
         "agents activated"
     );
 
+    let initial_retry_provider_input = match initial_fallback_from_id.as_deref() {
+        Some(fallback_from_id) => Some(retry_provider_input(
+            &session.session_id,
+            fallback_from_id,
+            &session.input.user_input,
+        )?),
+        None => None,
+    };
     let initial_messages = initial_messages_for_session(&mut session)?;
     if create_missing_session {
         ensure_canonical_session(&session)?;
@@ -147,6 +224,8 @@ fn orchestrate_with_config_and_session(
         initial_messages,
         redis_url: &config.redis_url,
         initial_runtime_id,
+        initial_fallback_from_id,
+        initial_retry_provider_input,
         runtime_event_writer,
         session_delta_writer,
     };
@@ -172,6 +251,105 @@ fn orchestrate_with_config_and_session(
         agents: manas_result.agents,
         final_error: manas_result.final_error,
     })
+}
+
+fn retry_provider_input(
+    session_id: &str,
+    fallback_from_id: &str,
+    expected_user_input: &str,
+) -> Result<RetryProviderInput, String> {
+    let client = SessionLogClient::discover().map_err(|error| {
+        format!(
+            "RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{fallback_from_id}:session_log_discovery:{error}"
+        )
+    })?;
+    resolve_retry_provider_input(
+        session_id,
+        fallback_from_id,
+        expected_user_input,
+        |runtime_id| client.replay_runtime(runtime_id.to_string()),
+    )
+}
+
+fn resolve_retry_provider_input<F>(
+    session_id: &str,
+    fallback_from_id: &str,
+    expected_user_input: &str,
+    mut replay_runtime: F,
+) -> Result<RetryProviderInput, String>
+where
+    F: FnMut(&str) -> Result<Option<RuntimeReplay>, String>,
+{
+    let mut runtime_id = fallback_from_id.to_string();
+    let mut visited = HashSet::new();
+
+    for _ in 0..MAX_RUNTIME_RETRY_LINEAGE_DEPTH {
+        if !visited.insert(runtime_id.clone()) {
+            return Err(format!(
+                "RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{runtime_id}:lineage_cycle"
+            ));
+        }
+        let replay = replay_runtime(&runtime_id).map_err(|error| {
+            format!("RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{runtime_id}:replay_failed:{error}")
+        })?;
+        let replay = replay.ok_or_else(|| {
+            format!("RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{runtime_id}:runtime_missing")
+        })?;
+        let aggregate = replay.aggregate;
+        if aggregate.runtime_id != runtime_id || aggregate.session_id != session_id {
+            return Err(format!(
+                "RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{runtime_id}:identity_mismatch"
+            ));
+        }
+        if !matches!(
+            aggregate.state,
+            RuntimeState::Failed | RuntimeState::TimedOut
+        ) {
+            return Err(format!(
+                "RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{runtime_id}:source_not_retryable"
+            ));
+        }
+        let provider_input = aggregate.input.as_ref().ok_or_else(|| {
+            format!("RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{runtime_id}:input_missing")
+        })?;
+        let messages = provider_input
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                format!("RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{runtime_id}:messages_missing")
+            })?;
+        let input_matches = messages
+            .iter()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|message| message.get("content"))
+            .is_some_and(|content| {
+                crate::context::user_input_content_matches(content, expected_user_input)
+            });
+        if !input_matches {
+            return Err(format!(
+                "RUNTIME_RETRY_INPUT_MISMATCH:{session_id}:{runtime_id}"
+            ));
+        }
+
+        let tools = provider_input
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                format!("RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{runtime_id}:tools_missing")
+            })?;
+
+        match aggregate.fallback_from_id {
+            Some(parent_runtime_id) => runtime_id = parent_runtime_id,
+            None => return Ok(RetryProviderInput { messages, tools }),
+        }
+    }
+
+    Err(format!(
+        "RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{runtime_id}:lineage_too_deep"
+    ))
 }
 
 fn ensure_canonical_session(session: &SessionManagement) -> Result<(), String> {
@@ -317,8 +495,147 @@ mod tests {
     use super::*;
     use crate::context::{build_messages_from_session, USER_AGENT_CONTEXT_ROLE};
     use chrono::Utc;
-    use lifecycle::{SessionInput, SessionManagement};
+    use lifecycle::{
+        ProviderConfig, RuntimeAggregate, RuntimeError, RuntimeProviderConfig, RuntimeState,
+        SessionInput, SessionManagement, ToolChoice,
+    };
+    use std::collections::HashMap;
     use std::fs;
+
+    fn retry_replay(
+        runtime_id: &str,
+        fallback_from_id: Option<&str>,
+        messages: Vec<Value>,
+        tools: Vec<Value>,
+    ) -> RuntimeReplay {
+        let now = Utc::now();
+        let mut aggregate = RuntimeAggregate::new_with_fallback(
+            runtime_id.to_string(),
+            "retry-session".to_string(),
+            "retry-agent".to_string(),
+            RuntimeProviderConfig {
+                base: ProviderConfig {
+                    tura_llm_name: "official_codex_app_server".to_string(),
+                    default_model_tier: None,
+                    current_model: Some("gpt-test".to_string()),
+                    stream: true,
+                    temperature: 0.0,
+                    max_tokens: 1024,
+                    tool_choice: ToolChoice::Auto,
+                    time_out_ms: 30_000,
+                },
+                thinking: true,
+                provider_name: "official_codex_app_server".to_string(),
+                model_name: "gpt-test".to_string(),
+                provider_url_name: "local".to_string(),
+                llm_provider_name: "openai".to_string(),
+            },
+            now,
+            fallback_from_id.map(str::to_string),
+        )
+        .expect("retry lineage should be valid");
+        aggregate
+            .set_input(serde_json::json!({
+                "messages": messages,
+                "tools": tools,
+                "options": { "stream": true }
+            }))
+            .expect("runtime input should be recorded");
+        aggregate
+            .finish_failure(
+                now,
+                RuntimeError {
+                    error_code: Some("INTERRUPTED".to_string()),
+                    error_text: Some("provider interrupted".to_string()),
+                    retry_allowed: true,
+                    fallback_allowed: true,
+                    fallback_to_id: None,
+                },
+                RuntimeState::Failed,
+                None,
+            )
+            .expect("retry source should be terminal");
+        RuntimeReplay {
+            aggregate,
+            revision: 1,
+            next_event_seq: 2,
+        }
+    }
+
+    #[test]
+    fn retry_replay_uses_root_provider_input_across_failed_attempts() {
+        let root_messages = vec![
+            serde_json::json!({ "role": "developer", "content": "original snapshot" }),
+            serde_json::json!({ "role": "user", "content": "same mission" }),
+        ];
+        let root_tools = vec![serde_json::json!({ "name": "original_tool" })];
+        let drifted_messages = vec![
+            serde_json::json!({ "role": "developer", "content": "drifted snapshot" }),
+            serde_json::json!({ "role": "user", "content": "same mission" }),
+        ];
+        let drifted_tools = vec![serde_json::json!({ "name": "drifted_tool" })];
+        let replays = HashMap::from([
+            (
+                "runtime-root".to_string(),
+                retry_replay(
+                    "runtime-root",
+                    None,
+                    root_messages.clone(),
+                    root_tools.clone(),
+                ),
+            ),
+            (
+                "runtime-retry".to_string(),
+                retry_replay(
+                    "runtime-retry",
+                    Some("runtime-root"),
+                    drifted_messages,
+                    drifted_tools,
+                ),
+            ),
+        ]);
+
+        let resolved = resolve_retry_provider_input(
+            "retry-session",
+            "runtime-retry",
+            "same mission",
+            |runtime_id| Ok(replays.get(runtime_id).cloned()),
+        )
+        .expect("same mission should resolve to the original provider snapshot");
+
+        assert_eq!(resolved.messages, root_messages);
+        assert_eq!(resolved.tools, root_tools);
+    }
+
+    #[test]
+    fn retry_replay_rejects_changed_user_input() {
+        let replay = retry_replay(
+            "runtime-root",
+            None,
+            vec![
+                serde_json::json!({ "role": "user", "content": "changed mission" }),
+                serde_json::json!({ "role": "assistant", "content": "intermediate" }),
+                serde_json::json!({
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "original mission" }]
+                }),
+            ],
+            vec![serde_json::json!({ "name": "command_run" })],
+        );
+
+        let error = resolve_retry_provider_input(
+            "retry-session",
+            "runtime-root",
+            "changed mission",
+            |runtime_id| Ok((runtime_id == "runtime-root").then(|| replay.clone())),
+        )
+        .expect_err("changed input must not inherit a prior provider turn");
+
+        assert_eq!(
+            error,
+            "RUNTIME_RETRY_INPUT_MISMATCH:retry-session:runtime-root"
+        );
+    }
 
     #[test]
     fn planning_override_removes_planning_from_started_agent_state() {

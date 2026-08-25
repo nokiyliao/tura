@@ -101,6 +101,7 @@ impl SessionManager {
             projection,
             context_tokens: management.context_tokens,
             runtime_usage: management.runtime_usage,
+            jspace_contract: management.jspace_contract,
         }
     }
 
@@ -151,6 +152,8 @@ pub struct SessionInfo {
     pub projection: SessionProjection,
     pub context_tokens: ContextTokenStats,
     pub runtime_usage: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jspace_contract: Option<serde_json::Value>,
 }
 
 fn default_true() -> bool {

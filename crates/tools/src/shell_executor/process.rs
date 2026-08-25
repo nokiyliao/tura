@@ -39,14 +39,21 @@ pub(super) fn terminate_process_tree(pid: u32) {
     terminate_platform_process_tree(pid);
 }
 
-pub(super) fn retain_shell_process_scope(scope: ShellProcessScope) {
+pub(super) fn process_is_alive(pid: u32) -> bool {
+    process_is_alive_platform(pid)
+}
+
+pub(super) fn retain_shell_process_scope(scope: ShellProcessScope, owner_scope: Option<&str>) {
     if !scope.has_live_members() {
         return;
     }
     retained_shell_process_scopes()
         .lock()
         .expect("retained shell process scope registry poisoned")
-        .push(scope);
+        .push(RetainedShellProcessScope {
+            owner_scope: owner_scope.map(str::to_string),
+            process_scope: scope,
+        });
 }
 
 pub fn terminate_retained_shell_process_scopes() -> usize {
@@ -57,13 +64,60 @@ pub fn terminate_retained_shell_process_scopes() -> usize {
         .collect::<Vec<_>>();
     let count = scopes.len();
     for scope in &scopes {
-        scope.terminate();
+        scope.process_scope.terminate();
     }
     count
 }
 
-fn retained_shell_process_scopes() -> &'static Mutex<Vec<ShellProcessScope>> {
-    static SCOPES: OnceLock<Mutex<Vec<ShellProcessScope>>> = OnceLock::new();
+pub fn terminate_retained_shell_process_scopes_for_scope(owner_scope: &str) -> usize {
+    let mut scopes = retained_shell_process_scopes()
+        .lock()
+        .expect("retained shell process scope registry poisoned");
+    let (matching, retained) = std::mem::take(&mut *scopes)
+        .into_iter()
+        .partition::<Vec<_>, _>(|scope| {
+            owner_scope_matches(scope.owner_scope.as_deref(), owner_scope)
+        });
+    *scopes = retained;
+    drop(scopes);
+    let count = matching.len();
+    for scope in &matching {
+        scope.process_scope.terminate();
+    }
+    count
+}
+
+pub fn retained_shell_process_scope_count() -> usize {
+    let mut scopes = retained_shell_process_scopes()
+        .lock()
+        .expect("retained shell process scope registry poisoned");
+    scopes.retain(|scope| scope.process_scope.has_live_members());
+    scopes.len()
+}
+
+pub fn retained_shell_process_scope_count_for_scope(owner_scope: &str) -> usize {
+    let mut scopes = retained_shell_process_scopes()
+        .lock()
+        .expect("retained shell process scope registry poisoned");
+    scopes.retain(|scope| scope.process_scope.has_live_members());
+    scopes
+        .iter()
+        .filter(|scope| owner_scope_matches(scope.owner_scope.as_deref(), owner_scope))
+        .count()
+}
+
+fn owner_scope_matches(stored: Option<&str>, requested: &str) -> bool {
+    stored == Some(requested)
+}
+
+#[derive(Debug)]
+struct RetainedShellProcessScope {
+    owner_scope: Option<String>,
+    process_scope: ShellProcessScope,
+}
+
+fn retained_shell_process_scopes() -> &'static Mutex<Vec<RetainedShellProcessScope>> {
+    static SCOPES: OnceLock<Mutex<Vec<RetainedShellProcessScope>>> = OnceLock::new();
     SCOPES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -140,8 +194,24 @@ fn terminate_process(pid: u32) {
     }
 }
 
+#[cfg(windows)]
+fn process_is_alive_platform(_pid: u32) -> bool {
+    // Recovery stays fail-closed until a native process-handle probe is added.
+    true
+}
+
 #[cfg(not(windows))]
 fn terminate_platform_process_tree(_pid: u32) {}
+
+#[cfg(unix)]
+fn process_is_alive_platform(pid: u32) -> bool {
+    unsafe { kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_alive_platform(_pid: u32) -> bool {
+    true
+}
 
 #[cfg(windows)]
 #[derive(Debug)]
@@ -210,7 +280,7 @@ impl ShellProcessScope {
         }
     }
 
-    fn has_live_members(&self) -> bool {
+    pub(super) fn has_live_members(&self) -> bool {
         use windows_sys::Win32::System::JobObjects::{
             JobObjectBasicAccountingInformation, QueryInformationJobObject,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
@@ -258,7 +328,7 @@ impl ShellProcessScope {
         }
     }
 
-    fn has_live_members(&self) -> bool {
+    pub(super) fn has_live_members(&self) -> bool {
         unsafe { kill(-self.pgid, 0) == 0 }
     }
 }
@@ -275,7 +345,7 @@ impl ShellProcessScope {
 
     pub(super) fn terminate(&self) {}
 
-    fn has_live_members(&self) -> bool {
+    pub(super) fn has_live_members(&self) -> bool {
         false
     }
 }
@@ -409,5 +479,63 @@ mod tests {
         assert!(!command.get_kill_on_drop());
         super::configure_tokio_process_scope(&mut command);
         assert!(command.get_kill_on_drop());
+    }
+
+    #[test]
+    fn retained_process_ownership_is_session_scoped() {
+        assert!(super::owner_scope_matches(Some("session-a"), "session-a"));
+        assert!(!super::owner_scope_matches(Some("session-b"), "session-a"));
+        assert!(!super::owner_scope_matches(None, "session-a"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_process_cleanup_is_exactly_owner_scoped() {
+        let mut first = std::process::Command::new("/bin/sh");
+        first.args(["-c", "sleep 60"]);
+        super::configure_process_scope(&mut first);
+        let mut first = first.spawn().expect("first retained process");
+        let first_scope = super::attach_shell_process_scope(first.id()).expect("first scope");
+        super::retain_shell_process_scope(first_scope, Some("owner-a"));
+
+        let mut second = std::process::Command::new("/bin/sh");
+        second.args(["-c", "sleep 60"]);
+        super::configure_process_scope(&mut second);
+        let mut second = second.spawn().expect("second retained process");
+        let second_scope = super::attach_shell_process_scope(second.id()).expect("second scope");
+        super::retain_shell_process_scope(second_scope, Some("owner-b"));
+
+        assert_eq!(
+            super::retained_shell_process_scope_count_for_scope("owner-a"),
+            1
+        );
+        assert_eq!(
+            super::retained_shell_process_scope_count_for_scope("owner-b"),
+            1
+        );
+        assert_eq!(
+            super::terminate_retained_shell_process_scopes_for_scope("owner-a"),
+            1
+        );
+        first.wait().expect("first retained process reaped");
+        assert_eq!(
+            super::retained_shell_process_scope_count_for_scope("owner-a"),
+            0
+        );
+        assert_eq!(
+            super::retained_shell_process_scope_count_for_scope("owner-b"),
+            1
+        );
+        assert!(second.try_wait().expect("second status").is_none());
+
+        assert_eq!(
+            super::terminate_retained_shell_process_scopes_for_scope("owner-b"),
+            1
+        );
+        second.wait().expect("second retained process reaped");
+        assert_eq!(
+            super::retained_shell_process_scope_count_for_scope("owner-b"),
+            0
+        );
     }
 }

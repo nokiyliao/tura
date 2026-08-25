@@ -1,5 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock, RwLock,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,6 +11,8 @@ use tracing::warn;
 use crate::tura_conf::TuraConfig;
 
 use super::{ProviderConfig, ProviderResponse, ProviderStreamEventSink, TuraError};
+
+pub const OFFICIAL_CODEX_APP_SERVER_PROVIDER: &str = "official_codex_app_server";
 
 pub static SETTINGS: OnceLock<Arc<Settings>> = OnceLock::new();
 static PROVIDER_LATENCY_TIMEOUTS: OnceLock<RwLock<ProviderLatencyTimeouts>> = OnceLock::new();
@@ -80,6 +85,21 @@ impl RouteConfig {
             })
     }
 
+    pub fn official_codex_app_server_provider(&self) -> Result<Option<&ProviderConfig>, TuraError> {
+        let official = self
+            .providers
+            .iter()
+            .find(|provider| provider.provider == OFFICIAL_CODEX_APP_SERVER_PROVIDER);
+        if official.is_some() && self.providers.len() != 1 {
+            return Err(TuraError::Config {
+                message: format!(
+                    "provider '{OFFICIAL_CODEX_APP_SERVER_PROVIDER}' must be the only provider in its route; fallback is prohibited"
+                ),
+            });
+        }
+        Ok(official)
+    }
+
     pub async fn embed(&self, text: &str, conf: &TuraConfig) -> Result<Vec<f32>, TuraError> {
         self.validate()?;
         self.providers[0].embed(text, conf).await
@@ -102,6 +122,18 @@ impl RouteConfig {
         options: CallOptions,
         stream_events: Option<ProviderStreamEventSink>,
     ) -> Result<ProviderResponse, TuraError> {
+        self.run_with_stream_events_and_command_guard(conf, messages, options, stream_events, None)
+            .await
+    }
+
+    pub async fn run_with_stream_events_and_command_guard(
+        &self,
+        conf: &TuraConfig,
+        messages: Vec<Value>,
+        options: CallOptions,
+        stream_events: Option<ProviderStreamEventSink>,
+        command_effect_started: Option<Arc<AtomicBool>>,
+    ) -> Result<ProviderResponse, TuraError> {
         self.validate()?;
 
         let mut failures = Vec::new();
@@ -116,6 +148,15 @@ impl RouteConfig {
             {
                 Ok(result) => return Ok(result),
                 Err(err) => {
+                    if command_effect_blocks_fallback(command_effect_started.as_ref()) {
+                        warn!(
+                            provider = %provider.provider,
+                            model = %provider.model,
+                            error = %err,
+                            "provider failure after command effect; route fallback disabled"
+                        );
+                        return Err(err);
+                    }
                     if err.is_non_retryable_provider_failure() {
                         warn!(provider = %provider.provider, model = %provider.model, error = %err, "provider failure is not retryable; returning without route fallback");
                         return Err(err);
@@ -133,6 +174,10 @@ impl RouteConfig {
             message: failures.join(" | "),
         })
     }
+}
+
+fn command_effect_blocks_fallback(effect_started: Option<&Arc<AtomicBool>>) -> bool {
+    effect_started.is_some_and(|started| started.load(Ordering::SeqCst))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -641,16 +686,20 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_latency_for_tier, latency_level_for_tier, provider_latency_config,
-        provider_latency_timeouts, set_provider_latency_config, set_provider_latency_timeouts,
-        CatalogModelConfig, CatalogModelDetail, CatalogModelLimit, CatalogModelModalities,
-        ModelCatalog, ProviderCatalogConfig, ProviderEnumCatalog, ProviderLatencyConfig,
-        ProviderLatencyTimeouts, RawProviderConfig, RawRouteConfig, RootConfig, RouteConfig,
-        Settings,
+        apply_latency_for_tier, command_effect_blocks_fallback, latency_level_for_tier,
+        provider_latency_config, provider_latency_timeouts, set_provider_latency_config,
+        set_provider_latency_timeouts, CatalogModelConfig, CatalogModelDetail, CatalogModelLimit,
+        CatalogModelModalities, ModelCatalog, ProviderCatalogConfig, ProviderEnumCatalog,
+        ProviderLatencyConfig, ProviderLatencyTimeouts, RawProviderConfig, RawRouteConfig,
+        RootConfig, RouteConfig, Settings,
     };
     use crate::{ProviderConfig, TuraError};
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     fn base_urls() -> HashMap<String, String> {
         HashMap::from([
@@ -670,6 +719,15 @@ mod tests {
             model: Settings::normalize_model_name(provider, model),
             temperature: 0.2,
         }
+    }
+
+    #[test]
+    fn command_effect_disables_provider_route_fallback() {
+        let started = Arc::new(AtomicBool::new(false));
+        assert!(!command_effect_blocks_fallback(Some(&started)));
+        started.store(true, Ordering::SeqCst);
+        assert!(command_effect_blocks_fallback(Some(&started)));
+        assert!(!command_effect_blocks_fallback(None));
     }
 
     fn settings_with_catalog_and_routes() -> Settings {

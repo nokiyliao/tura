@@ -30,7 +30,7 @@ pub(super) fn shell_output_value(response: CommandResponse) -> Value {
         response.exit_code,
         response.stdout,
         response.stderr,
-        Value::Null,
+        response.output,
         response.changes,
     )
 }

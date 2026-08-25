@@ -2,48 +2,40 @@ use super::*;
 
 impl SessionStore {
     pub(crate) fn refresh_messages_from_session_db(&self, session_id: &str) -> Result<(), String> {
-        const PAGE_SIZE: u64 = 1_000;
+        const HYDRATED_MESSAGE_TAIL_SIZE: u64 = 1_000;
 
         let client = SessionDbClient::discover().map_err(|error| {
             format!("failed to discover session_db for message refresh: {error}")
         })?;
-        let mut page = 0;
         let mut refreshed = Vec::new();
-        loop {
-            let (page_info, records) = client
-                .list_session_records(session_id.to_string(), page, PAGE_SIZE)
-                .map_err(|error| {
-                    format!("failed to refresh messages for session {session_id}: {error}")
-                })?;
-            for record in records {
-                let message: Message = serde_json::from_value(record.record).map_err(|error| {
-                    format!("invalid message projection for session {session_id}: {error}")
-                })?;
-                let role = match message.role {
-                    MessageRole::User => "user",
-                    MessageRole::Assistant => "assistant",
-                    MessageRole::System => "system",
-                };
-                if record.session_id != session_id
-                    || message.id != record.message_id
-                    || message.session_id != session_id
-                    || role != record.role
-                    || message.created_at != record.created_at
-                    || message.updated_at != record.updated_at
-                {
-                    return Err(format!(
-                        "Session message projection envelope does not match its payload for session {session_id}"
-                    ));
-                }
-                refreshed.push(message);
+        // Session DB defines page zero as the newest page for record reads. One
+        // bounded read therefore hydrates only the exact session's current tail.
+        let (_, records) = client
+            .list_session_records(session_id.to_string(), 0, HYDRATED_MESSAGE_TAIL_SIZE)
+            .map_err(|error| {
+                format!("failed to refresh messages for session {session_id}: {error}")
+            })?;
+        for record in records {
+            let message: Message = serde_json::from_value(record.record).map_err(|error| {
+                format!("invalid message projection for session {session_id}: {error}")
+            })?;
+            let role = match message.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::System => "system",
+            };
+            if record.session_id != session_id
+                || message.id != record.message_id
+                || message.session_id != session_id
+                || role != record.role
+                || message.created_at != record.created_at
+                || message.updated_at != record.updated_at
+            {
+                return Err(format!(
+                    "Session message projection envelope does not match its payload for session {session_id}"
+                ));
             }
-            if (page_info.page + 1).saturating_mul(page_info.page_size) >= page_info.total {
-                break;
-            }
-            page = page.saturating_add(1);
-        }
-        if let Some(info) = self.sessions.write().get_mut(session_id) {
-            info.message_count = refreshed.len();
+            refreshed.push(message);
         }
         self.messages
             .write()
@@ -52,6 +44,14 @@ impl SessionStore {
     }
 
     pub fn get_messages(&self, session_id: &str) -> Vec<Message> {
+        if let Err(error) = self.ensure_hydrated(session_id) {
+            tracing::debug!(
+                session_id,
+                error,
+                "failed to hydrate exact session messages"
+            );
+            return Vec::new();
+        }
         self.messages
             .read()
             .get(session_id)
@@ -124,7 +124,7 @@ impl SessionStore {
                 }
             }
             if let Some(info) = self.sessions.write().get_mut(session_id) {
-                info.message_count = session_messages.len();
+                info.message_count = info.message_count.max(session_messages.len());
                 if let Some(updated_at) = merged.iter().map(|message| message.updated_at).max() {
                     info.updated_at = info.updated_at.max(updated_at);
                 }
@@ -218,7 +218,7 @@ impl SessionStore {
             });
         }
         if let Some(info) = self.sessions.write().get_mut(session_id) {
-            info.message_count = session_messages.len();
+            info.message_count = info.message_count.max(session_messages.len());
             info.updated_at = info.updated_at.max(updated_at);
         }
         drop(messages);
@@ -252,7 +252,7 @@ impl SessionStore {
             (message, true)
         };
         if let Some(info) = self.sessions.write().get_mut(session_id) {
-            info.message_count = session_messages.len();
+            info.message_count = info.message_count.max(session_messages.len());
             info.updated_at = info.updated_at.max(projected.updated_at);
             if projected.role == MessageRole::User {
                 info.last_user_message_at = Some(
@@ -281,6 +281,10 @@ impl SessionStore {
     }
 
     pub fn get_todos(&self, session_id: &str) -> Vec<serde_json::Value> {
+        if let Err(error) = self.ensure_hydrated(session_id) {
+            tracing::debug!(session_id, error, "failed to hydrate exact session todos");
+            return Vec::new();
+        }
         self.todos
             .read()
             .get(session_id)
@@ -298,6 +302,7 @@ impl SessionStore {
         session_id: &str,
         todos: Vec<serde_json::Value>,
     ) -> Result<Vec<serde_json::Value>, String> {
+        self.ensure_hydrated(session_id)?;
         let (todos, cursor) = SessionDbClient::discover()
             .and_then(|client| {
                 client.update_session_todos(session_log_contract::UpdateSessionTodosRequest {
@@ -600,7 +605,7 @@ impl SessionStore {
         session_messages.push(message.clone());
 
         if let Some(info) = self.sessions.write().get_mut(session_id) {
-            info.message_count = session_messages.len();
+            info.message_count = info.message_count.max(session_messages.len());
             info.updated_at = now;
             if role == MessageRole::User {
                 info.last_user_message_at = Some(now);
@@ -835,7 +840,7 @@ impl SessionStore {
         session_messages.push(message.clone());
 
         if let Some(info) = self.sessions.write().get_mut(session_id) {
-            info.message_count = session_messages.len();
+            info.message_count = info.message_count.max(session_messages.len());
             info.updated_at = now;
         }
         drop(messages);

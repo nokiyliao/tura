@@ -187,6 +187,14 @@ pub(crate) fn execute_command_with_feed(
         SessionLogCommand::ReplayRuntime(payload) => SessionLogResponse::RuntimeReplayed {
             runtime: store.replay_runtime(payload)?.map(Box::new),
         },
+        SessionLogCommand::GetRuntimeLease(payload) => SessionLogResponse::RuntimeLeaseRead {
+            runtime: store.get_runtime_lease(payload)?,
+        },
+        SessionLogCommand::RecoveryCloseRuntime(payload) => {
+            SessionLogResponse::RuntimeRecoveryClosed {
+                result: store.recovery_close_runtime(payload)?,
+            }
+        }
         SessionLogCommand::PersistSessionDelta(payload) => {
             let outcome = store.persist_session_delta_with_feed(*payload)?;
             committed_feed_entries.extend(outcome.feed_entries);
@@ -285,8 +293,14 @@ pub(crate) fn serve_blocking_with_feed_hub(
     listener.set_nonblocking(true)?;
     let addr = listener.local_addr()?;
     publish_addr(&addr)?;
+    let mut last_endpoint_check = std::time::Instant::now();
     tracing::info!(address = %addr, "session_db service listening");
     while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        if last_endpoint_check.elapsed() >= Duration::from_secs(1) {
+            republish_addr_if_missing(&addr)
+                .context("failed to republish lost session_db endpoint")?;
+            last_endpoint_check = std::time::Instant::now();
+        }
         match listener.accept() {
             Ok((stream, _peer_addr)) => {
                 let store = store.clone();
@@ -325,6 +339,14 @@ fn publish_addr(addr: &SocketAddr) -> Result<()> {
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("failed to publish {}", path.display()))?;
     Ok(())
+}
+
+fn republish_addr_if_missing(addr: &SocketAddr) -> Result<bool> {
+    if service_addr_path().exists() {
+        return Ok(false);
+    }
+    publish_addr(addr)?;
+    Ok(true)
 }
 
 fn handle_connection(
@@ -534,6 +556,30 @@ mod tests {
             !path.exists(),
             "unreachable session_db addr should be removed"
         );
+    }
+
+    #[test]
+    fn live_owner_republishes_a_lost_endpoint_record() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let root = tempfile::tempdir().expect("temp db root");
+        let _env = EnvGuard::set(&[
+            ("TURA_HOME", Some(root.path())),
+            ("SESSION_LOG_DB_ROOT", Some(root.path())),
+            ("TURA_DB_ROOT", None),
+        ]);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind endpoint");
+        let addr = listener.local_addr().expect("endpoint addr");
+
+        publish_addr(&addr).expect("publish endpoint");
+        let path = service_addr_path();
+        std::fs::remove_file(&path).expect("simulate endpoint loss");
+        assert!(republish_addr_if_missing(&addr).expect("republish endpoint"));
+        let endpoint: ServiceEndpoint = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("read republished endpoint"),
+        )
+        .expect("parse republished endpoint");
+        assert_eq!(endpoint.addr, addr.to_string());
+        assert!(!republish_addr_if_missing(&addr).expect("idempotent endpoint check"));
     }
 
     #[test]
@@ -754,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn service_probe_waits_for_owned_health_deadline_before_replacing_endpoint() {
+    fn service_probe_preserves_endpoint_after_owned_health_deadline() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let root = tempfile::tempdir().expect("temp db root");
         let _env = EnvGuard::set(&[
@@ -812,8 +858,8 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(250));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(
-            !path.exists(),
-            "the unchanged endpoint may be removed only after its owner misses the deadline"
+            path.exists(),
+            "a client must preserve the endpoint until the lifecycle owner releases its lock"
         );
         server.join().expect("unresponsive owned endpoint thread");
         owner_lock.unlock().expect("release owner lock");

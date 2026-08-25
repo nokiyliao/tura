@@ -13,7 +13,8 @@ export class NdjsonOutput {
   }
 
   completed(result: RunResult): void {
-    process.stdout.write(`${JSON.stringify({ type: "cli.completed", ...result })}\n`);
+    const type = result.status === "detached" ? "cli.detached" : "cli.completed";
+    process.stdout.write(`${JSON.stringify({ type, ...result })}\n`);
   }
 
   failed(sessionID: string | undefined, error: unknown): void {

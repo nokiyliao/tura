@@ -71,7 +71,10 @@ fn normalize_workspace(value: &str) -> String {
 }
 
 fn ensure_session_db_owner_for_persisted_reads() {
-    if session_log_contract::client::service_is_running() {
+    // Router dispatch already establishes the owner before spawning this
+    // worker. A published endpoint is enough to proceed to the authoritative
+    // data operation; probing here creates a second, destructive TOCTOU edge.
+    if session_log_contract::client::service_addr_path().is_file() {
         return;
     }
     for addr in router_addrs_for_current_home() {

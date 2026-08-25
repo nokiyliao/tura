@@ -998,6 +998,31 @@ fn command_run_command_streaming_emits_each_complete_command_object() {
 }
 
 #[test]
+fn command_run_command_streaming_inherits_top_level_timeout_before_dispatch() {
+    let mut collector = super::CodexCommandRunCommandCollector::default();
+    collector.push_event(&json!({
+        "type": "response.output_item.added",
+        "item": {
+            "id": "fc_timeout",
+            "call_id": "call_timeout",
+            "type": "function_call",
+            "name": "command_run"
+        }
+    }));
+    let ready = collector.push_event(&json!({
+        "type": "response.function_call_arguments.delta",
+        "item_id": "fc_timeout",
+        "delta": "{\"timeout_ms\":25000,\"commands\":[{\"step\":1,\"command_type\":\"shell_command\",\"command_line\":\"sleep 16\"},"
+    }));
+
+    let command = match &ready[0] {
+        crate::tura_llm::ProviderStreamEvent::CommandRunCommandReady { command, .. } => command,
+        other => panic!("unexpected provider event: {other:?}"),
+    };
+    assert_eq!(command["timeout_ms"], 25_000);
+}
+
+#[test]
 fn command_run_command_streaming_emits_split_python_command_object() {
     let mut collector = super::CodexCommandRunCommandCollector::default();
     collector.push_event(&json!({

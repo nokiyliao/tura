@@ -8,7 +8,9 @@ use anyhow::{bail, Context, Result};
 use session_log_contract::client::{
     open_session_feed_subscription, SessionFeedSubscription, SessionFeedSubscriptionCancellation,
 };
-use session_log_contract::{SessionFeedCommandUpdate, SessionFeedEntry, SessionFeedEvent};
+use session_log_contract::{
+    SessionFeedCommandUpdate, SessionFeedEntry, SessionFeedEvent, SessionSnapshot, SessionSummary,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +21,83 @@ use std::time::Duration;
 const REPLAY_PAGE_SIZE: u64 = 1_000;
 const RECONNECT_DELAY: Duration = Duration::from_millis(100);
 const SUBSCRIPTION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const REPLAY_HOLD_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+static STARTUP_PROJECTION_GATE: AtomicBool = AtomicBool::new(false);
+static PROJECTION_READY: AtomicBool = AtomicBool::new(true);
+static PROJECTION_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+pub struct ProjectionHealth {
+    pub healthy: bool,
+    pub ready: bool,
+    pub status: &'static str,
+    pub error: Option<String>,
+}
+
+pub fn enable_startup_projection_gate() {
+    *PROJECTION_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    PROJECTION_READY.store(false, Ordering::SeqCst);
+    STARTUP_PROJECTION_GATE.store(true, Ordering::SeqCst);
+}
+
+pub fn mark_projection_ready() {
+    *PROJECTION_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    PROJECTION_READY.store(true, Ordering::SeqCst);
+}
+
+pub fn mark_projection_failed(error: String) {
+    *PROJECTION_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+    PROJECTION_READY.store(false, Ordering::SeqCst);
+}
+
+pub fn session_projection_fail_closed() -> bool {
+    STARTUP_PROJECTION_GATE.load(Ordering::SeqCst) && !PROJECTION_READY.load(Ordering::SeqCst)
+}
+
+pub fn projection_health() -> ProjectionHealth {
+    if !STARTUP_PROJECTION_GATE.load(Ordering::SeqCst) || PROJECTION_READY.load(Ordering::SeqCst) {
+        return ProjectionHealth {
+            healthy: true,
+            ready: true,
+            status: "ready",
+            error: None,
+        };
+    }
+    let error = PROJECTION_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if error.is_some() {
+        ProjectionHealth {
+            healthy: false,
+            ready: false,
+            status: "failed",
+            error,
+        }
+    } else {
+        ProjectionHealth {
+            healthy: false,
+            ready: false,
+            status: "starting",
+            error: None,
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn reset_startup_projection_gate() {
+    STARTUP_PROJECTION_GATE.store(false, Ordering::SeqCst);
+    PROJECTION_READY.store(true, Ordering::SeqCst);
+    *PROJECTION_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
 
 pub struct SessionFeedTailer {
     cancellation: Arc<Mutex<Option<SessionFeedSubscriptionCancellation>>>,
@@ -57,11 +136,11 @@ impl SessionFeedTailer {
 
 pub fn start_session_feed_tailer() -> Result<(SessionFeedTailer, tokio::sync::oneshot::Receiver<()>)>
 {
+    enable_startup_projection_gate();
     let mut subscription = open_session_feed_subscription()?;
     let cancellation = subscription.cancellation_handle()?;
     let client = SessionDbClient::discover()?;
     let mut reducer = SessionFeedReducer::new(session_store().clone());
-    replay_all_sessions(&client, &mut reducer)?;
     let stopping = Arc::new(AtomicBool::new(false));
     let thread_stopping = Arc::clone(&stopping);
     let cancellation = Arc::new(Mutex::new(Some(cancellation)));
@@ -73,12 +152,50 @@ pub fn start_session_feed_tailer() -> Result<(SessionFeedTailer, tokio::sync::on
     let thread = std::thread::Builder::new()
         .name("gateway-session-feed".to_string())
         .spawn(move || {
+            wait_for_optional_replay_hold(&thread_stopping);
+            if thread_stopping.load(Ordering::SeqCst) {
+                let _ = done_sender.send(());
+                return;
+            }
+            if let Err(error) = replay_all_sessions(&client, &mut reducer) {
+                let message = format!("{error:#}");
+                mark_projection_failed(message.clone());
+                *thread_failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message);
+                let _ = done_sender.send(());
+                return;
+            }
+            mark_projection_ready();
             let outcome = loop {
                 if thread_stopping.load(Ordering::SeqCst) {
                     break Ok(());
                 }
                 match subscription.poll_next_entry(SUBSCRIPTION_POLL_INTERVAL) {
                     Ok(Poll::Ready(Some(entry))) => {
+                        let resident = match prepare_session_for_live_entry(
+                            &client,
+                            &mut reducer,
+                            &entry.session_id,
+                            entry.cursor,
+                        ) {
+                            Ok(resident) => resident,
+                            Err(error) => break Err(error),
+                        };
+                        if !resident {
+                            continue;
+                        }
+                        if reducer.has_durable_gap(&entry) {
+                            if let Err(error) = replay_session_from_cursor(
+                                &client,
+                                &mut reducer,
+                                entry.session_id.clone(),
+                            ) {
+                                break Err(error.context(
+                                    "failed to reconcile durable Session feed cursor gap",
+                                ));
+                            }
+                        }
                         if let Err(error) = reducer.apply(entry) {
                             break Err(error.context("failed to reduce durable Session feed"));
                         }
@@ -190,17 +307,17 @@ fn reconnect_session_feed(
 fn replay_all_sessions(client: &SessionDbClient, reducer: &mut SessionFeedReducer) -> Result<()> {
     let mut canonical_session_ids = HashSet::new();
     for workspace in client.list_workspaces()? {
-        canonical_session_ids.extend(replay_directory_with_reducer(
+        canonical_session_ids.extend(load_directory_summaries(
             client,
             reducer,
             &workspace.directory,
         )?);
     }
     let stale_session_ids = reducer
-        .cursors
-        .keys()
-        .filter(|session_id| !canonical_session_ids.contains(*session_id))
-        .cloned()
+        .store
+        .summary_session_ids()
+        .into_iter()
+        .filter(|session_id| !canonical_session_ids.contains(session_id))
         .collect::<Vec<_>>();
     for session_id in stale_session_ids {
         reducer.store.remove_session_projection(&session_id);
@@ -210,16 +327,120 @@ fn replay_all_sessions(client: &SessionDbClient, reducer: &mut SessionFeedReduce
     Ok(())
 }
 
+fn prepare_session_for_live_entry(
+    client: &SessionDbClient,
+    reducer: &mut SessionFeedReducer,
+    session_id: &str,
+    feed_cursor: u64,
+) -> Result<bool> {
+    if reducer.store.has_resident_session(session_id) {
+        reducer
+            .cursors
+            .entry(session_id.to_string())
+            .or_insert_with(|| reducer.store.summary_cursor(session_id).unwrap_or(0));
+        return Ok(true);
+    }
+    let Some(snapshot) = client.get_session(session_id.to_string())? else {
+        reducer.store.remove_session_projection(session_id);
+        return Ok(false);
+    };
+    reducer
+        .store
+        .upsert_snapshot_summary_cache(&snapshot, feed_cursor)
+        .map_err(anyhow::Error::msg)?;
+    if !snapshot_requires_hydration(&snapshot) {
+        return Ok(false);
+    }
+    hydrate_snapshot(reducer.store.clone(), &snapshot).map_err(anyhow::Error::msg)?;
+    reducer.cursors.insert(session_id.to_string(), feed_cursor);
+    Ok(false)
+}
+
+pub(crate) fn hydrate_exact_session(store: SessionStore, session_id: &str) -> Result<(), String> {
+    if store.has_resident_session(session_id) {
+        return Ok(());
+    }
+    let client = SessionDbClient::discover()
+        .map_err(|error| format!("failed to discover session_db: {error}"))?;
+    hydrate_exact_session_with_client(&client, store, session_id)
+}
+
+fn hydrate_exact_session_with_client(
+    client: &SessionDbClient,
+    store: SessionStore,
+    session_id: &str,
+) -> Result<(), String> {
+    let snapshot = client
+        .get_session(session_id.to_string())
+        .map_err(|error| format!("failed to read exact session {session_id}: {error}"))?
+        .ok_or_else(|| format!("session {session_id} not found"))?;
+    hydrate_snapshot(store.clone(), &snapshot)?;
+    store
+        .has_resident_session(session_id)
+        .then_some(())
+        .ok_or_else(|| format!("session {session_id} snapshot could not be hydrated"))
+}
+
+fn hydrate_snapshot(store: SessionStore, snapshot: &SessionSnapshot) -> Result<(), String> {
+    store.insert_snapshot_projection_cache(snapshot)?;
+    store.refresh_messages_from_session_db(&snapshot.session_id)
+}
+
+fn summary_requires_hydration(summary: &SessionSummary) -> bool {
+    let status = summary
+        .status
+        .as_deref()
+        .or(summary.state.as_deref())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        status.as_str(),
+        "active" | "busy" | "queued" | "running" | "starting"
+    ) || task_management_requires_hydration(&summary.task_management)
+}
+
+fn snapshot_requires_hydration(snapshot: &SessionSnapshot) -> bool {
+    snapshot.lifecycle_projection.state.ui_status() == "busy"
+        || snapshot
+            .lifecycle_projection
+            .task_plan
+            .detailed_tasks
+            .iter()
+            .any(|task| task.scheduler_eligible(chrono::Utc::now()))
+}
+
+fn task_management_requires_hydration(task_management: &serde_json::Value) -> bool {
+    fn task_requires_hydration(
+        task: &serde_json::Value,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        serde_json::from_value::<lifecycle::TaskStep>(task.clone())
+            .map(|task| task.scheduler_eligible(now))
+            // Unknown legacy task shapes stay resident rather than risking a missed due task.
+            .unwrap_or_else(|_| {
+                task.get("start_condition")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|condition| condition != "user_action")
+            })
+    }
+
+    let now = chrono::Utc::now();
+    task_requires_hydration(task_management, now)
+        || task_management
+            .get("tasks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tasks| tasks.iter().any(|task| task_requires_hydration(task, now)))
+}
+
 pub(crate) fn replay_directory(
     client: &SessionDbClient,
     store: SessionStore,
     directory: &str,
 ) -> Result<()> {
-    replay_directory_with_reducer(client, &mut SessionFeedReducer::new(store), directory)
-        .map(|_| ())
+    load_directory_summaries(client, &mut SessionFeedReducer::new(store), directory).map(|_| ())
 }
 
-fn replay_directory_with_reducer(
+fn load_directory_summaries(
     client: &SessionDbClient,
     reducer: &mut SessionFeedReducer,
     directory: &str,
@@ -227,23 +448,20 @@ fn replay_directory_with_reducer(
     let mut session_ids = HashSet::new();
     let mut page = 0;
     loop {
-        let (page_info, sessions) =
-            client.list_sessions(directory.to_string(), page, REPLAY_PAGE_SIZE)?;
-        for session in sessions {
-            let session_id = session.session_id;
+        let (page_info, summaries) =
+            client.list_session_summaries(directory.to_string(), page, REPLAY_PAGE_SIZE)?;
+        for summary in summaries {
+            let session_id = summary.session_id.clone();
+            let feed_cursor = summary.feed_cursor;
+            let hydrate = summary_requires_hydration(&summary);
             session_ids.insert(session_id.clone());
-            if let Err(error) = replay_session(client, reducer, session_id.clone()) {
-                if client.get_session(session_id.clone())?.is_none() {
-                    session_ids.remove(&session_id);
-                    continue;
-                }
-                return Err(error);
+            reducer.store.upsert_summary_cache(summary);
+            if hydrate && !reducer.store.has_resident_session(&session_id) {
+                hydrate_exact_session_with_client(client, reducer.store.clone(), &session_id)
+                    .map_err(anyhow::Error::msg)?;
             }
-            if reducer.store.get_session(&session_id).is_none() {
-                if client.get_session(session_id.clone())?.is_none() {
-                    continue;
-                }
-                bail!("session {session_id} feed is missing its creation snapshot");
+            if hydrate {
+                reducer.cursors.insert(session_id, feed_cursor);
             }
         }
         if (page_info.page + 1).saturating_mul(page_info.page_size) >= page_info.total {
@@ -253,12 +471,12 @@ fn replay_directory_with_reducer(
     }
 }
 
-fn replay_session(
+fn replay_session_from_cursor(
     client: &SessionDbClient,
     reducer: &mut SessionFeedReducer,
     session_id: String,
 ) -> Result<()> {
-    let mut cursor = 0;
+    let mut cursor = reducer.cursors.get(&session_id).copied().unwrap_or(0);
     loop {
         let (entries, next_cursor) =
             client.read_session_feed(session_id.clone(), cursor, REPLAY_PAGE_SIZE)?;
@@ -273,6 +491,19 @@ fn replay_session(
             bail!("session feed replay made no cursor progress for {session_id}");
         }
         cursor = next_cursor;
+    }
+}
+
+fn wait_for_optional_replay_hold(stopping: &AtomicBool) {
+    let Ok(path) = std::env::var("TURA_SESSION_FEED_REPLAY_HOLD_PATH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    while path.exists() && !stopping.load(Ordering::SeqCst) {
+        std::thread::sleep(REPLAY_HOLD_POLL_INTERVAL);
     }
 }
 
@@ -391,7 +622,20 @@ impl SessionFeedReducer {
                 .insert(session_id.clone(), event_id);
         }
         self.cursors.insert(session_id, entry.cursor);
+        self.store
+            .update_summary_cursor(&entry.session_id, entry.cursor);
         Ok(true)
+    }
+
+    fn has_durable_gap(&self, entry: &SessionFeedEntry) -> bool {
+        entry.cursor > 1
+            && entry.cursor
+                > self
+                    .cursors
+                    .get(&entry.session_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1)
     }
 
     fn apply_event(
@@ -664,6 +908,7 @@ mod tests {
         management.use_last_tool_call_response = info.use_last_tool_call_response;
         management.context_tokens = info.context_tokens;
         management.runtime_usage = info.runtime_usage.clone();
+        management.jspace_contract = info.jspace_contract.clone();
         management.replace_lifecycle_projection(projection.clone());
         SessionSnapshot {
             session_id: session_id.to_string(),
@@ -696,6 +941,158 @@ mod tests {
             management,
             todos: vec![json!({"id": format!("todo-{name}")})],
         }
+    }
+
+    fn cold_summary(status: &str, task_management: serde_json::Value) -> SessionSummary {
+        SessionSummary {
+            session_id: "cold-session".to_string(),
+            workspace: "C:/cold-workspace".to_string(),
+            name: Some("Cold session".to_string()),
+            parent_id: None,
+            created_at: 1,
+            updated_at: 2,
+            last_user_message_at: Some(2),
+            state: Some(status.to_string()),
+            status: Some(status.to_string()),
+            message_count: 42,
+            feed_cursor: 17,
+            task_management,
+            metadata: SessionMetadata {
+                session_directory: "C:/cold-workspace/sessions".to_string(),
+                model: Some("openai/gpt-5.6-sol".to_string()),
+                agent: Some("balanced".to_string()),
+                session_type: "coding".to_string(),
+                kill_processes_on_start: false,
+                validator_enabled: false,
+                force_planning: false,
+                model_variant: Some("xhigh".to_string()),
+                model_acceleration_enabled: false,
+                disable_permission_restrictions: false,
+                use_last_tool_call_response: true,
+                auto_session_name: true,
+                context_tokens: lifecycle::ContextTokenStats::default(),
+                runtime_usage: json!({}),
+            },
+        }
+    }
+
+    #[test]
+    fn cold_summary_is_listable_without_resident_history() {
+        let store = SessionStore::empty();
+        store.upsert_summary_cache(cold_summary("idle", json!({})));
+
+        assert_eq!(store.session_count(), 1);
+        assert_eq!(store.resident_session_count_for_business_test(), 0);
+        let listed = store.list_sessions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "cold-session");
+        assert_eq!(listed[0].message_count, 42);
+        assert_eq!(listed[0].model.as_deref(), Some("openai/gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn cold_inventory_cost_tracks_summary_count_not_history_count() {
+        const SESSION_COUNT: usize = 2_000;
+        const HISTORY_MESSAGES_PER_SESSION: u64 = 50_000;
+        let store = SessionStore::empty();
+        for index in 0..SESSION_COUNT {
+            let mut summary = cold_summary("idle", json!({}));
+            summary.session_id = format!("cold-session-{index}");
+            summary.message_count = HISTORY_MESSAGES_PER_SESSION;
+            store.upsert_summary_cache(summary);
+        }
+
+        assert_eq!(store.session_count(), SESSION_COUNT);
+        assert_eq!(store.resident_session_count_for_business_test(), 0);
+        assert_eq!(
+            store
+                .list_sessions()
+                .into_iter()
+                .map(|session| session.message_count as u64)
+                .sum::<u64>(),
+            SESSION_COUNT as u64 * HISTORY_MESSAGES_PER_SESSION
+        );
+    }
+
+    #[test]
+    fn new_feed_generation_resets_the_summary_high_water() {
+        let (store, session_id) = test_store();
+        let current = snapshot(&store, &session_id, "Current generation", 20);
+        store.update_summary_cursor(&session_id, 17);
+
+        store
+            .upsert_snapshot_summary_cache(&current, 1)
+            .expect("new generation summary");
+        assert_eq!(store.summary_cursor(&session_id), Some(1));
+
+        store
+            .upsert_snapshot_summary_cache(&current, 0)
+            .expect("live delta summary");
+        assert_eq!(store.summary_cursor(&session_id), Some(1));
+    }
+
+    #[test]
+    fn resident_admission_is_active_or_scheduler_scoped() {
+        assert!(!summary_requires_hydration(&cold_summary(
+            "idle",
+            json!({})
+        )));
+        assert!(summary_requires_hydration(&cold_summary("busy", json!({}))));
+        assert!(summary_requires_hydration(&cold_summary(
+            "idle",
+            json!({
+                "status": "todo",
+                "start_condition": "scheduled_task",
+                "start_at": "1970-01-01T00:00:00Z",
+            }),
+        )));
+        assert!(!summary_requires_hydration(&cold_summary(
+            "idle",
+            json!({
+                "status": "done",
+                "start_condition": "scheduled_task",
+                "start_at": "1970-01-01T00:00:00Z",
+            }),
+        )));
+        assert!(!summary_requires_hydration(&cold_summary(
+            "idle",
+            json!({
+                "status": "todo",
+                "start_condition": "scheduled_task",
+                "start_at": "2999-01-01T00:00:00Z",
+            }),
+        )));
+    }
+
+    #[test]
+    fn idle_resident_cache_is_bounded_without_deleting_summaries() {
+        let store = SessionStore::empty();
+        for index in 0..3 {
+            store.create_session(
+                Some(format!("C:/workspace-{index}")),
+                None,
+                None,
+                Some("coding".to_string()),
+                false,
+                false,
+                false,
+                None,
+                false,
+                false,
+            );
+        }
+        assert_eq!(store.session_count(), 3);
+        assert_eq!(store.resident_session_count_for_business_test(), 3);
+
+        let evicted = store.evict_idle_residents_for_business_test(
+            chrono::Utc::now().timestamp_millis(),
+            1,
+            60 * 60 * 1_000,
+        );
+
+        assert_eq!(evicted, 2);
+        assert_eq!(store.resident_session_count_for_business_test(), 1);
+        assert_eq!(store.session_count(), 3);
     }
 
     #[test]
@@ -1148,6 +1545,42 @@ mod tests {
             message.parts[0].text.as_deref(),
             Some("first paragraph\n\nsecond paragraph")
         );
+    }
+
+    #[test]
+    fn replay_live_cursor_gap_is_detected_before_reduction() {
+        let (store, session_id) = test_store();
+        let mut reducer = SessionFeedReducer::new(store);
+        let mut first = entry(
+            1,
+            SessionFeedEvent::TodosUpdated {
+                todos: Vec::new(),
+                updated_at: 1,
+            },
+        );
+        first.session_id = session_id.clone();
+        assert!(!reducer.has_durable_gap(&first));
+        assert!(reducer.apply(first).expect("apply first durable cursor"));
+
+        let mut skipped = entry(
+            3,
+            SessionFeedEvent::TodosUpdated {
+                todos: Vec::new(),
+                updated_at: 3,
+            },
+        );
+        skipped.session_id = session_id.clone();
+        assert!(reducer.has_durable_gap(&skipped));
+
+        let mut contiguous = entry(
+            2,
+            SessionFeedEvent::TodosUpdated {
+                todos: Vec::new(),
+                updated_at: 2,
+            },
+        );
+        contiguous.session_id = session_id;
+        assert!(!reducer.has_durable_gap(&contiguous));
     }
 
     #[test]

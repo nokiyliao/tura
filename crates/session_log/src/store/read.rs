@@ -338,7 +338,9 @@ impl SessionLogStore {
             state: workspace_payload.state,
             status: workspace_payload.status,
             message_count: workspace_payload.message_count as u64,
+            feed_cursor: workspace_payload.feed_cursor,
             task_management: workspace_payload.task_management,
+            metadata: workspace_payload.metadata,
         }))
     }
 

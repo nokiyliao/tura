@@ -12,6 +12,7 @@ export interface RuntimeConfigOverrides {
   modelAccelerationEnabled?: boolean;
   killProcessesOnStart?: boolean;
   validatorEnabled?: boolean;
+  disablePermissionRestrictions?: boolean;
   commandRunShell?: CommandRunShell;
 }
 
@@ -130,6 +131,8 @@ function assignRuntimeConfigValue(
   else if (canonical === "kill_processes_on_start")
     overrides.killProcessesOnStart = booleanValue(value, key);
   else if (canonical === "validator_enabled") overrides.validatorEnabled = booleanValue(value, key);
+  else if (canonical === "disable_permission_restrictions")
+    overrides.disablePermissionRestrictions = booleanValue(value, key);
   else if (canonical === "command_run_shell") overrides.commandRunShell = shellValue(value, key);
 }
 

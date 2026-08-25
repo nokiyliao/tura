@@ -62,6 +62,11 @@ name = "google_local_flow"
 path = "tests/live/google_local_flow.rs"
 required-features = ["live-tests"]
 
+[[test]]
+name = "official_codex_app_server_flow"
+path = "tests/official_codex_app_server_flow.rs"
+harness = false
+
 [dependencies]
 tokio.workspace = true
 serde.workspace = true
@@ -75,6 +80,7 @@ reqwest.workspace = true
 futures-util.workspace = true
 regex.workspace = true
 tura_path.workspace = true
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -29,6 +29,7 @@ pub(super) fn parse_command_item(value: &Value) -> Result<CommandItem, String> {
             workdir: None,
             step: None,
             timeout_ms: None,
+            stall_timeout_ms: None,
             binding_id: None,
         });
     }
@@ -105,6 +106,7 @@ pub(super) fn parse_command_item(value: &Value) -> Result<CommandItem, String> {
         workdir: string_field(object, &["workdir", "cwd"]),
         step: u64_field(object, &["step"]),
         timeout_ms: u64_field(object, &["timeout_ms", "timeoutMs"]),
+        stall_timeout_ms: u64_field(object, &["stall_timeout_ms", "stallTimeoutMs"]),
         binding_id: string_field(object, &["id", "command_id", "commandId", "result_id"]),
     })
 }

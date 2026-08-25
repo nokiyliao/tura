@@ -275,7 +275,7 @@ pub(super) fn init_index_db(conn: &Connection) -> Result<()> {
 }
 
 pub(super) fn init_workspace_db(conn: &Connection) -> Result<()> {
-    require_canonical_schema(conn, "workspace", WORKSPACE_SCHEMA)?;
+    prepare_workspace_schema(conn)?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS sessions (
@@ -392,6 +392,183 @@ pub(super) fn init_workspace_db(conn: &Connection) -> Result<()> {
             ON session_feed_events(runtime_id, cursor);
         ",
     )?;
+    require_workspace_schema(conn)?;
+    Ok(())
+}
+
+const LEGACY_SESSION_BASE_COLUMNS: &[&str] = &[
+    "session_id",
+    "workspace",
+    "name",
+    "parent_id",
+    "created_at",
+    "updated_at",
+    "last_user_message_at",
+    "state",
+    "status",
+    "message_count",
+    "task_management_json",
+    "management_json",
+    "session_json",
+    "todos_json",
+];
+const LEGACY_SESSION_EXTRA_COLUMNS: &[&str] =
+    &["execution_id", "execution_epoch", "snapshot_revision"];
+const CANONICAL_SESSION_SEQUENCE_COLUMNS: &[&str] = &[
+    "next_context_sequence",
+    "retained_from_sequence",
+    "next_management_sequence",
+];
+
+fn database_tables(conn: &Connection) -> Result<BTreeSet<String>> {
+    Ok(conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?)
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    Ok(conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn prepare_workspace_schema(conn: &Connection) -> Result<()> {
+    let actual_tables = database_tables(conn)?;
+    if actual_tables.is_empty() {
+        return Ok(());
+    }
+    let expected_tables = WORKSPACE_SCHEMA
+        .iter()
+        .map(|(table, _)| (*table).to_string())
+        .collect::<BTreeSet<_>>();
+    if actual_tables == expected_tables {
+        return require_workspace_schema(conn);
+    }
+    let required_legacy_tables =
+        BTreeSet::from(["sessions".to_string(), "session_records".to_string()]);
+    if !required_legacy_tables.is_subset(&actual_tables)
+        || !actual_tables.is_subset(&expected_tables)
+    {
+        anyhow::bail!(
+            "incompatible workspace session database schema: expected a canonical table subset, found {actual_tables:?}; start with a clean canonical database"
+        );
+    }
+
+    let session_columns = table_columns(conn, "sessions")?;
+    let preserves_canonical_base = session_columns
+        .iter()
+        .take(LEGACY_SESSION_BASE_COLUMNS.len())
+        .map(String::as_str)
+        .eq(LEGACY_SESSION_BASE_COLUMNS.iter().copied());
+    if !preserves_canonical_base {
+        anyhow::bail!(
+            "incompatible workspace session database schema: legacy sessions columns {session_columns:?} do not preserve the canonical base"
+        );
+    }
+    let allowed_tail = LEGACY_SESSION_EXTRA_COLUMNS
+        .iter()
+        .chain(CANONICAL_SESSION_SEQUENCE_COLUMNS)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let invalid_tail = session_columns[LEGACY_SESSION_BASE_COLUMNS.len()..]
+        .iter()
+        .filter(|column| !allowed_tail.contains(column.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !invalid_tail.is_empty() {
+        anyhow::bail!(
+            "incompatible workspace session database schema: unsupported legacy sessions columns {invalid_tail:?}"
+        );
+    }
+    let expected_records = WORKSPACE_SCHEMA
+        .iter()
+        .find(|(table, _)| *table == "session_records")
+        .map(|(_, columns)| *columns)
+        .expect("workspace schema must define session_records");
+    let actual_records = table_columns(conn, "session_records")?;
+    if actual_records
+        != expected_records
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect::<Vec<_>>()
+    {
+        anyhow::bail!(
+            "incompatible workspace session database schema: table session_records has columns {actual_records:?}, expected {expected_records:?}"
+        );
+    }
+    for (table, expected_columns) in WORKSPACE_SCHEMA {
+        if matches!(*table, "sessions" | "session_records") || !actual_tables.contains(*table) {
+            continue;
+        }
+        let actual_columns = table_columns(conn, table)?;
+        if actual_columns
+            != expected_columns
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect::<Vec<_>>()
+        {
+            anyhow::bail!(
+                "incompatible workspace session database schema: table {table} has columns {actual_columns:?}, expected {expected_columns:?}"
+            );
+        }
+    }
+    for column in CANONICAL_SESSION_SEQUENCE_COLUMNS {
+        if !session_columns.iter().any(|actual| actual == column) {
+            conn.execute(
+                &format!("ALTER TABLE sessions ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn require_workspace_schema(conn: &Connection) -> Result<()> {
+    let actual_tables = database_tables(conn)?;
+    let expected_tables = WORKSPACE_SCHEMA
+        .iter()
+        .map(|(table, _)| (*table).to_string())
+        .collect::<BTreeSet<_>>();
+    if actual_tables != expected_tables {
+        anyhow::bail!(
+            "incompatible workspace session database schema: expected tables {expected_tables:?}, found {actual_tables:?}; start with a clean canonical database"
+        );
+    }
+    for (table, expected_columns) in WORKSPACE_SCHEMA {
+        let actual_columns = table_columns(conn, table)?;
+        if *table == "sessions" {
+            let actual = actual_columns
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let expected = expected_columns.iter().copied().collect::<BTreeSet<_>>();
+            let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+            let unsupported = actual
+                .difference(&expected)
+                .copied()
+                .filter(|column| !LEGACY_SESSION_EXTRA_COLUMNS.contains(column))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() || !unsupported.is_empty() {
+                anyhow::bail!(
+                    "incompatible workspace session database schema: table sessions missing {missing:?}, unsupported {unsupported:?}"
+                );
+            }
+        } else if actual_columns
+            != expected_columns
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect::<Vec<_>>()
+        {
+            anyhow::bail!(
+                "incompatible workspace session database schema: table {table} has columns {actual_columns:?}, expected {expected_columns:?}; start with a clean canonical database"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -400,13 +577,7 @@ fn require_canonical_schema(
     database: &str,
     expected: &[(&str, &[&str])],
 ) -> Result<()> {
-    let actual_tables = conn
-        .prepare(
-            "SELECT name FROM sqlite_master
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-        )?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    let actual_tables = database_tables(conn)?;
     if actual_tables.is_empty() {
         return Ok(());
     }
@@ -420,10 +591,7 @@ fn require_canonical_schema(
         );
     }
     for (table, expected_columns) in expected {
-        let actual_columns = conn
-            .prepare(&format!("PRAGMA table_info({table})"))?
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let actual_columns = table_columns(conn, table)?;
         if actual_columns
             != expected_columns
                 .iter()

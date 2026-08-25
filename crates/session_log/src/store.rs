@@ -7,6 +7,7 @@ mod helpers;
 mod payload;
 mod read;
 mod runtime_events;
+mod runtime_recovery;
 mod session_commands;
 mod write;
 

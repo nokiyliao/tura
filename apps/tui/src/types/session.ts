@@ -82,6 +82,7 @@ export interface CreateSessionRequest {
   model_acceleration_enabled?: boolean;
   kill_processes_on_start?: boolean;
   validator_enabled?: boolean;
+  disable_permission_restrictions?: boolean;
   force_planning?: boolean;
   auto_session_name?: boolean;
 }
@@ -101,12 +102,14 @@ export interface PromptPayload {
   source: "cli" | "tui";
   variant?: string;
   model_acceleration_enabled?: boolean;
+  jspace_contract?: unknown;
+  task_context_capsule?: unknown;
   [key: string]: unknown;
 }
 
 export interface RunResult {
   sessionID: string;
-  status: "completed" | "failed" | "timeout" | "permission_required";
+  status: "completed" | "failed" | "timeout" | "permission_required" | "detached";
   finalText: string;
   messages: Message[];
   usage: unknown | null;

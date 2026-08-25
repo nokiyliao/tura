@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod jspace;
 pub mod process_hardening;
 pub mod shell_fallback;
 pub mod workspace_git;

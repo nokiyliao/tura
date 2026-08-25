@@ -4,7 +4,7 @@ use crate::gateway_events::{
 };
 use crate::manas::constants::PLANNING_TOOL;
 use crate::manas::prompt_messages::push_no_tool_task_status_retry_message;
-use crate::manas::runtime_turn::execute_turn;
+use crate::manas::runtime_turn::{execute_turn, RetryProviderInput};
 use crate::manas::tool_catalog::{command_run_commands_for_agent, planning_child_depth};
 use crate::manas::TASK_STATUS_COMMAND;
 use crate::manas::{user_visible_runtime_output_text, user_visible_runtime_text};
@@ -29,7 +29,8 @@ use crate::context::{
 };
 use crate::manas::ManasOverrides;
 use crate::provider_flow::errors::{
-    provider_timeout_retry_wait, runtime_failure_allows_retry, runtime_failure_text,
+    provider_timeout_retry_wait, runtime_failure_allows_retry,
+    runtime_failure_requires_exact_input, runtime_failure_text,
 };
 use crate::runtime_event_writer::{RuntimeEventWriter, RuntimeFeedPublisher};
 use crate::state_machine::agent_management::AgentManagement;
@@ -55,6 +56,8 @@ pub(crate) struct ManasInput<'a> {
     pub(crate) initial_messages: Vec<serde_json::Value>,
     pub(crate) redis_url: &'a str,
     pub(crate) initial_runtime_id: Option<RuntimeId>,
+    pub(crate) initial_fallback_from_id: Option<RuntimeId>,
+    pub(crate) initial_retry_provider_input: Option<RetryProviderInput>,
     pub(crate) runtime_event_writer: Option<RuntimeEventWriter>,
     pub(crate) session_delta_writer: Option<SessionDeltaWriter>,
 }
@@ -75,6 +78,8 @@ pub(crate) fn process_manas_internal(
         initial_messages,
         redis_url,
         mut initial_runtime_id,
+        initial_fallback_from_id,
+        mut initial_retry_provider_input,
         mut runtime_event_writer,
         mut session_delta_writer,
     } = input;
@@ -103,7 +108,7 @@ pub(crate) fn process_manas_internal(
         .unwrap_or_default();
     let mut current_messages = initial_messages.clone();
     let mut last_runtime_id: Option<RuntimeId> = None;
-    let mut fallback_from_id: Option<RuntimeId> = None;
+    let mut fallback_from_id = initial_fallback_from_id;
     let original_user_task = session.input.user_input.clone();
     let mut turn = 0_u64;
     let mut provider_timeout_retries = 0_u8;
@@ -159,6 +164,7 @@ pub(crate) fn process_manas_internal(
             false,
             initial_runtime_id.take(),
             fallback_from_id.take(),
+            initial_retry_provider_input.take(),
             runtime_event_writer.as_mut(),
         ) {
             Ok(result) => result,
@@ -230,16 +236,21 @@ pub(crate) fn process_manas_internal(
                     final_session_state = SessionState::Failed;
                     break;
                 }
-                let removed_media = provider_media_fallback(&error_text)
-                    .and_then(ProviderMediaFallback::retry_content_type)
-                    .map(|content_type| {
-                        let removed = replace_unsupported_content_type_in_messages(
-                            &mut current_messages,
-                            content_type,
-                        );
-                        (content_type, removed)
+                let exact_input_retry = runtime_failure_requires_exact_input(&runtime);
+                let removed_media = (!exact_input_retry)
+                    .then(|| {
+                        provider_media_fallback(&error_text)
+                            .and_then(ProviderMediaFallback::retry_content_type)
+                            .map(|content_type| {
+                                let removed = replace_unsupported_content_type_in_messages(
+                                    &mut current_messages,
+                                    content_type,
+                                );
+                                (content_type, removed)
+                            })
+                            .filter(|(_, removed)| *removed > 0)
                     })
-                    .filter(|(_, removed)| *removed > 0);
+                    .flatten();
                 provider_timeout_retries = provider_timeout_retries.saturating_add(1);
                 warn!(
                     session_id = %session.session_id,
@@ -261,14 +272,18 @@ pub(crate) fn process_manas_internal(
                         )),
                     );
                 }
-                tail_injection::append_tail_prompt(
-                    &mut current_messages,
-                    tail_injection::TailPrompt::developer(provider_retry::transient_failure_retry(
-                        &error_text,
-                        provider_timeout_retries,
-                        3,
-                    )),
-                );
+                if !exact_input_retry {
+                    tail_injection::append_tail_prompt(
+                        &mut current_messages,
+                        tail_injection::TailPrompt::developer(
+                            provider_retry::transient_failure_retry(
+                                &error_text,
+                                provider_timeout_retries,
+                                3,
+                            ),
+                        ),
+                    );
+                }
                 fallback_from_id = Some(runtime.runtime_id.clone());
                 seal_runtime_feed(&mut runtime_event_writer, &runtime.runtime_id)?;
                 continue;
@@ -648,7 +663,7 @@ pub(crate) fn process_manas_internal(
                     supports_planning,
                     supports_task_status,
                     false,
-                ) && should_continue_no_tool_task_status_retry(session, no_tool_retries)
+                ) && should_continue_no_tool_task_status_retry(no_tool_retries)
                 {
                     no_tool_retries = no_tool_retries.saturating_add(1);
                     push_no_tool_task_status_retry_message(&mut current_messages, session);
@@ -704,7 +719,7 @@ pub(crate) fn process_manas_internal(
                 break;
             }
 
-            if should_continue_no_tool_task_status_retry(session, no_tool_retries) {
+            if should_continue_no_tool_task_status_retry(no_tool_retries) {
                 no_tool_retries = no_tool_retries.saturating_add(1);
                 push_no_tool_task_status_retry_message(&mut current_messages, session);
                 if let Some(next_task) = active_doing_task_user_message(session) {
@@ -832,13 +847,7 @@ fn should_retry_no_tool_task_status(
     supports_planning && has_active_doing_task
 }
 
-fn should_continue_no_tool_task_status_retry(
-    session: &SessionManagement,
-    no_tool_retries: u64,
-) -> bool {
-    if session.goal_mode {
-        return true;
-    }
+fn should_continue_no_tool_task_status_retry(no_tool_retries: u64) -> bool {
     no_tool_retries < u64::from(no_tool_retry_limit())
 }
 
@@ -942,6 +951,7 @@ fn run_terminal_final_response_turn(
         false,
         true,
         true,
+        None,
         None,
         None,
         runtime_event_writer.as_deref_mut(),
@@ -1325,20 +1335,11 @@ mod tests {
     }
 
     #[test]
-    fn goal_mode_no_tool_retry_ignores_retry_limit() {
-        let mut session = test_session("session-goal-retry-budget");
-        session.goal_mode = true;
-
-        assert!(should_continue_no_tool_task_status_retry(&session, 0));
-        assert!(should_continue_no_tool_task_status_retry(&session, 20));
-        assert!(should_continue_no_tool_task_status_retry(&session, 10_000));
-
-        session.goal_mode = false;
-        assert!(should_continue_no_tool_task_status_retry(&session, 0));
-        assert!(!should_continue_no_tool_task_status_retry(
-            &session,
-            u64::from(no_tool_retry_limit())
-        ));
+    fn no_tool_retry_budget_applies_to_goal_mode_too() {
+        assert!(should_continue_no_tool_task_status_retry(0));
+        assert!(!should_continue_no_tool_task_status_retry(u64::from(
+            no_tool_retry_limit()
+        )));
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod call;
 pub mod checkpointing;
 pub mod command_run_streaming;
 pub mod errors;
+mod official_codex;
 pub mod provider_response;
 pub mod provider_streaming;
 pub mod request_options;

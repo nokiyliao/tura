@@ -130,14 +130,12 @@ async fn handle_socket_connection(
     state: crate::app::AppState,
     stream: tokio::net::TcpStream,
 ) -> anyhow::Result<()> {
-    use std::collections::HashMap;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::sync::Mutex as AsyncMutex;
 
     let connection_guard = ConnectionLifecycleGuard::new(state.lifecycle.clone());
     let (read, write) = stream.into_split();
     let write = Arc::new(AsyncMutex::new(write));
-    let active_sessions = Arc::new(AsyncMutex::new(HashMap::<String, String>::new()));
     let pending_tasks = Arc::new(AsyncMutex::new(Vec::<tokio::task::JoinHandle<()>>::new()));
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
@@ -160,20 +158,14 @@ async fn handle_socket_connection(
         };
         state.lifecycle.mark_activity();
         let active_runtime = enqueue_turn_identity(&parsed);
-        if let Some((session_id, runtime_id)) = active_runtime.as_ref() {
-            active_sessions
-                .lock()
-                .await
-                .insert(session_id.clone(), runtime_id.clone());
-        }
         let abort_on_disconnect = should_abort_request_on_connection_close(&parsed);
         let state_for_task = state.clone();
         let write_for_task = Arc::clone(&write);
-        let active_sessions_for_task = Arc::clone(&active_sessions);
         let feed_forwarder = if let Some((session_id, _)) = active_runtime.as_ref() {
             match start_session_round_forwarder(
                 session_id.clone(),
                 parsed.request_id.clone(),
+                state.execution.clone(),
                 Arc::clone(&write),
             )
             .await
@@ -194,12 +186,6 @@ async fn handle_socket_connection(
             if let Some(forwarder) = feed_forwarder {
                 forwarder.stop().await;
             }
-            if let Some((session_id, runtime_id)) = active_runtime.as_ref() {
-                let mut active = active_sessions_for_task.lock().await;
-                if active.get(session_id) == Some(runtime_id) {
-                    active.remove(session_id);
-                }
-            }
             if let Ok(encoded) = serde_json::to_string(&response) {
                 let mut writer = write_for_task.lock().await;
                 let _ = writer.write_all(format!("{encoded}\n").as_bytes()).await;
@@ -210,24 +196,6 @@ async fn handle_socket_connection(
             pending_tasks.lock().await.push(handle);
         }
     }
-    let sessions = active_sessions
-        .lock()
-        .await
-        .iter()
-        .map(|(session_id, runtime_id)| (session_id.clone(), runtime_id.clone()))
-        .collect::<Vec<_>>();
-    for (session_id, runtime_id) in sessions {
-        let _ = state
-            .execution
-            .cancel_turn(
-                &state,
-                json!({
-                    "session_id": session_id,
-                    "runtime_id": runtime_id,
-                }),
-            )
-            .await;
-    }
     let tasks = pending_tasks.lock().await.drain(..).collect::<Vec<_>>();
     for task in tasks {
         task.abort();
@@ -237,6 +205,74 @@ async fn handle_socket_connection(
 }
 
 type SocketWriter = Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>;
+
+#[derive(Default)]
+struct TerminalCallbackGate {
+    callbacks: std::collections::HashMap<String, serde_json::Value>,
+    deliveries:
+        std::collections::HashMap<String, crate::services::execution::TerminalDeliveryIdentity>,
+    completed: std::collections::HashSet<String>,
+}
+
+impl TerminalCallbackGate {
+    fn accept_callback(
+        &mut self,
+        runtime_id: String,
+        callback: serde_json::Value,
+    ) -> anyhow::Result<
+        Option<(
+            serde_json::Value,
+            crate::services::execution::TerminalDeliveryIdentity,
+        )>,
+    > {
+        if self.completed.contains(&runtime_id) {
+            return Ok(None);
+        }
+        if let Some(delivery) = self.deliveries.remove(&runtime_id) {
+            self.completed.insert(runtime_id);
+            return Ok(Some((callback, delivery)));
+        }
+        if let Some(existing) = self.callbacks.get(&runtime_id) {
+            if existing == &callback {
+                return Ok(None);
+            }
+            return Err(anyhow::anyhow!(
+                "TERMINAL_CALLBACK_IDENTITY_CONFLICT:{runtime_id}"
+            ));
+        }
+        self.callbacks.insert(runtime_id, callback);
+        Ok(None)
+    }
+
+    fn accept_delivery(
+        &mut self,
+        delivery: crate::services::execution::TerminalDeliveryIdentity,
+    ) -> anyhow::Result<
+        Option<(
+            serde_json::Value,
+            crate::services::execution::TerminalDeliveryIdentity,
+        )>,
+    > {
+        let runtime_id = delivery.runtime_id.clone();
+        if self.completed.contains(&runtime_id) {
+            return Ok(None);
+        }
+        if let Some(callback) = self.callbacks.remove(&runtime_id) {
+            self.completed.insert(runtime_id);
+            return Ok(Some((callback, delivery)));
+        }
+        if let Some(existing) = self.deliveries.get(&runtime_id) {
+            if existing == &delivery {
+                return Ok(None);
+            }
+            return Err(anyhow::anyhow!(
+                "TERMINAL_DELIVERY_IDENTITY_CONFLICT:{runtime_id}"
+            ));
+        }
+        self.deliveries.insert(runtime_id, delivery);
+        Ok(None)
+    }
+}
 
 struct SessionRoundForwarder {
     cancellation: Option<SessionFeedSubscriptionCancellation>,
@@ -269,41 +305,100 @@ impl Drop for SessionRoundForwarder {
 async fn start_session_round_forwarder(
     session_id: String,
     request_id: String,
+    execution: crate::services::execution::ExecutionService,
     write: SocketWriter,
 ) -> anyhow::Result<SessionRoundForwarder> {
     let subscription = tokio::task::spawn_blocking(open_session_feed_subscription)
         .await
         .map_err(|error| anyhow::anyhow!("session feed subscriber task failed: {error}"))??;
     let cancellation = subscription.cancellation_handle()?;
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+    let writer_execution = execution.clone();
     let reader = tokio::task::spawn_blocking(move || {
         let mut subscription = subscription;
+        let mut terminal_gate = TerminalCallbackGate::default();
         while let Ok(Some(entry)) = subscription.next_entry() {
-            let Some(callback) = session_round_callback(entry, &session_id, &request_id) else {
-                continue;
-            };
-            if sender.send(callback).is_err() {
-                break;
+            let terminal_callback = agent_message_is_terminal(&entry);
+            if let Some(callback) = session_round_callback(entry.clone(), &session_id, &request_id)
+                && let Some(runtime_id) = entry.runtime_id.as_ref()
+            {
+                if terminal_callback {
+                    match terminal_gate.accept_callback(runtime_id.clone(), callback) {
+                        Ok(Some((callback, delivery))) => {
+                            if sender
+                                .blocking_send((vec![callback], Some(delivery)))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("router terminal callback blocked: {error:#}");
+                            return;
+                        }
+                    }
+                } else if sender.blocking_send((vec![callback], None)).is_err() {
+                    return;
+                }
+            }
+            if entry.session_id == session_id {
+                match execution.intake_terminal_feed_entry(&entry, &request_id) {
+                    Ok(Some(delivery)) => match terminal_gate.accept_delivery(delivery) {
+                        Ok(Some((callback, delivery))) => {
+                            if sender
+                                .blocking_send((vec![callback], Some(delivery)))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("router terminal delivery blocked: {error:#}");
+                            return;
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "router terminal receipt intake blocked for {session_id}: {error:#}"
+                        );
+                    }
+                }
             }
         }
     });
     let writer = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
 
-        while let Some(callback) = receiver.recv().await {
-            let Ok(encoded) = serde_json::to_string(&callback) else {
-                continue;
-            };
+        while let Some((callbacks, delivery)) = receiver.recv().await {
             let mut writer = write.lock().await;
-            if writer
-                .write_all(format!("{encoded}\n").as_bytes())
-                .await
-                .is_err()
-            {
+            let mut batch_delivered = true;
+            for callback in callbacks {
+                let Ok(encoded) = serde_json::to_string(&callback) else {
+                    batch_delivered = false;
+                    break;
+                };
+                if writer
+                    .write_all(format!("{encoded}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    batch_delivered = false;
+                    break;
+                }
+            }
+            if !batch_delivered || writer.flush().await.is_err() {
                 break;
             }
-            if writer.flush().await.is_err() {
-                break;
+            if let Some(delivery) = delivery
+                && let Err(error) = writer_execution.acknowledge_terminal_delivery(&delivery)
+            {
+                eprintln!(
+                    "router terminal callback acknowledgement blocked for {}: {error:#}",
+                    delivery.commander_session_id
+                );
             }
         }
     });
@@ -361,8 +456,21 @@ fn session_round_callback(
     }))
 }
 
+fn agent_message_is_terminal(entry: &SessionFeedEntry) -> bool {
+    matches!(
+        &entry.event,
+        SessionFeedEvent::AgentMessage {
+            runtime_status: Some(status),
+            ..
+        } if !status.live
+    )
+}
+
 fn should_abort_request_on_connection_close(request: &IpcRequest) -> bool {
-    request.method != "execution.command_run"
+    !matches!(
+        request.method.as_str(),
+        "execution.command_run" | "execution.enqueue_turn"
+    )
 }
 
 struct ConnectionLifecycleGuard {
@@ -436,7 +544,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[test]
-    fn command_run_requests_are_detached_from_runtime_socket_disconnect() {
+    fn durable_execution_requests_are_detached_from_runtime_socket_disconnect() {
         let request = IpcRequest {
             request_id: "command-run".to_string(),
             kind: "call".to_string(),
@@ -448,6 +556,12 @@ mod tests {
 
         let request = IpcRequest {
             method: "execution.enqueue_turn".to_string(),
+            ..request
+        };
+        assert!(!should_abort_request_on_connection_close(&request));
+
+        let request = IpcRequest {
+            method: "execution.get_status".to_string(),
             ..request
         };
         assert!(should_abort_request_on_connection_close(&request));
@@ -492,6 +606,47 @@ mod tests {
     }
 
     #[test]
+    fn only_terminal_agent_message_is_held_for_durable_delivery() {
+        let base = SessionFeedEntry {
+            session_id: "session-1".to_string(),
+            cursor: 7,
+            runtime_id: Some("runtime-1".to_string()),
+            event_id: "runtime-1:feed:3".to_string(),
+            event: SessionFeedEvent::AgentMessage {
+                message_id: "runtime-1.message".to_string(),
+                part_id: "runtime-1.message".to_string(),
+                reply_message: "progress".to_string(),
+                new_learning: String::new(),
+                runtime_status: None,
+                context_tokens: None,
+                usage: None,
+                created_at: 10,
+                updated_at: 20,
+            },
+        };
+        assert!(!agent_message_is_terminal(&base));
+
+        let terminal = SessionFeedEntry {
+            event: SessionFeedEvent::AgentMessage {
+                message_id: "runtime-1.message".to_string(),
+                part_id: "runtime-1.message".to_string(),
+                reply_message: "done".to_string(),
+                new_learning: String::new(),
+                runtime_status: Some(lifecycle::RuntimeProjection::new(
+                    "runtime-1".to_string(),
+                    lifecycle::RuntimeState::Finished,
+                )),
+                context_tokens: None,
+                usage: None,
+                created_at: 10,
+                updated_at: 21,
+            },
+            ..base
+        };
+        assert!(agent_message_is_terminal(&terminal));
+    }
+
+    #[test]
     fn round_callback_ignores_other_sessions_and_non_message_events() {
         let entry = SessionFeedEntry {
             session_id: "session-1".to_string(),
@@ -520,6 +675,57 @@ mod tests {
             ..entry
         };
         assert!(session_round_callback(agent_entry, "session-2", "request-1").is_none());
+    }
+
+    #[test]
+    fn terminal_callback_gate_pairs_callback_before_delivery_once() {
+        let mut gate = TerminalCallbackGate::default();
+        let callback = json!({"text": "done"});
+        assert!(gate
+            .accept_callback("runtime-1".to_string(), callback.clone())
+            .expect("queue callback")
+            .is_none());
+        let delivery = terminal_delivery("runtime-1");
+        let (paired_callback, paired_delivery) = gate
+            .accept_delivery(delivery.clone())
+            .expect("pair delivery")
+            .expect("ready pair");
+        assert_eq!(paired_callback, callback);
+        assert_eq!(paired_delivery, delivery);
+        assert!(gate
+            .accept_delivery(terminal_delivery("runtime-1"))
+            .expect("ignore duplicate delivery")
+            .is_none());
+    }
+
+    #[test]
+    fn terminal_callback_gate_pairs_delivery_before_callback_once() {
+        let mut gate = TerminalCallbackGate::default();
+        let delivery = terminal_delivery("runtime-2");
+        assert!(gate
+            .accept_delivery(delivery.clone())
+            .expect("queue delivery")
+            .is_none());
+        let callback = json!({"text": "done later"});
+        let (paired_callback, paired_delivery) = gate
+            .accept_callback("runtime-2".to_string(), callback.clone())
+            .expect("pair callback")
+            .expect("ready pair");
+        assert_eq!(paired_callback, callback);
+        assert_eq!(paired_delivery, delivery);
+        assert!(gate
+            .accept_callback("runtime-2".to_string(), callback)
+            .expect("ignore duplicate callback")
+            .is_none());
+    }
+
+    fn terminal_delivery(runtime_id: &str) -> crate::services::execution::TerminalDeliveryIdentity {
+        crate::services::execution::TerminalDeliveryIdentity {
+            commander_session_id: "commander-1".to_string(),
+            transaction_id: "transaction-1".to_string(),
+            event_id: format!("{runtime_id}:terminal"),
+            runtime_id: runtime_id.to_string(),
+        }
     }
 
     #[tokio::test]

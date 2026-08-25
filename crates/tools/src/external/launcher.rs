@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-const DEFAULT_EXTERNAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_EXTERNAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub async fn invoke(
     command_id: &str,

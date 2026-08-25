@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveGatewayUrl, gatewayUrlIsExplicit, resolveCwd } from "./gateway/directory.js";
-import { ensureGatewayAvailable } from "./gateway/autostart.js";
+import { connectGatewayAvailable } from "./gateway/autostart.js";
 import {
   CliUsageError,
   type CliContext,
@@ -129,10 +129,9 @@ function hasHelp(args: string[]): boolean {
 
 async function gatewayContext(context: CliContext): Promise<CliContext> {
   if (context.mock) return context;
-  const gatewayUrl = await ensureGatewayAvailable(
+  const gatewayUrl = await connectGatewayAvailable(
     context.gatewayUrl,
     plainCapabilities(),
-    context.dev,
     context.gatewayUrlExplicit,
   );
   return { ...context, gatewayUrl };
@@ -236,7 +235,10 @@ export function parseRun(
   let modelAccelerationEnabled: boolean | undefined;
   let killProcessesOnStart: boolean | undefined;
   let validatorEnabled: boolean | undefined;
+  let disablePermissionRestrictions: boolean | undefined;
   let commandRunShell: CommandRunShell | undefined = commandRunShellOverride;
+  let jspaceContract: unknown;
+  let taskContextCapsule: unknown;
   let output: OutputMode = rootJson ? "json" : "text";
   let stream = true;
   let timeoutSec = 600;
@@ -273,6 +275,17 @@ export function parseRun(
       modelAccelerationEnabled = false;
     else if (arg === "-p" || arg === "--priority") modelAccelerationEnabled = true;
     else if (isCommandRunShellFlag(arg)) commandRunShell = shellValue(arg.slice(2));
+    else if (arg === "--jspace-contract")
+      jspaceContract = readJsonArgument(args[++index], "--jspace-contract");
+    else if (arg.startsWith("--jspace-contract="))
+      jspaceContract = readJsonArgument(arg.slice("--jspace-contract=".length), "--jspace-contract");
+    else if (arg === "--task-context-capsule")
+      taskContextCapsule = readJsonArgument(args[++index], "--task-context-capsule");
+    else if (arg.startsWith("--task-context-capsule="))
+      taskContextCapsule = readJsonArgument(
+        arg.slice("--task-context-capsule=".length),
+        "--task-context-capsule",
+      );
     else if (arg === "--output") output = parseOutput(args[++index]);
     else if (arg === "--json") output = "json";
     else if (arg === "--stream") stream = true;
@@ -289,6 +302,7 @@ export function parseRun(
         modelAccelerationEnabled,
         killProcessesOnStart,
         validatorEnabled,
+        disablePermissionRestrictions,
         commandRunShell,
       } = applyRunOverrides(
         {
@@ -299,6 +313,7 @@ export function parseRun(
           modelAccelerationEnabled,
           killProcessesOnStart,
           validatorEnabled,
+          disablePermissionRestrictions,
           commandRunShell,
         },
         overrides,
@@ -313,6 +328,7 @@ export function parseRun(
         modelAccelerationEnabled,
         killProcessesOnStart,
         validatorEnabled,
+        disablePermissionRestrictions,
         commandRunShell,
       } = applyRunOverrides(
         {
@@ -323,6 +339,7 @@ export function parseRun(
           modelAccelerationEnabled,
           killProcessesOnStart,
           validatorEnabled,
+          disablePermissionRestrictions,
           commandRunShell,
         },
         overrides,
@@ -340,13 +357,25 @@ export function parseRun(
     modelAccelerationEnabled: modelAccelerationEnabled ?? DEFAULT_MODEL_ACCELERATION_ENABLED,
     killProcessesOnStart,
     validatorEnabled,
+    disablePermissionRestrictions,
     commandRunShell,
+    jspaceContract,
+    taskContextCapsule,
     output,
     stream,
     timeoutSec,
     lastMessageFile,
     source: "cli",
   };
+}
+
+function readJsonArgument(path: string | undefined, flag: string): unknown {
+  if (!path) throw new CliUsageError(`${flag} requires a JSON file path`);
+  try {
+    return JSON.parse(readFileSync(resolve(path), "utf8"));
+  } catch (error) {
+    throw new CliUsageError(`${flag} could not read valid JSON from ${path}: ${String(error)}`);
+  }
 }
 
 export function commandRunShellForCommand(command: string): CommandRunShell | undefined {
