@@ -8,7 +8,8 @@ use tracing::error;
 use crate::profile_timings;
 use crate::provider_flow::checkpointing;
 use crate::provider_flow::errors::{
-    finish_provider_call_failure, finish_runtime_failure, runtime_timeout,
+    finish_provider_call_failure, finish_runtime_failure,
+    finish_runtime_failure_with_retry_policy, runtime_timeout,
 };
 use crate::provider_flow::official_codex::{
     call_runtime_official_codex, OfficialCodexRuntimeInput,
@@ -193,9 +194,26 @@ pub(crate) async fn call_runtime_with_writer(
         }),
     );
 
-    let official_provider = route_config
-        .official_codex_app_server_provider()
-        .map_err(|error| format!("official Codex admission rejected route: {error}"))?;
+    let official_provider = match route_config.official_codex_app_server_provider() {
+        Ok(provider) => provider,
+        Err(error) => {
+            let finished_at = Utc::now();
+            let message = format!("official Codex admission rejected route: {error}");
+            runtime.set_output(serde_json::json!({"error": message}))?;
+            flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
+            finish_runtime_failure_with_retry_policy(
+                &mut runtime,
+                finished_at,
+                "PROVIDER_ROUTE_ADMISSION_REJECTED",
+                message,
+                RuntimeState::Failed,
+                false,
+            )?;
+            flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
+            checkpointing::best_effort_turn_failed(&runtime);
+            return Ok(runtime);
+        }
+    };
     let call_result = if let Some(provider) = official_provider {
         call_runtime_official_codex(
             &mut runtime,
@@ -441,6 +459,64 @@ mod tests {
             model_catalog: ModelCatalog::default(),
             provider_enums: ProviderEnumCatalog::default(),
         })
+    }
+
+    fn legacy_codex_settings() -> Arc<Settings> {
+        Arc::new(Settings {
+            provider_base_url: HashMap::new(),
+            routes: HashMap::from([(
+                "legacy-codex-route".to_string(),
+                RouteConfig {
+                    default_temperature: 0.0,
+                    providers: vec![LlmProviderConfig {
+                        provider: "codex".to_string(),
+                        base_url: "http://127.0.0.1:9".to_string(),
+                        model: "gpt-5.6-sol".to_string(),
+                        temperature: 0.0,
+                    }],
+                },
+            )]),
+            model_catalog: ModelCatalog::default(),
+            provider_enums: ProviderEnumCatalog::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_admission_finishes_non_retryable_runtime_without_network() {
+        let runtime = call_runtime(
+            CallRuntimeInput {
+                runtime: runtime(),
+                messages: vec![json!({ "role": "user", "content": "hello" })],
+                tools: Vec::new(),
+                provider_name: "legacy-codex-route".to_string(),
+                stream: false,
+                max_tokens: 128,
+                tool_choice: None,
+                session_directory: std::env::temp_dir(),
+                allowed_command_run_commands: Some(BTreeSet::new()),
+                disable_permission_restrictions: false,
+                jspace_contract: None,
+                require_startup_task_state: false,
+            },
+            legacy_codex_settings(),
+            Arc::new(TuraConfig::new(".env.legacy-codex-admission-test")),
+        )
+        .await
+        .expect("legacy route rejection should be captured on the runtime");
+
+        assert_eq!(runtime.state, lifecycle::RuntimeState::Failed);
+        let error = runtime.error.expect("runtime error should be set");
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("PROVIDER_ROUTE_ADMISSION_REJECTED")
+        );
+        assert!(!error.retry_allowed);
+        assert!(!error.fallback_allowed);
+        assert!(error
+            .error_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("legacy provider 'codex' is disabled"));
     }
 
     #[tokio::test]
