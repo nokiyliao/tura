@@ -122,6 +122,14 @@ pub(crate) async fn call_runtime_with_writer(
         }),
     );
 
+    if legacy_codex_provider_requested(&input.provider_name) {
+        return finish_provider_route_admission_failure(
+            runtime,
+            runtime_event_writer,
+            "legacy provider 'codex' is disabled; use 'official_codex_app_server'".to_string(),
+        );
+    }
+
     let direct_route = route_for_provider_name(tura_settings.as_ref(), &input.provider_name);
     let configured_route = route_by_name(tura_settings.as_ref(), &input.provider_name);
     let route_config_base = direct_route
@@ -197,21 +205,11 @@ pub(crate) async fn call_runtime_with_writer(
     let official_provider = match route_config.official_codex_app_server_provider() {
         Ok(provider) => provider,
         Err(error) => {
-            let finished_at = Utc::now();
-            let message = format!("official Codex admission rejected route: {error}");
-            runtime.set_output(serde_json::json!({"error": message}))?;
-            flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
-            finish_runtime_failure_with_retry_policy(
-                &mut runtime,
-                finished_at,
-                "PROVIDER_ROUTE_ADMISSION_REJECTED",
-                message,
-                RuntimeState::Failed,
-                false,
-            )?;
-            flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
-            checkpointing::best_effort_turn_failed(&runtime);
-            return Ok(runtime);
+            return finish_provider_route_admission_failure(
+                runtime,
+                runtime_event_writer,
+                format!("official Codex admission rejected route: {error}"),
+            );
         }
     };
     let call_result = if let Some(provider) = official_provider {
@@ -269,6 +267,39 @@ pub(crate) async fn call_runtime_with_writer(
         }
     }
 
+    Ok(runtime)
+}
+
+fn legacy_codex_provider_requested(provider_name: &str) -> bool {
+    provider_name
+        .trim()
+        .split_once('/')
+        .map_or(provider_name.trim(), |(provider, _)| provider.trim())
+        .eq_ignore_ascii_case("codex")
+        || std::env::var("TURA_SESSION_MODEL_OVERRIDE")
+            .ok()
+            .and_then(|value| value.split_once('/').map(|(provider, _)| provider.to_string()))
+            .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("codex"))
+}
+
+fn finish_provider_route_admission_failure(
+    mut runtime: RuntimeAggregate,
+    mut runtime_event_writer: Option<&mut RuntimeEventWriter>,
+    message: String,
+) -> Result<RuntimeAggregate, String> {
+    let finished_at = Utc::now();
+    runtime.set_output(serde_json::json!({"error": message}))?;
+    flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
+    finish_runtime_failure_with_retry_policy(
+        &mut runtime,
+        finished_at,
+        "PROVIDER_ROUTE_ADMISSION_REJECTED",
+        message,
+        RuntimeState::Failed,
+        false,
+    )?;
+    flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
+    checkpointing::best_effort_turn_failed(&runtime);
     Ok(runtime)
 }
 
@@ -512,6 +543,43 @@ mod tests {
         );
         assert!(!error.retry_allowed);
         assert!(!error.fallback_allowed);
+        assert!(error
+            .error_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("legacy provider 'codex' is disabled"));
+    }
+
+    #[tokio::test]
+    async fn explicit_legacy_codex_model_finishes_before_route_resolution() {
+        let runtime = call_runtime(
+            CallRuntimeInput {
+                runtime: runtime(),
+                messages: vec![json!({ "role": "user", "content": "hello" })],
+                tools: Vec::new(),
+                provider_name: "codex/gpt-5.6-sol".to_string(),
+                stream: false,
+                max_tokens: 128,
+                tool_choice: None,
+                session_directory: std::env::temp_dir(),
+                allowed_command_run_commands: Some(BTreeSet::new()),
+                disable_permission_restrictions: false,
+                jspace_contract: None,
+                require_startup_task_state: false,
+            },
+            legacy_codex_settings(),
+            Arc::new(TuraConfig::new(".env.explicit-legacy-codex-test")),
+        )
+        .await
+        .expect("explicit legacy model should be captured on the runtime");
+
+        assert_eq!(runtime.state, lifecycle::RuntimeState::Failed);
+        let error = runtime.error.expect("runtime error should be set");
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("PROVIDER_ROUTE_ADMISSION_REJECTED")
+        );
+        assert!(!error.retry_allowed);
         assert!(error
             .error_text
             .as_deref()
