@@ -3,16 +3,16 @@
 //! Runtime workers orchestrate turns, but shell/tool child processes are owned
 //! here so aborting a runtime worker does not orphan process-tree cleanup.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use code_tools::runtime::tool::CancellationToken;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use tura_path::jspace::{JSpaceAdmissionCache, JSpaceError, JSpaceMatcher};
 
@@ -370,11 +370,11 @@ impl Default for CommandRunService {
 #[cfg(test)]
 mod tests {
     use super::{CommandRunRequest, CommandRunService};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::time::{Duration, Instant};
-    use tura_path::jspace::semantic_sha256;
+    use tura_path::jspace::{authorization_semantic_sha256, semantic_sha256};
 
     const ACTIVE_FIXTURE_DELAY_MS: u64 = 1200;
     const CONCURRENT_FIXTURE_DELAY_MS: u64 = 3000;
@@ -382,25 +382,51 @@ mod tests {
 
     fn jspace_contract(root: &Path) -> Value {
         let mut contract = json!({
-            "schema_version": "jspace_contract_v1",
+            "schema_version": "jspace_contract_v2",
             "repo_root": root,
-            "dcf_generation": {"generation_id": "generation-test"},
+            "dcf_generation": {
+                "repo_root": root,
+                "generation_id": "generation-test",
+                "required_domain_bindings": {
+                    "surface-map": {
+                        "required_domains": ["surface"],
+                        "source_fingerprints": {"surface": "surface-a"}
+                    }
+                }
+            },
             "provenance": {"matched_surface_ids": ["surface-test"]},
             "matched_surface_ids": ["surface-test"],
             "read_scopes": ["src/**"],
             "write_scopes": ["src/**"],
             "allowed_operations": ["read", "create", "modify", "command"],
             "denied_operations": ["network", "install", "system_mutation"],
-            "command_prefixes": ["git status"],
+            "command_templates": [{
+                "argv": ["git", "status", "--short"],
+                "effects": ["read"],
+                "targets": []
+            }],
             "focused_verifiers": [],
-            "declared_targets": [],
+            "declared_targets": ["src/main.rs"],
             "expansion": {
                 "mode": "exact_target_only",
                 "error_code": "JSPACE_EXPANSION_REQUIRED",
                 "mutation_on_expansion": false
             }
         });
-        contract["semantic_sha256"] = Value::String(semantic_sha256(&contract));
+        contract["authorization_semantic_sha256"] =
+            Value::String(authorization_semantic_sha256(&contract).expect("authorization digest"));
+        contract["content_sha256"] = Value::String(semantic_sha256(&contract));
+        contract
+    }
+
+    fn reseal_jspace(mut contract: Value) -> Value {
+        contract
+            .as_object_mut()
+            .expect("contract object")
+            .remove("content_sha256");
+        contract["authorization_semantic_sha256"] =
+            Value::String(authorization_semantic_sha256(&contract).expect("authorization digest"));
+        contract["content_sha256"] = Value::String(semantic_sha256(&contract));
         contract
     }
 
@@ -699,12 +725,7 @@ mod tests {
 
         let mut changed = contract.clone();
         changed["read_scopes"] = json!(["other/**"]);
-        let mut payload = changed.clone();
-        payload
-            .as_object_mut()
-            .expect("contract object")
-            .remove("semantic_sha256");
-        changed["semantic_sha256"] = Value::String(semantic_sha256(&payload));
+        let changed = reseal_jspace(changed);
         let error = service
             .execute(request(changed))
             .await
@@ -741,7 +762,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jspace_denies_unadmitted_shell_prefix_without_running_it() {
+    async fn jspace_denies_unadmitted_exact_shell_command_without_running_it() {
         let workspace = tempfile::tempdir().expect("workspace");
         let service = CommandRunService::new();
         let contract = jspace_contract(workspace.path());
@@ -767,6 +788,39 @@ mod tests {
         assert_eq!(
             response["result"]["results"][0]["jspace_error_code"],
             "JSPACE_COMMAND_DENIED"
+        );
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn jspace_rejects_shell_suffix_injection_before_execution() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let service = CommandRunService::new();
+        let marker = workspace.path().join("injected.txt");
+        let response = service
+            .execute(json!({
+                "session_id": "jspace-injection-session",
+                "runtime_id": "jspace-injection-runtime",
+                "session_directory": workspace.path().display().to_string(),
+                "jspace_contract": jspace_contract(workspace.path()),
+                "arguments": {
+                    "commands": [{
+                        "command": "shell_command",
+                        "command_line": serde_json::to_string(&json!({
+                            "command": format!(
+                                "git status --short; touch {}",
+                                marker.display()
+                            )
+                        })).expect("shell args")
+                    }]
+                }
+            }))
+            .await
+            .expect("denial is a command result");
+
+        assert_eq!(
+            response["result"]["results"][0]["jspace_error_code"],
+            "JSPACE_COMMAND_SYNTAX_UNSAFE"
         );
         assert!(!marker.exists());
     }

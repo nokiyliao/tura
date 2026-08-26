@@ -14,10 +14,21 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub const JSPACE_SCHEMA_VERSION: &str = "jspace_contract_v1";
+pub const JSPACE_SCHEMA_VERSION: &str = "jspace_contract_v2";
+const JSPACE_LEGACY_SCHEMA_VERSION: &str = "jspace_contract_v1";
+const JSPACE_AUTHORIZATION_SCHEMA_VERSION: &str = "jspace_authorization_v1";
 pub const JSPACE_EXPANSION_REQUIRED: &str = "JSPACE_EXPANSION_REQUIRED";
 
-const KNOWN_OPERATIONS: &[&str] = &["read", "create", "modify", "delete", "command"];
+const KNOWN_OPERATIONS: &[&str] = &[
+    "read",
+    "create",
+    "modify",
+    "delete",
+    "command",
+    "network",
+    "install",
+    "system_mutation",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JSpaceError {
@@ -145,80 +156,32 @@ impl PathTrie {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ByteTrieNode {
-    children: HashMap<u8, usize>,
-    terminal: bool,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommandTarget {
+    operation: String,
+    path: String,
+    argv_index: usize,
 }
 
-#[derive(Clone, Debug, Default)]
-struct BytePrefixTrie {
-    nodes: Vec<ByteTrieNode>,
-}
-
-impl BytePrefixTrie {
-    fn new() -> Self {
-        Self {
-            nodes: vec![ByteTrieNode {
-                children: HashMap::new(),
-                terminal: false,
-            }],
-        }
-    }
-
-    fn insert(&mut self, prefix: &str) -> Result<(), JSpaceError> {
-        if prefix.trim().is_empty() {
-            return Err(JSpaceError::new(
-                "JSPACE_COMMAND_PREFIX_INVALID",
-                "command",
-                prefix,
-                "command prefix must be non-empty",
-            ));
-        }
-        let mut node_index = 0;
-        for byte in prefix.as_bytes() {
-            let next_index = if let Some(index) = self.nodes[node_index].children.get(byte) {
-                *index
-            } else {
-                let index = self.nodes.len();
-                self.nodes.push(ByteTrieNode {
-                    children: HashMap::new(),
-                    terminal: false,
-                });
-                self.nodes[node_index].children.insert(*byte, index);
-                index
-            };
-            node_index = next_index;
-        }
-        self.nodes[node_index].terminal = true;
-        Ok(())
-    }
-
-    fn matches(&self, command: &str) -> bool {
-        let mut node_index = 0;
-        for byte in command.as_bytes() {
-            let Some(next_index) = self.nodes[node_index].children.get(byte) else {
-                return false;
-            };
-            node_index = *next_index;
-            if self.nodes[node_index].terminal {
-                return true;
-            }
-        }
-        self.nodes[node_index].terminal
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommandTemplate {
+    argv: Vec<String>,
+    effects: Vec<String>,
+    targets: Vec<CommandTarget>,
 }
 
 #[derive(Clone, Debug)]
 pub struct JSpaceMatcher {
     repo_root: PathBuf,
     lexical_repo_root: PathBuf,
-    digest: String,
+    content_digest: String,
+    authorization_digest: String,
     read_scopes: PathTrie,
     write_scopes: PathTrie,
+    declared_targets: PathTrie,
     allowed_operations: HashSet<String>,
     denied_operations: HashSet<String>,
-    command_prefixes: BytePrefixTrie,
+    command_templates: Vec<CommandTemplate>,
 }
 
 impl JSpaceMatcher {
@@ -232,44 +195,19 @@ impl JSpaceMatcher {
             )
         })?;
         let schema_version = required_string(object, "schema_version")?;
-        if schema_version != JSPACE_SCHEMA_VERSION {
+        if schema_version != JSPACE_SCHEMA_VERSION && schema_version != JSPACE_LEGACY_SCHEMA_VERSION
+        {
             return Err(JSpaceError::new(
                 "JSPACE_SCHEMA_VERSION_UNSUPPORTED",
                 "admission",
                 "",
-                format!("expected {JSPACE_SCHEMA_VERSION}, got {schema_version}"),
+                format!(
+                    "expected {JSPACE_SCHEMA_VERSION} or {JSPACE_LEGACY_SCHEMA_VERSION}, got {schema_version}"
+                ),
             ));
         }
-        let claimed_digest = required_string(object, "semantic_sha256")?;
-        if claimed_digest.len() != 64
-            || !claimed_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(JSpaceError::new(
-                "JSPACE_SEMANTIC_DIGEST_INVALID",
-                "admission",
-                "",
-                "semantic_sha256 must be 64 hexadecimal characters",
-            ));
-        }
-        let mut payload = contract.clone();
-        let payload_object = payload.as_object_mut().ok_or_else(|| {
-            JSpaceError::new(
-                "JSPACE_CONTRACT_MALFORMED",
-                "admission",
-                "",
-                "contract must be an object",
-            )
-        })?;
-        payload_object.remove("semantic_sha256");
-        let expected_digest = semantic_sha256(&payload);
-        if expected_digest != claimed_digest {
-            return Err(JSpaceError::new(
-                "JSPACE_SEMANTIC_DIGEST_MISMATCH",
-                "admission",
-                "",
-                format!("expected {expected_digest}, got {claimed_digest}"),
-            ));
-        }
+        let (content_digest, authorization_digest) =
+            verified_contract_digests(contract, object, &schema_version)?;
 
         let contract_root = PathBuf::from(required_string(object, "repo_root")?);
         let lexical_repo_root = session_root.to_path_buf();
@@ -283,6 +221,30 @@ impl JSpaceMatcher {
                 format!("session root is {}", session_root.display()),
             ));
         }
+        if schema_version == JSPACE_SCHEMA_VERSION {
+            let generation_root = object
+                .get("dcf_generation")
+                .and_then(Value::as_object)
+                .and_then(|generation| generation.get("repo_root"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    JSpaceError::new(
+                        "JSPACE_CONTRACT_MALFORMED",
+                        "admission",
+                        "dcf_generation.repo_root",
+                        "DCF evidence root is missing",
+                    )
+                })?;
+            let generation_root = normalized_root(Path::new(generation_root))?;
+            if generation_root != contract_root {
+                return Err(JSpaceError::new(
+                    "JSPACE_DCF_ROOT_MISMATCH",
+                    "admission",
+                    &generation_root.display().to_string(),
+                    format!("contract root is {}", contract_root.display()),
+                ));
+            }
+        }
         validate_expansion_rule(object)?;
         validate_object_field(object, "dcf_generation")?;
         validate_object_field(object, "provenance")?;
@@ -294,15 +256,17 @@ impl JSpaceMatcher {
         let write_values = required_string_array(object, "write_scopes")?;
         let allowed_values = required_string_array(object, "allowed_operations")?;
         let denied_values = required_string_array(object, "denied_operations")?;
-        let command_values = required_string_array(object, "command_prefixes")?;
         let allowed_operations = operation_set(allowed_values, "allowed_operations")?;
         let denied_operations = operation_set(denied_values, "denied_operations")?;
-        if allowed_operations.contains("delete") && denied_operations.contains("delete") {
+        if allowed_operations
+            .iter()
+            .any(|operation| denied_operations.contains(operation))
+        {
             return Err(JSpaceError::new(
                 "JSPACE_OPERATION_CONFLICT",
-                "delete",
+                "admission",
                 "",
-                "delete cannot be both allowed and denied",
+                "an operation cannot be both allowed and denied",
             ));
         }
         let mut read_scopes = PathTrie::new();
@@ -313,25 +277,75 @@ impl JSpaceMatcher {
         for scope in write_values {
             write_scopes.insert(&scope)?;
         }
-        let mut command_prefixes = BytePrefixTrie::new();
-        for prefix in command_values {
-            command_prefixes.insert(&prefix)?;
+        let mut declared_targets = PathTrie::new();
+        for target in required_string_array(object, "declared_targets")? {
+            if target.contains('*')
+                || target.contains('?')
+                || target.contains('[')
+                || target.contains(']')
+            {
+                return Err(JSpaceError::new(
+                    "JSPACE_TARGET_INVALID",
+                    "admission",
+                    &target,
+                    "declared targets must be exact paths without wildcards",
+                ));
+            }
+            declared_targets.insert(&target)?;
+        }
+        let command_templates = if schema_version == JSPACE_SCHEMA_VERSION {
+            parse_command_templates(object)?
+        } else {
+            required_string_array(object, "command_prefixes")?
+                .into_iter()
+                .map(|command| {
+                    Ok(CommandTemplate {
+                        argv: parse_shell_argv(&command)?,
+                        effects: vec!["read".to_string()],
+                        targets: Vec::new(),
+                    })
+                })
+                .collect::<Result<Vec<_>, JSpaceError>>()?
+        };
+        validate_command_templates(
+            &command_templates,
+            &allowed_operations,
+            &denied_operations,
+            &declared_targets,
+        )?;
+        if allowed_operations.contains("command") && command_templates.is_empty() {
+            return Err(JSpaceError::new(
+                "JSPACE_COMMAND_TEMPLATE_MISSING",
+                "command",
+                "",
+                "command operation requires at least one exact argv template",
+            ));
         }
 
         Ok(Self {
             repo_root: session_root,
             lexical_repo_root,
-            digest: claimed_digest,
+            content_digest,
+            authorization_digest,
             read_scopes,
             write_scopes,
+            declared_targets,
             allowed_operations,
             denied_operations,
-            command_prefixes,
+            command_templates,
         })
     }
 
     pub fn semantic_sha256(&self) -> &str {
-        &self.digest
+        &self.authorization_digest
+    }
+
+    pub fn authorization_semantic_sha256(&self) -> &str {
+        &self.authorization_digest
+    }
+
+    pub fn content_sha256(&self) -> &str {
+        &self.content_digest
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -341,7 +355,7 @@ impl JSpaceMatcher {
     pub fn check_path(&self, operation: &str, target: &Path) -> Result<(), JSpaceError> {
         self.check_operation(operation, &target.display().to_string())?;
         let relative = self.resolve_target(target, operation)?;
-        let allowed = if operation == "read" {
+        let scope_allowed = if operation == "read" {
             self.read_scopes.matches(&relative)
         } else {
             if operation == "delete" && !self.allowed_operations.contains("delete") {
@@ -354,15 +368,23 @@ impl JSpaceMatcher {
             }
             self.write_scopes.matches(&relative)
         };
-        if allowed {
-            return Ok(());
+        if !scope_allowed {
+            return Err(JSpaceError::new(
+                JSPACE_EXPANSION_REQUIRED,
+                operation,
+                &target.display().to_string(),
+                "exact target is inside the root but outside the declared scope",
+            ));
         }
-        Err(JSpaceError::new(
-            JSPACE_EXPANSION_REQUIRED,
-            operation,
-            &target.display().to_string(),
-            "exact target is inside the root but outside the declared scope",
-        ))
+        if operation != "read" && !self.declared_targets.matches(&relative) {
+            return Err(JSpaceError::new(
+                JSPACE_EXPANSION_REQUIRED,
+                operation,
+                &target.display().to_string(),
+                "mutation target is not one of the exact declared targets",
+            ));
+        }
+        Ok(())
     }
 
     pub fn check_command(&self, command_type: &str, command_line: &str) -> Result<(), JSpaceError> {
@@ -379,16 +401,27 @@ impl JSpaceMatcher {
         match command_type.as_str() {
             "shell_command" | "bash" | "zsh" => {
                 let (command, workdir) = shell_command_parts(command_line);
-                if !self.command_prefixes.matches(&command) {
-                    return Err(JSpaceError::new(
-                        "JSPACE_COMMAND_DENIED",
-                        "command",
-                        &command,
-                        "command does not match an admitted prefix",
-                    ));
-                }
+                let argv = parse_shell_argv(&command)?;
+                let template = self
+                    .command_templates
+                    .iter()
+                    .find(|template| template.argv == argv)
+                    .ok_or_else(|| {
+                        JSpaceError::new(
+                            "JSPACE_COMMAND_DENIED",
+                            "command",
+                            &command,
+                            "command does not match an exact admitted argv template",
+                        )
+                    })?;
                 if let Some(workdir) = workdir {
                     self.resolve_target(Path::new(&workdir), "command")?;
+                }
+                for effect in &template.effects {
+                    self.check_operation(effect, &command)?;
+                }
+                for target in &template.targets {
+                    self.check_path(&target.operation, Path::new(&target.path))?;
                 }
                 Ok(())
             }
@@ -558,17 +591,26 @@ impl JSpaceAdmissionCache {
             ));
         }
         let normalized_session_root = normalized_root(session_root)?;
-        let claimed_digest = contract
-            .get("semantic_sha256")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                JSpaceError::new(
-                    "JSPACE_CONTRACT_MALFORMED",
-                    "admission",
-                    "",
-                    "semantic_sha256 is required",
-                )
-            })?;
+        let object = contract.as_object().ok_or_else(|| {
+            JSpaceError::new(
+                "JSPACE_CONTRACT_MALFORMED",
+                "admission",
+                "",
+                "contract must be a JSON object",
+            )
+        })?;
+        let schema_version = required_string(object, "schema_version")?;
+        let (claimed_content, claimed_authorization) =
+            claimed_contract_digests(object, &schema_version)?;
+        let claimed_root = normalized_root(Path::new(&required_string(object, "repo_root")?))?;
+        if claimed_root != normalized_session_root {
+            return Err(JSpaceError::new(
+                "JSPACE_ROOT_MISMATCH",
+                "admission",
+                &claimed_root.display().to_string(),
+                format!("session root is {}", normalized_session_root.display()),
+            ));
+        }
         let mut entries = self
             .entries
             .lock()
@@ -586,17 +628,35 @@ impl JSpaceAdmissionCache {
                     ),
                 ));
             }
-            if existing.semantic_sha256() != claimed_digest {
+            if existing.authorization_semantic_sha256() != claimed_authorization {
                 return Err(JSpaceError::new(
                     "JSPACE_CONTRACT_CHANGED",
                     "admission",
                     session_id,
                     format!(
-                        "existing digest {} cannot be replaced by {}",
-                        existing.semantic_sha256(),
-                        claimed_digest
+                        "existing authorization {} cannot be replaced by {}",
+                        existing.authorization_semantic_sha256(),
+                        claimed_authorization
                     ),
                 ));
+            }
+            if existing.content_sha256() != claimed_content {
+                let refreshed = Arc::new(JSpaceMatcher::from_value(
+                    &normalized_session_root,
+                    contract,
+                )?);
+                if refreshed.authorization_semantic_sha256()
+                    != existing.authorization_semantic_sha256()
+                {
+                    return Err(JSpaceError::new(
+                        "JSPACE_CONTRACT_CHANGED",
+                        "admission",
+                        session_id,
+                        "refreshed content changed authorization identity",
+                    ));
+                }
+                entries.insert(session_id.to_string(), Arc::clone(&refreshed));
+                return Ok(Some(refreshed));
             }
             return Ok(Some(Arc::clone(existing)));
         }
@@ -614,6 +674,319 @@ impl JSpaceAdmissionCache {
     }
 }
 
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn claimed_contract_digests(
+    object: &Map<String, Value>,
+    schema_version: &str,
+) -> Result<(String, String), JSpaceError> {
+    let (content, authorization) = match schema_version {
+        JSPACE_SCHEMA_VERSION => (
+            required_string(object, "content_sha256")?,
+            required_string(object, "authorization_semantic_sha256")?,
+        ),
+        JSPACE_LEGACY_SCHEMA_VERSION => {
+            let digest = required_string(object, "semantic_sha256")?;
+            (digest.clone(), digest)
+        }
+        _ => {
+            return Err(JSpaceError::new(
+                "JSPACE_SCHEMA_VERSION_UNSUPPORTED",
+                "admission",
+                "schema_version",
+                format!("unsupported schema {schema_version}"),
+            ));
+        }
+    };
+    if !is_lower_sha256(&content) || !is_lower_sha256(&authorization) {
+        return Err(JSpaceError::new(
+            "JSPACE_DIGEST_INVALID",
+            "admission",
+            "",
+            "J-Space digests must be lowercase SHA-256",
+        ));
+    }
+    Ok((content, authorization))
+}
+
+fn verified_contract_digests(
+    contract: &Value,
+    object: &Map<String, Value>,
+    schema_version: &str,
+) -> Result<(String, String), JSpaceError> {
+    let (content, authorization) = claimed_contract_digests(object, schema_version)?;
+    if schema_version == JSPACE_SCHEMA_VERSION {
+        let expected_authorization = authorization_semantic_sha256(contract)?;
+        if authorization != expected_authorization {
+            return Err(JSpaceError::new(
+                "JSPACE_AUTHORIZATION_DIGEST_MISMATCH",
+                "admission",
+                "",
+                format!("expected {expected_authorization}, got {authorization}"),
+            ));
+        }
+        let mut payload = contract.clone();
+        payload
+            .as_object_mut()
+            .ok_or_else(|| {
+                JSpaceError::new(
+                    "JSPACE_CONTRACT_MALFORMED",
+                    "admission",
+                    "",
+                    "contract must be an object",
+                )
+            })?
+            .remove("content_sha256");
+        let expected_content = semantic_sha256(&payload);
+        if content != expected_content {
+            return Err(JSpaceError::new(
+                "JSPACE_CONTENT_DIGEST_MISMATCH",
+                "admission",
+                "",
+                format!("expected {expected_content}, got {content}"),
+            ));
+        }
+    } else {
+        let mut payload = contract.clone();
+        payload
+            .as_object_mut()
+            .ok_or_else(|| {
+                JSpaceError::new(
+                    "JSPACE_CONTRACT_MALFORMED",
+                    "admission",
+                    "",
+                    "contract must be an object",
+                )
+            })?
+            .remove("semantic_sha256");
+        let expected = semantic_sha256(&payload);
+        if content != expected {
+            return Err(JSpaceError::new(
+                "JSPACE_SEMANTIC_DIGEST_MISMATCH",
+                "admission",
+                "",
+                format!("expected {expected}, got {content}"),
+            ));
+        }
+    }
+    Ok((content, authorization))
+}
+
+pub fn authorization_semantic_sha256(contract: &Value) -> Result<String, JSpaceError> {
+    let object = contract.as_object().ok_or_else(|| {
+        JSpaceError::new(
+            "JSPACE_CONTRACT_MALFORMED",
+            "admission",
+            "",
+            "contract must be an object",
+        )
+    })?;
+    let generation = object
+        .get("dcf_generation")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            JSpaceError::new(
+                "JSPACE_CONTRACT_MALFORMED",
+                "admission",
+                "dcf_generation",
+                "required object is missing",
+            )
+        })?;
+    let payload = serde_json::json!({
+        "schema_version": JSPACE_AUTHORIZATION_SCHEMA_VERSION,
+        "repo_root": object.get("repo_root").cloned().unwrap_or(Value::Null),
+        "required_domain_bindings": generation
+            .get("required_domain_bindings")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "matched_surface_ids": object
+            .get("matched_surface_ids")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "read_scopes": object.get("read_scopes").cloned().unwrap_or(Value::Null),
+        "write_scopes": object.get("write_scopes").cloned().unwrap_or(Value::Null),
+        "allowed_operations": object
+            .get("allowed_operations")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "denied_operations": object
+            .get("denied_operations")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "command_templates": object
+            .get("command_templates")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "declared_targets": object
+            .get("declared_targets")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "expansion": object.get("expansion").cloned().unwrap_or(Value::Null),
+    });
+    Ok(semantic_sha256(&payload))
+}
+
+fn parse_command_templates(
+    object: &Map<String, Value>,
+) -> Result<Vec<CommandTemplate>, JSpaceError> {
+    let Some(Value::Array(values)) = object.get("command_templates") else {
+        return Err(JSpaceError::new(
+            "JSPACE_CONTRACT_MALFORMED",
+            "admission",
+            "command_templates",
+            "required command template array is missing",
+        ));
+    };
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let template = value.as_object().ok_or_else(|| {
+                JSpaceError::new(
+                    "JSPACE_CONTRACT_MALFORMED",
+                    "admission",
+                    "command_templates",
+                    format!("template {index} is not an object"),
+                )
+            })?;
+            let argv = required_string_array(template, "argv")?;
+            let effects = required_string_array(template, "effects")?;
+            if argv.is_empty() || effects.is_empty() || argv.iter().any(|value| value.is_empty()) {
+                return Err(JSpaceError::new(
+                    "JSPACE_COMMAND_TEMPLATE_INVALID",
+                    "admission",
+                    "command_templates",
+                    format!("template {index} requires non-empty argv and effects"),
+                ));
+            }
+            let Some(Value::Array(target_values)) = template.get("targets") else {
+                return Err(JSpaceError::new(
+                    "JSPACE_CONTRACT_MALFORMED",
+                    "admission",
+                    "command_templates.targets",
+                    "required target array is missing",
+                ));
+            };
+            let targets = target_values
+                .iter()
+                .map(|target| {
+                    let target = target.as_object().ok_or_else(|| {
+                        JSpaceError::new(
+                            "JSPACE_CONTRACT_MALFORMED",
+                            "admission",
+                            "command_templates.targets",
+                            "target is not an object",
+                        )
+                    })?;
+                    Ok(CommandTarget {
+                        operation: required_string(target, "operation")?,
+                        path: required_string(target, "path")?,
+                        argv_index: required_usize(target, "argv_index")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, JSpaceError>>()?;
+            Ok(CommandTemplate {
+                argv,
+                effects,
+                targets,
+            })
+        })
+        .collect()
+}
+
+fn validate_command_templates(
+    templates: &[CommandTemplate],
+    allowed: &HashSet<String>,
+    denied: &HashSet<String>,
+    declared_targets: &PathTrie,
+) -> Result<(), JSpaceError> {
+    let mut seen = HashSet::new();
+    for template in templates {
+        if !seen.insert(template.argv.clone()) {
+            return Err(JSpaceError::new(
+                "JSPACE_COMMAND_TEMPLATE_DUPLICATE",
+                "admission",
+                &template.argv.join(" "),
+                "exact argv template is duplicated",
+            ));
+        }
+        let mut mutation_effects = HashSet::new();
+        let mut targeted_mutations = HashSet::new();
+        for effect in &template.effects {
+            if !KNOWN_OPERATIONS.contains(&effect.as_str()) || effect == "command" {
+                return Err(JSpaceError::new(
+                    "JSPACE_COMMAND_EFFECT_INVALID",
+                    "admission",
+                    effect,
+                    "command template contains an unknown effect",
+                ));
+            }
+            if denied.contains(effect)
+                || (matches!(effect.as_str(), "read" | "create" | "modify" | "delete")
+                    && !allowed.contains(effect))
+            {
+                return Err(JSpaceError::new(
+                    "JSPACE_COMMAND_EFFECT_DENIED",
+                    effect,
+                    &template.argv.join(" "),
+                    "command effect is not admitted",
+                ));
+            }
+            if matches!(effect.as_str(), "create" | "modify" | "delete") {
+                mutation_effects.insert(effect.clone());
+            }
+        }
+        for target in &template.targets {
+            if !matches!(
+                target.operation.as_str(),
+                "read" | "create" | "modify" | "delete"
+            ) || !template.effects.contains(&target.operation)
+            {
+                return Err(JSpaceError::new(
+                    "JSPACE_COMMAND_TARGET_EFFECT_MISMATCH",
+                    &target.operation,
+                    &target.path,
+                    "command target operation is absent from effects",
+                ));
+            }
+            scope_components(&target.path)?;
+            if template.argv.get(target.argv_index) != Some(&target.path) {
+                return Err(JSpaceError::new(
+                    "JSPACE_COMMAND_TARGET_ARGV_MISMATCH",
+                    &target.operation,
+                    &target.path,
+                    format!("target path must equal argv[{}]", target.argv_index),
+                ));
+            }
+            if target.operation != "read" {
+                if !declared_targets.matches(&target.path) {
+                    return Err(JSpaceError::new(
+                        "JSPACE_COMMAND_TARGET_UNDECLARED",
+                        &target.operation,
+                        &target.path,
+                        "command mutation target is not declared",
+                    ));
+                }
+                targeted_mutations.insert(target.operation.clone());
+            }
+        }
+        if mutation_effects != targeted_mutations {
+            return Err(JSpaceError::new(
+                "JSPACE_COMMAND_MUTATION_TARGET_MISSING",
+                "command",
+                &template.argv.join(" "),
+                "every mutation effect requires an exact target",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn required_string(object: &Map<String, Value>, key: &str) -> Result<String, JSpaceError> {
     object
         .get(key)
@@ -626,6 +999,21 @@ fn required_string(object: &Map<String, Value>, key: &str) -> Result<String, JSp
                 "admission",
                 key,
                 "required non-empty string is missing",
+            )
+        })
+}
+
+fn required_usize(object: &Map<String, Value>, key: &str) -> Result<usize, JSpaceError> {
+    object
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            JSpaceError::new(
+                "JSPACE_CONTRACT_MALFORMED",
+                "admission",
+                key,
+                "required non-negative integer is missing",
             )
         })
 }
@@ -872,6 +1260,103 @@ fn shell_command_parts(raw: &str) -> (String, Option<String>) {
     (command, workdir)
 }
 
+fn parse_shell_argv(raw: &str) -> Result<Vec<String>, JSpaceError> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let unsafe_error =
+        |detail: &str| JSpaceError::new("JSPACE_COMMAND_SYNTAX_UNSAFE", "command", raw, detail);
+    if raw.trim().is_empty() {
+        return Err(unsafe_error("command must be non-empty"));
+    }
+    let mut argv = Vec::new();
+    let mut token = String::new();
+    let mut token_started = false;
+    let mut quote = Quote::None;
+    let mut characters = raw.chars().peekable();
+    while let Some(character) = characters.next() {
+        if matches!(character, '\0' | '\r' | '\n') {
+            return Err(unsafe_error(
+                "control bytes and multiline shell commands are denied",
+            ));
+        }
+        match quote {
+            Quote::Single => {
+                if character == '\'' {
+                    quote = Quote::None;
+                } else {
+                    token.push(character);
+                }
+            }
+            Quote::Double => match character {
+                '"' => quote = Quote::None,
+                '\\' => {
+                    let Some(escaped) = characters.next() else {
+                        return Err(unsafe_error("trailing escape is invalid"));
+                    };
+                    token.push(escaped);
+                }
+                '$' | '`' => {
+                    return Err(unsafe_error(
+                        "shell expansion and command substitution are denied",
+                    ));
+                }
+                _ => token.push(character),
+            },
+            Quote::None => match character {
+                character if character.is_whitespace() => {
+                    if token_started {
+                        argv.push(std::mem::take(&mut token));
+                        token_started = false;
+                    }
+                }
+                '\'' => {
+                    quote = Quote::Single;
+                    token_started = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    token_started = true;
+                }
+                '\\' => {
+                    let Some(escaped) = characters.next() else {
+                        return Err(unsafe_error("trailing escape is invalid"));
+                    };
+                    if matches!(escaped, '\r' | '\n' | '\0') {
+                        return Err(unsafe_error("escaped control bytes are denied"));
+                    }
+                    token.push(escaped);
+                    token_started = true;
+                }
+                ';' | '&' | '|' | '<' | '>' | '(' | ')' | '$' | '`' | '#' | '*' | '?' | '['
+                | ']' | '{' | '}' | '~' => {
+                    return Err(unsafe_error(
+                        "shell control, expansion, redirection, comments, and globbing are denied",
+                    ));
+                }
+                _ => {
+                    token.push(character);
+                    token_started = true;
+                }
+            },
+        }
+    }
+    if quote != Quote::None {
+        return Err(unsafe_error("unterminated shell quote is invalid"));
+    }
+    if token_started {
+        argv.push(token);
+    }
+    if argv.is_empty() {
+        return Err(unsafe_error("command must contain an executable"));
+    }
+    Ok(argv)
+}
+
 pub fn semantic_sha256(payload: &Value) -> String {
     let canonical = canonical_json(payload);
     let digest = Sha256::digest(canonical.as_bytes());
@@ -938,33 +1423,102 @@ fn canonical_json_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{semantic_sha256, JSpaceAdmissionCache, JSpaceMatcher, JSPACE_EXPANSION_REQUIRED};
-    use serde_json::{json, Value};
+    use super::{
+        JSPACE_EXPANSION_REQUIRED, JSpaceAdmissionCache, JSpaceMatcher,
+        authorization_semantic_sha256, semantic_sha256,
+    };
+    use serde_json::{Value, json};
     use std::fs;
+
+    const AUTHORIZATION_DIGEST_CROSS_LANGUAGE_VECTOR: &str =
+        "bd2a325bfeb427c3d3f677d8d831af0f79708c05bf87e9409c1625ba2e16c11f";
 
     fn contract(root: &std::path::Path) -> Value {
         let mut value = json!({
-            "schema_version": "jspace_contract_v1",
+            "schema_version": "jspace_contract_v2",
             "repo_root": root,
-            "dcf_generation": {"generation_id": "g"},
+            "dcf_generation": {
+                "repo_root": root,
+                "generation_id": "g",
+                "required_domain_bindings": {
+                    "surface-map": {
+                        "required_domains": ["surface"],
+                        "source_fingerprints": {"surface": "surface-a"}
+                    }
+                }
+            },
             "provenance": {"matched_surface_ids": ["surface"]},
             "matched_surface_ids": ["surface"],
             "read_scopes": ["src/**"],
             "write_scopes": ["src/**"],
             "allowed_operations": ["read", "create", "modify", "command"],
             "denied_operations": ["network", "install", "system_mutation"],
-            "command_prefixes": ["git status"],
+            "command_templates": [{
+                "argv": ["git", "status", "--short"],
+                "effects": ["read"],
+                "targets": []
+            }],
             "focused_verifiers": [],
-            "declared_targets": [],
+            "declared_targets": ["src/main.rs"],
             "expansion": {
                 "mode": "exact_target_only",
                 "error_code": "JSPACE_EXPANSION_REQUIRED",
                 "mutation_on_expansion": false
             }
         });
-        let digest = semantic_sha256(&value);
-        value["semantic_sha256"] = Value::String(digest);
+        let authorization = authorization_semantic_sha256(&value).expect("authorization digest");
+        value["authorization_semantic_sha256"] = Value::String(authorization);
+        let content = semantic_sha256(&value);
+        value["content_sha256"] = Value::String(content);
         value
+    }
+
+    fn reseal(mut value: Value) -> Value {
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("content_sha256");
+        let authorization = authorization_semantic_sha256(&value).expect("authorization digest");
+        value["authorization_semantic_sha256"] = Value::String(authorization);
+        let content = semantic_sha256(&value);
+        value["content_sha256"] = Value::String(content);
+        value
+    }
+
+    #[test]
+    fn authorization_digest_matches_dcf_cross_language_vector() {
+        let value = json!({
+            "repo_root": "/workspace",
+            "dcf_generation": {
+                "required_domain_bindings": {
+                    "surface-map": {
+                        "required_domains": ["surface"],
+                        "source_fingerprints": {"surface": "surface-a"}
+                    }
+                }
+            },
+            "matched_surface_ids": ["surface-test"],
+            "read_scopes": ["src/**"],
+            "write_scopes": ["src/**"],
+            "allowed_operations": ["read", "create", "modify", "command"],
+            "denied_operations": ["network", "install", "system_mutation"],
+            "command_templates": [{
+                "argv": ["git", "status", "--short"],
+                "effects": ["read"],
+                "targets": []
+            }],
+            "declared_targets": ["src/main.rs"],
+            "expansion": {
+                "mode": "exact_target_only",
+                "error_code": "JSPACE_EXPANSION_REQUIRED",
+                "mutation_on_expansion": false
+            }
+        });
+
+        assert_eq!(
+            authorization_semantic_sha256(&value).expect("authorization digest"),
+            AUTHORIZATION_DIGEST_CROSS_LANGUAGE_VECTOR
+        );
     }
 
     #[test]
@@ -986,12 +1540,7 @@ mod tests {
 
         let mut changed = value.clone();
         changed["read_scopes"] = json!(["other/**"]);
-        let mut payload = changed.clone();
-        payload
-            .as_object_mut()
-            .expect("object")
-            .remove("semantic_sha256");
-        changed["semantic_sha256"] = Value::String(semantic_sha256(&payload));
+        let changed = reseal(changed);
         let error = cache
             .admit("session", root.path(), Some(&changed))
             .expect_err("digest change");
@@ -1015,6 +1564,44 @@ mod tests {
     }
 
     #[test]
+    fn admission_rejects_dcf_evidence_root_that_differs_from_contract_root() {
+        let root = tempfile::tempdir().expect("root");
+        let other = tempfile::tempdir().expect("other");
+        let mut value = contract(root.path());
+        value["dcf_generation"]["repo_root"] = json!(other.path());
+        let value = reseal(value);
+
+        let error = JSpaceMatcher::from_value(root.path(), &value)
+            .expect_err("foreign DCF evidence root must fail");
+        assert_eq!(error.code(), "JSPACE_DCF_ROOT_MISMATCH");
+    }
+
+    #[test]
+    fn admission_refreshes_provenance_without_changing_authorization() {
+        let root = tempfile::tempdir().expect("root");
+        let cache = JSpaceAdmissionCache::default();
+        let value = contract(root.path());
+        let first_authorization = value["authorization_semantic_sha256"].clone();
+        cache
+            .admit("session", root.path(), Some(&value))
+            .expect("first admission");
+
+        let mut refreshed = value.clone();
+        refreshed["dcf_generation"]["generation_id"] = json!("g-next");
+        refreshed["provenance"]["repo_head"] = json!("head-next");
+        let refreshed = reseal(refreshed);
+        assert_eq!(
+            refreshed["authorization_semantic_sha256"],
+            first_authorization
+        );
+        assert_ne!(refreshed["content_sha256"], value["content_sha256"]);
+        cache
+            .admit("session", root.path(), Some(&refreshed))
+            .expect("provenance-only refresh");
+        assert_eq!(cache.admissions(), 1);
+    }
+
+    #[test]
     fn path_operation_and_command_checks_are_local_and_fail_closed() {
         let root = tempfile::tempdir().expect("root");
         fs::create_dir(root.path().join("src")).expect("src");
@@ -1035,17 +1622,29 @@ mod tests {
         );
         assert_eq!(
             matcher
-                .check_path("modify", &root.path().join("other.rs"))
-                .expect_err("expansion")
+                .check_path("modify", &root.path().join("src").join("other.rs"))
+                .expect_err("undeclared target")
                 .code(),
             JSPACE_EXPANSION_REQUIRED
         );
-        assert!(matcher
-            .check_command("shell_command", "git status --short")
-            .is_ok());
+        assert!(
+            matcher
+                .check_command("shell_command", "git status --short")
+                .is_ok()
+        );
         assert_eq!(
             matcher
-                .check_command("shell_command", "curl https://example.test")
+                .check_command(
+                    "shell_command",
+                    "git status --short; curl https://example.test"
+                )
+                .expect_err("shell chaining")
+                .code(),
+            "JSPACE_COMMAND_SYNTAX_UNSAFE"
+        );
+        assert_eq!(
+            matcher
+                .check_command("shell_command", "git status")
                 .expect_err("command")
                 .code(),
             "JSPACE_COMMAND_DENIED"

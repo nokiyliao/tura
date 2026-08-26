@@ -179,7 +179,11 @@ impl TaskContextCapsule {
 
     pub fn bind_jspace(&self, jspace_contract: Option<&Value>) -> Result<(), String> {
         let digest = jspace_contract
-            .and_then(|contract| contract.get("semantic_sha256"))
+            .and_then(|contract| {
+                contract
+                    .get("authorization_semantic_sha256")
+                    .or_else(|| contract.get("semantic_sha256"))
+            })
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 "TASK_CONTEXT_JSPACE_BINDING_MISSING: capsule requires a J-Space contract"
