@@ -212,6 +212,16 @@ pub(crate) async fn call_runtime_with_writer(
             );
         }
     };
+    if official_provider.is_none() {
+        return finish_provider_route_admission_failure(
+            runtime,
+            runtime_event_writer,
+            format!(
+                "provider route '{}' is disabled for mission reasoning; use 'official_codex_app_server'",
+                input.provider_name
+            ),
+        );
+    }
     let call_result = if let Some(provider) = official_provider {
         call_runtime_official_codex(
             &mut runtime,
@@ -588,15 +598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_runtime_provider_config_failure_finishes_failed_without_network() {
-        // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
-        #[allow(
-            unsafe_code,
-            reason = "Rust 2024 process-environment mutation audited at the caller"
-        )]
-        unsafe {
-            std::env::remove_var("DEFINITELY_MISSING_PROVIDER_FOR_CALL_RUNTIME_TEST_API_KEY")
-        };
+    async fn non_official_provider_finishes_admission_failure_without_network() {
         let settings = missing_key_settings();
         let config = Arc::new(TuraConfig::new(".env.missing-for-call-runtime-test"));
 
@@ -619,7 +621,7 @@ mod tests {
             config,
         )
         .await
-        .expect("provider config failure should be captured on the runtime");
+        .expect("non-official provider rejection should be captured on the runtime");
 
         assert_eq!(runtime.state, lifecycle::RuntimeState::Failed);
         assert_eq!(
@@ -632,17 +634,20 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("failure output should contain text");
         assert!(
-            error.contains("API Key not found"),
+            error.contains("disabled for mission reasoning"),
             "unexpected failure output: {error}"
         );
         let runtime_error = runtime.error.expect("runtime error should be set");
-        assert_eq!(runtime_error.error_code.as_deref(), Some("CALL_FAILED"));
+        assert_eq!(
+            runtime_error.error_code.as_deref(),
+            Some("PROVIDER_ROUTE_ADMISSION_REJECTED")
+        );
         assert!(!runtime_error.retry_allowed);
         assert!(!runtime_error.fallback_allowed);
         assert!(runtime_error
             .error_text
             .as_deref()
             .unwrap_or_default()
-            .contains("API Key not found"));
+            .contains("disabled for mission reasoning"));
     }
 }
