@@ -17,8 +17,9 @@ use router_contract::{IpcRequest, IpcResponse, RouterEndpoint};
 pub(crate) async fn serve_stdio() -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    let _ = cleanup_orphan_runtime_workers();
     let state = build_state();
-    let _ = recover_after_start(&state.session_db)?;
+    let _ = recover_after_start(&state).await?;
     let stdin = tokio::io::stdin();
     // Shared, locked writer: each request is handled on its own task and writes
     // its response (tagged with `request_id`) when ready, so a slow call (e.g. a
@@ -93,7 +94,7 @@ pub(crate) async fn serve_socket() -> anyhow::Result<()> {
         );
     }
     let state = build_state();
-    let _ = recover_after_start(&state.session_db)?;
+    let _ = recover_after_start(&state).await?;
     // The daemon owns the backend: bring up the single session_db owner now.
     let _ = state.session_db.start();
 
