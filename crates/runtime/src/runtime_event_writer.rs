@@ -236,7 +236,7 @@ impl RuntimeEventWriter {
             RuntimeEvent,
         ) -> Result<(u64, u64), String>,
     ) -> Result<(), String> {
-        self.feed_barrier(runtime_id)?;
+        let feed_error = self.feed_barrier(runtime_id).err();
         let cursor = self
             .cursors
             .get(runtime_id)
@@ -257,7 +257,7 @@ impl RuntimeEventWriter {
         cursor.next_event_seq = next_event_seq;
         cursor.pending_terminal = None;
         self.next_receipt_event_seq += 1;
-        Ok(())
+        feed_error.map_or(Ok(()), Err)
     }
 
     fn write_terminal_receipt(
@@ -571,9 +571,12 @@ fn run_feed_worker(client: SessionLogClient, receiver: mpsc::Receiver<FeedComman
 mod tests {
     use super::*;
     use chrono::Utc;
-    use lifecycle::{ProviderConfig, RuntimeProviderConfig, SessionCommand, TaskPlan, ToolChoice};
+    use lifecycle::{
+        ProviderConfig, RuntimeError, RuntimeProviderConfig, SessionCommand, TaskPlan, ToolChoice,
+    };
     use session_log_contract::{
-        CreateSessionRequest, ReadSessionFeedRequest, ReplayRuntimeRequest, SessionFeedEvent,
+        CreateSessionRequest, GetRuntimeLeaseRequest, ReadSessionFeedRequest,
+        ReplayRuntimeRequest, SessionFeedEvent,
     };
     use std::sync::Mutex;
 
@@ -863,7 +866,7 @@ mod tests {
             runtime_id.clone(),
             session_id.clone(),
             "agent".to_string(),
-            provider,
+            provider.clone(),
             now,
         );
         let mut writer = RuntimeEventWriter::new(
@@ -1023,6 +1026,91 @@ mod tests {
             panic!("runtime replay missing after seal");
         };
         assert!(replay.aggregate.state.is_terminal());
+
+        let rejected_runtime_id = "writer-rejected-feed-runtime".to_string();
+        let mut rejected_runtime = RuntimeAggregate::new(
+            rejected_runtime_id.clone(),
+            session_id.clone(),
+            "agent".to_string(),
+            provider,
+            now,
+        );
+        let mut rejected_writer = RuntimeEventWriter::new(
+            session_id.clone(),
+            rejected_runtime_id.clone(),
+            "writer-rejected-feed-lease".to_string(),
+        )
+        .expect("rejected feed writer");
+        rejected_writer
+            .flush(&mut rejected_runtime)
+            .expect("flush rejected runtime creation");
+        let rejected_publisher = rejected_writer
+            .feed_publisher(&rejected_runtime_id, "missing-parent-session")
+            .expect("rejected feed publisher");
+        rejected_publisher
+            .publish(SessionFeedEvent::AgentMessage {
+                message_id: format!("{rejected_runtime_id}.message"),
+                part_id: format!("{rejected_runtime_id}.message"),
+                reply_message: "visible failure".to_string(),
+                new_learning: String::new(),
+                runtime_status: None,
+                context_tokens: None,
+                usage: None,
+                created_at: now.timestamp_millis(),
+                updated_at: now.timestamp_millis(),
+            })
+            .expect("queue rejected feed event");
+        rejected_runtime
+            .finish_failure(
+                now + chrono::Duration::milliseconds(4),
+                RuntimeError {
+                    error_code: Some("PRE_PROVIDER_EXECUTE_TURN_FAILED".to_string()),
+                    error_text: Some("missing route".to_string()),
+                    retry_allowed: false,
+                    fallback_allowed: false,
+                    fallback_to_id: None,
+                },
+                RuntimeState::Failed,
+                None,
+            )
+            .expect("finish rejected runtime");
+        rejected_writer
+            .flush(&mut rejected_runtime)
+            .expect("defer rejected runtime terminal");
+
+        let feed_error = rejected_writer
+            .seal_runtime(&rejected_runtime_id)
+            .expect_err("rejected feed remains observable after terminal commit");
+        assert!(feed_error.contains("TargetSessionNotFound"));
+        let replay = session_log_contract::client::call_service(
+            &SessionLogCommand::ReplayRuntime(ReplayRuntimeRequest {
+                runtime_id: rejected_runtime_id.clone(),
+            }),
+        )
+        .expect("replay rejected feed runtime after seal");
+        let SessionLogResponse::RuntimeReplayed {
+            runtime: Some(replay),
+        } = replay
+        else {
+            panic!("rejected feed runtime replay missing after seal");
+        };
+        assert!(replay.aggregate.state.is_terminal());
+        assert_eq!(replay.aggregate.state, RuntimeState::Failed);
+        let lease = session_log_contract::client::call_service(
+            &SessionLogCommand::GetRuntimeLease(GetRuntimeLeaseRequest {
+                runtime_id: rejected_runtime_id,
+                database_path: None,
+            }),
+        )
+        .expect("read rejected feed runtime lease after seal");
+        let SessionLogResponse::RuntimeLeaseRead {
+            runtime: Some(lease),
+        } = lease
+        else {
+            panic!("rejected feed runtime lease missing after seal");
+        };
+        assert!(lease.terminal);
+        assert!(!lease.lease_active);
 
         let _ = session_log_contract::client::call_service(&SessionLogCommand::Shutdown);
         let _ = handle.join();
