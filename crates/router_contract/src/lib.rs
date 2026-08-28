@@ -20,6 +20,8 @@ pub const METHOD_PATCH_TOOL_CONFIG: &str = "registry.tools.config.patch";
 pub struct RouterEndpoint {
     pub addr: String,
     pub version: String,
+    #[serde(default)]
+    pub binary_sha256: Option<String>,
     pub pid: Option<u32>,
     pub process_start_time: Option<u64>,
 }

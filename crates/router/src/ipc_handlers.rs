@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
@@ -8,10 +8,10 @@ use crate::services;
 use crate::shutdown::mark_router_shutting_down;
 use router_contract::{
     ExecuteCommandRequest, GetToolConfigResponse, GetToolResponse, IpcRequest, IpcResponse,
-    ListCommandsRequest, ListCommandsResponse, ListToolsResponse, PatchToolConfigRequest,
-    PatchToolRequest, ToolRegistryRequest, ToolRequest, METHOD_ENQUEUE_TURN,
+    ListCommandsRequest, ListCommandsResponse, ListToolsResponse, METHOD_ENQUEUE_TURN,
     METHOD_EXECUTE_COMMAND, METHOD_GET_TOOL, METHOD_GET_TOOL_CONFIG, METHOD_HEALTH_CHECK,
     METHOD_LIST_COMMANDS, METHOD_LIST_TOOLS, METHOD_PATCH_TOOL, METHOD_PATCH_TOOL_CONFIG,
+    PatchToolConfigRequest, PatchToolRequest, ToolRegistryRequest, ToolRequest,
 };
 use tura_router::registry::ToolRegistry;
 
@@ -20,23 +20,26 @@ pub(crate) async fn handle_ipc_request(state: &AppState, request: IpcRequest) ->
         "" | METHOD_HEALTH_CHECK
             if request.kind == "health_check" || request.method == METHOD_HEALTH_CHECK =>
         {
-            let session_db = state.session_db.start().unwrap_or_else(|error| {
+            crate::process_info::current_executable_sha256().map(|binary_sha256| {
+                let session_db = state.session_db.start().unwrap_or_else(|error| {
+                    json!({
+                        "status": "error",
+                        "error": error.to_string()
+                    })
+                });
                 json!({
-                    "status": "error",
-                    "error": error.to_string()
+                    "status": "ok",
+                    "pid": std::process::id(),
+                    "process_start_time": current_process_start_time(std::process::id()),
+                    "binary_sha256": binary_sha256,
+                    "session_db": session_db,
+                    "runtime_policy": {
+                        "max_active_runtime_workers": services::runtime_workers::MAX_ACTIVE_RUNTIME_WORKERS,
+                        "runtime_worker_idle_ttl_secs": services::runtime_workers::RUNTIME_WORKER_IDLE_TTL_SECS,
+                        "max_idle_runtime_workers": services::runtime_workers::MAX_IDLE_RUNTIME_WORKERS
+                    }
                 })
-            });
-            Ok(json!({
-                "status": "ok",
-                "pid": std::process::id(),
-                "process_start_time": current_process_start_time(std::process::id()),
-                "session_db": session_db,
-                "runtime_policy": {
-                    "max_active_runtime_workers": services::runtime_workers::MAX_ACTIVE_RUNTIME_WORKERS,
-                    "runtime_worker_idle_ttl_secs": services::runtime_workers::RUNTIME_WORKER_IDLE_TTL_SECS,
-                    "max_idle_runtime_workers": services::runtime_workers::MAX_IDLE_RUNTIME_WORKERS
-                }
-            }))
+            })
         }
         "session_db.lifecycle.start" => state.session_db.start(),
         "session_db.lifecycle.status" => Ok(state.session_db.status()),
@@ -210,9 +213,11 @@ mod tests {
         assert!(state.shutdown.load(Ordering::SeqCst));
         assert_eq!(response.payload["status"], "shutting_down");
         assert_eq!(response.payload["runtime_workers_stopped"], 0);
-        assert!(response.payload["background_process_scopes_terminated"]
-            .as_u64()
-            .is_some());
+        assert!(
+            response.payload["background_process_scopes_terminated"]
+                .as_u64()
+                .is_some()
+        );
         Ok(())
     }
 
@@ -335,10 +340,12 @@ mod tests {
             ),
         ));
         assert!(!malformed.ok);
-        assert!(malformed
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("unknown field `legacy`")));
+        assert!(
+            malformed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown field `legacy`"))
+        );
         Ok(())
     }
 }

@@ -1,13 +1,13 @@
 use serde_json::json;
 use session_log_contract::{
-    client::{open_session_feed_subscription, SessionFeedSubscriptionCancellation},
     SessionFeedEntry, SessionFeedEvent,
+    client::{SessionFeedSubscriptionCancellation, open_session_feed_subscription},
 };
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{Arc, atomic::Ordering};
 
 use crate::app::build_state;
 use crate::ipc_handlers::{enqueue_turn_identity, handle_ipc_request};
-use crate::process_info::current_process_start_time;
+use crate::process_info::{current_executable_sha256, current_process_start_time};
 use crate::services::{
     recovery::recover_after_start, runtime_orphans::cleanup_orphan_runtime_workers,
 };
@@ -66,6 +66,7 @@ fn publish_router_addr(addr: &std::net::SocketAddr) -> anyhow::Result<()> {
     let record = RouterEndpoint {
         addr: addr.to_string(),
         version: tura_path::instance_version(),
+        binary_sha256: Some(current_executable_sha256()?.to_string()),
         pid: Some(pid),
         process_start_time: current_process_start_time(pid),
     };
@@ -81,7 +82,7 @@ pub(crate) fn unpublish_router_addr() {
 
 pub(crate) async fn serve_socket() -> anyhow::Result<()> {
     use tokio::net::TcpListener;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     let _router_lock = RouterDaemonLock::acquire()?;
     let orphan_report = cleanup_orphan_runtime_workers();
@@ -526,6 +527,7 @@ impl RouterDaemonLock {
         )?;
         writeln!(file, "kind=router")?;
         writeln!(file, "build_kind={}", tura_path::build_kind())?;
+        writeln!(file, "binary_sha256={}", current_executable_sha256()?)?;
         writeln!(file, "home={}", tura_path::instance_home().display())?;
         Ok(Self { file, path })
     }
@@ -681,10 +683,11 @@ mod tests {
     fn terminal_callback_gate_pairs_callback_before_delivery_once() {
         let mut gate = TerminalCallbackGate::default();
         let callback = json!({"text": "done"});
-        assert!(gate
-            .accept_callback("runtime-1".to_string(), callback.clone())
-            .expect("queue callback")
-            .is_none());
+        assert!(
+            gate.accept_callback("runtime-1".to_string(), callback.clone())
+                .expect("queue callback")
+                .is_none()
+        );
         let delivery = terminal_delivery("runtime-1");
         let (paired_callback, paired_delivery) = gate
             .accept_delivery(delivery.clone())
@@ -692,20 +695,22 @@ mod tests {
             .expect("ready pair");
         assert_eq!(paired_callback, callback);
         assert_eq!(paired_delivery, delivery);
-        assert!(gate
-            .accept_delivery(terminal_delivery("runtime-1"))
-            .expect("ignore duplicate delivery")
-            .is_none());
+        assert!(
+            gate.accept_delivery(terminal_delivery("runtime-1"))
+                .expect("ignore duplicate delivery")
+                .is_none()
+        );
     }
 
     #[test]
     fn terminal_callback_gate_pairs_delivery_before_callback_once() {
         let mut gate = TerminalCallbackGate::default();
         let delivery = terminal_delivery("runtime-2");
-        assert!(gate
-            .accept_delivery(delivery.clone())
-            .expect("queue delivery")
-            .is_none());
+        assert!(
+            gate.accept_delivery(delivery.clone())
+                .expect("queue delivery")
+                .is_none()
+        );
         let callback = json!({"text": "done later"});
         let (paired_callback, paired_delivery) = gate
             .accept_callback("runtime-2".to_string(), callback.clone())
@@ -713,10 +718,11 @@ mod tests {
             .expect("ready pair");
         assert_eq!(paired_callback, callback);
         assert_eq!(paired_delivery, delivery);
-        assert!(gate
-            .accept_callback("runtime-2".to_string(), callback)
-            .expect("ignore duplicate callback")
-            .is_none());
+        assert!(
+            gate.accept_callback("runtime-2".to_string(), callback)
+                .expect("ignore duplicate callback")
+                .is_none()
+        );
     }
 
     fn terminal_delivery(runtime_id: &str) -> crate::services::execution::TerminalDeliveryIdentity {
@@ -729,8 +735,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_run_survives_runtime_socket_disconnect_until_router_finishes(
-    ) -> anyhow::Result<()> {
+    async fn command_run_survives_runtime_socket_disconnect_until_router_finishes()
+    -> anyhow::Result<()> {
         let state = build_state();
         let workspace = tempfile::tempdir()?;
         let started = workspace.path().join("started.txt");

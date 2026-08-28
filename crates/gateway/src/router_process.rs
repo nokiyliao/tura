@@ -4,19 +4,20 @@
 //! as a direct child; router then owns session_db, runtime workers, and
 //! command-run children below that tree.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex as ParkingMutex;
-use router_contract::{IpcRequest, IpcResponse, RouterEndpoint, METHOD_HEALTH_CHECK};
+use router_contract::{IpcRequest, IpcResponse, METHOD_HEALTH_CHECK, RouterEndpoint};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -41,6 +42,7 @@ struct ProcessLockRecord {
     process_start_time: Option<u64>,
     kind: Option<String>,
     build_kind: Option<String>,
+    binary_sha256: Option<String>,
     home: Option<String>,
 }
 
@@ -425,24 +427,28 @@ impl RouterProcess {
     }
 
     fn reachable_owned_router_endpoint(&self) -> Result<Option<RouterEndpoint>> {
-        let endpoint = reachable_router_endpoint()?;
-        if endpoint.as_ref().is_some_and(|endpoint| {
-            !self.owns_router_endpoint(endpoint) && !self.is_adopted_addr(endpoint)
-        }) {
+        let Some(endpoint) = reachable_router_endpoint()? else {
+            return Ok(None);
+        };
+        if !self.router_binary_matches(&endpoint)?
+            || (!self.owns_router_endpoint(&endpoint) && !self.is_adopted_addr(&endpoint))
+        {
             return Ok(None);
         }
-        Ok(endpoint)
+        Ok(Some(endpoint))
     }
 
     fn healthy_owned_router_endpoint(&self) -> Result<Option<(RouterEndpoint, serde_json::Value)>> {
-        let endpoint = healthy_router_endpoint()?;
-        if endpoint.as_ref().is_some_and(|(endpoint, _)| {
-            !self.owns_router_endpoint(endpoint)
-                && !router_endpoint_process_fingerprint_matches(endpoint)
-        }) {
+        let Some((endpoint, health)) = healthy_router_endpoint()? else {
+            return Ok(None);
+        };
+        if !self.router_binary_matches(&endpoint)?
+            || (!self.owns_router_endpoint(&endpoint)
+                && !router_endpoint_process_fingerprint_matches(&endpoint))
+        {
             return Ok(None);
         }
-        Ok(endpoint)
+        Ok(Some((endpoint, health)))
     }
 
     fn wait_for_healthy_owned_router(&self, timeout: Duration) -> Result<Option<RouterEndpoint>> {
@@ -477,6 +483,14 @@ impl RouterProcess {
             },
             _ => false,
         }
+    }
+
+    fn router_binary_matches(&self, endpoint: &RouterEndpoint) -> Result<bool> {
+        let Some(router_bin) = self.router_bin.as_deref() else {
+            return Ok(false);
+        };
+        let expected = file_sha256(router_bin)?;
+        Ok(endpoint.binary_sha256.as_deref() == Some(expected.as_str()))
     }
 
     fn is_adopted_addr(&self, endpoint: &RouterEndpoint) -> bool {
@@ -671,6 +685,13 @@ fn healthy_router_endpoint() -> Result<Option<(RouterEndpoint, serde_json::Value
     {
         endpoint.process_start_time = Some(start_time);
     }
+    let health_binary_sha256 = response
+        .pointer("/payload/binary_sha256")
+        .and_then(serde_json::Value::as_str);
+    if endpoint.binary_sha256.as_deref() != health_binary_sha256 {
+        let _ = std::fs::remove_file(router_addr_path());
+        return Ok(None);
+    }
     Ok(Some((endpoint, response)))
 }
 
@@ -682,7 +703,38 @@ fn parse_router_endpoint(raw: &str) -> Result<Option<RouterEndpoint>> {
     if endpoint.addr.trim().is_empty() {
         return Ok(None);
     }
+    if !endpoint
+        .binary_sha256
+        .as_deref()
+        .is_some_and(is_lower_sha256)
+    {
+        return Ok(None);
+    }
     Ok(Some(endpoint))
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open router executable {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let bytes = file
+            .read(&mut buffer)
+            .with_context(|| format!("hash router executable {}", path.display()))?;
+        if bytes == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn wait_for_router_addr_unreachable(addr: &str, timeout: Duration) -> bool {
@@ -819,6 +871,7 @@ fn router_lock_matches_endpoint(endpoint: &RouterEndpoint) -> bool {
     };
     record.kind.as_deref() == Some("router")
         && record.build_kind.as_deref() == Some(tura_path::build_kind())
+        && record.binary_sha256.as_deref() == endpoint.binary_sha256.as_deref()
         && record
             .home
             .as_deref()
@@ -838,6 +891,7 @@ fn read_process_lock_record(path: &Path) -> Option<ProcessLockRecord> {
         process_start_time: None,
         kind: None,
         build_kind: None,
+        binary_sha256: None,
         home: None,
     };
     for line in raw.lines() {
@@ -849,6 +903,7 @@ fn read_process_lock_record(path: &Path) -> Option<ProcessLockRecord> {
             "process_start_time" => record.process_start_time = value.trim().parse().ok(),
             "kind" => record.kind = Some(value.trim().to_string()),
             "build_kind" => record.build_kind = Some(value.trim().to_string()),
+            "binary_sha256" => record.binary_sha256 = Some(value.trim().to_string()),
             "home" => record.home = Some(value.trim().to_string()),
             _ => {}
         }
@@ -1105,6 +1160,7 @@ mod tests {
             json!({
                 "addr": addr.to_string(),
                 "version": tura_path::instance_version(),
+                "binary_sha256": "a".repeat(64),
             }),
         )?;
 
@@ -1185,6 +1241,7 @@ mod tests {
             json!({
                 "addr": addr,
                 "version": tura_path::instance_version(),
+                "binary_sha256": "a".repeat(64),
             }),
         )?;
 
@@ -1214,6 +1271,7 @@ mod tests {
             json!({
                 "addr": addr,
                 "version": tura_path::instance_version(),
+                "binary_sha256": "a".repeat(64),
             }),
         )?;
 
@@ -1248,6 +1306,7 @@ mod tests {
             json!({
                 "addr": addr,
                 "version": tura_path::instance_version(),
+                "binary_sha256": "a".repeat(64),
                 "pid": 4242,
                 "process_start_time": 777,
             }),
@@ -1269,6 +1328,7 @@ mod tests {
             &json!({
                 "addr": "127.0.0.1:12",
                 "version": tura_path::instance_version(),
+                "binary_sha256": "a".repeat(64),
                 "pid": 12,
                 "process_start_time": 34,
             })
@@ -1278,20 +1338,67 @@ mod tests {
         .expect("compatible endpoint");
 
         assert_eq!(parsed.addr, "127.0.0.1:12");
+        assert_eq!(
+            parsed.binary_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert_eq!(parsed.pid, Some(12));
         assert_eq!(parsed.process_start_time, Some(34));
 
-        assert!(parse_router_endpoint(
-            &json!({"addr": "127.0.0.1:12", "version": "old"}).to_string()
-        )
-        .expect("incompatible endpoint should parse")
-        .is_none());
+        assert!(
+            parse_router_endpoint(
+                &json!({
+                    "addr": "127.0.0.1:12",
+                    "version": tura_path::instance_version(),
+                })
+                .to_string()
+            )
+            .expect("legacy endpoint should parse")
+            .is_none()
+        );
+
+        assert!(
+            parse_router_endpoint(&json!({"addr": "127.0.0.1:12", "version": "old"}).to_string())
+                .expect("incompatible endpoint should parse")
+                .is_none()
+        );
         let missing_addr =
             parse_router_endpoint(&json!({"version": tura_path::instance_version()}).to_string())
                 .expect_err("missing address should be rejected");
         assert!(
             missing_addr.to_string().contains("missing field `addr`"),
             "error should describe the missing router address: {missing_addr:#}"
+        );
+    }
+
+    #[test]
+    fn router_binary_identity_rejects_an_endpoint_from_the_replaced_preimage() {
+        let root = temp_home("tura-router-binary-identity").expect("temp root");
+        let router_bin = root.join("tura_router");
+        std::fs::write(&router_bin, b"old-router-binary").expect("old router binary");
+        let old_sha = file_sha256(&router_bin).expect("old router digest");
+        std::fs::write(&router_bin, b"new-router-binary").expect("new router binary");
+
+        let process = RouterProcess {
+            router_bin: Some(router_bin),
+            addr: ParkingMutex::new(None),
+            child: ParkingMutex::new(None),
+            request_seq: AtomicU64::new(1),
+            restart_count: AtomicU64::new(0),
+            last_error: ParkingMutex::new(None),
+        };
+        let endpoint = RouterEndpoint {
+            addr: "127.0.0.1:1".to_string(),
+            version: tura_path::instance_version(),
+            binary_sha256: Some(old_sha),
+            pid: Some(42),
+            process_start_time: Some(84),
+        };
+
+        assert!(
+            !process
+                .router_binary_matches(&endpoint)
+                .expect("compare router binary identity")
         );
     }
 
@@ -1307,8 +1414,9 @@ mod tests {
         std::fs::write(
             router_lock_path(),
             format!(
-                "pid={current_pid}\nprocess_start_time={current_start}\nkind=router\nbuild_kind={}\nhome={}\n",
+                "pid={current_pid}\nprocess_start_time={current_start}\nkind=router\nbuild_kind={}\nbinary_sha256={}\nhome={}\n",
                 tura_path::build_kind(),
+                "a".repeat(64),
                 tura_path::instance_home().display()
             ),
         )
@@ -1316,6 +1424,7 @@ mod tests {
         let matching = RouterEndpoint {
             addr: "127.0.0.1:1".to_string(),
             version: tura_path::instance_version(),
+            binary_sha256: Some("a".repeat(64)),
             pid: Some(current_pid),
             process_start_time: Some(current_start),
         };
@@ -1330,12 +1439,15 @@ mod tests {
         let no_start_time = RouterEndpoint {
             addr: "127.0.0.1:1".to_string(),
             version: tura_path::instance_version(),
+            binary_sha256: Some("a".repeat(64)),
             pid: Some(current_pid),
             process_start_time: None,
         };
         assert!(!router_endpoint_process_identity_matches(&no_start_time));
-        assert!(!terminate_router_endpoint_process(&no_start_time)
-            .expect("missing fingerprint should refuse forced termination"));
+        assert!(
+            !terminate_router_endpoint_process(&no_start_time)
+                .expect("missing fingerprint should refuse forced termination")
+        );
     }
 
     #[test]
@@ -1351,6 +1463,7 @@ mod tests {
         let endpoint = RouterEndpoint {
             addr: "127.0.0.1:1".to_string(),
             version: tura_path::instance_version(),
+            binary_sha256: Some("a".repeat(64)),
             pid: Some(current_pid),
             process_start_time: Some(current_start),
         };
@@ -1523,8 +1636,8 @@ mod tests {
     }
 
     #[test]
-    fn router_socket_deadline_reproduces_slow_enqueue_failure_but_no_deadline_waits(
-    ) -> anyhow::Result<()> {
+    fn router_socket_deadline_reproduces_slow_enqueue_failure_but_no_deadline_waits()
+    -> anyhow::Result<()> {
         fn delayed_response(
             delay: Duration,
         ) -> anyhow::Result<(String, thread::JoinHandle<anyhow::Result<()>>)> {

@@ -4279,6 +4279,7 @@ dependencies = [
  "serde_json",
  "session_lifecycle",
  "session_log_contract",
+ "sha2",
  "sysinfo",
  "tempfile",
  "tokio",

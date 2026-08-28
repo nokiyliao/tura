@@ -34,6 +34,7 @@ tura_path = { workspace = true }
 tools = { workspace = true }
 fs2.workspace = true
 sysinfo.workspace = true
+sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
