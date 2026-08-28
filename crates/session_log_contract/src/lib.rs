@@ -22,3 +22,4 @@ pub use protocol::{
     SessionRecord, SessionRecordProjection, SessionSnapshot, SessionSummary, UpdateSessionRequest,
     UpdateSessionTodosRequest, WorkspaceSummary,
 };
+pub use protocol::recovery_terminal_projection_event_id;

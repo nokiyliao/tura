@@ -10,9 +10,9 @@ use lifecycle::{
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use session_log_contract::{
-    GetRuntimeLeaseRequest, RecoveryCloseRuntimeOutcome, RecoveryCloseRuntimeReason,
-    RecoveryCloseRuntimeRequest, RuntimeLeaseSnapshot, RuntimeRecoveryReceipt,
-    SessionFeedEvent,
+    recovery_terminal_projection_event_id, GetRuntimeLeaseRequest,
+    RecoveryCloseRuntimeOutcome, RecoveryCloseRuntimeReason, RecoveryCloseRuntimeRequest,
+    RuntimeLeaseSnapshot, RuntimeRecoveryReceipt, SessionFeedEvent,
 };
 use std::path::{Path, PathBuf};
 
@@ -436,7 +436,7 @@ fn ensure_recovery_terminal_feed(
     projection: &lifecycle::SessionProjection,
     updated_at: i64,
 ) -> Result<()> {
-    let event_id = format!("runtime-recovery:{receipt_id}:session-projection");
+    let event_id = recovery_terminal_projection_event_id(receipt_id);
     let exists = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_feed_events WHERE event_id = ?1)",
         params![event_id],

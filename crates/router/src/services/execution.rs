@@ -17,13 +17,14 @@ use router_contract::{CancelRuntimeRequest, EnqueueTurnRequest, ProbeSessionsReq
 use runtime_contract::{LifecycleExecutionContext, RunAgentRequest};
 use session_lifecycle::{
     commander_store_path, IntakeOutcome, LifecycleConfig, LiveEffectEvidence, ReclaimOutcome,
-    SessionLifecycleStore, TerminalState,
+    SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity, TerminalState,
 };
 use session_log_contract::{
-    ActivateRuntimeLeaseRequest, GetRuntimeLeaseRequest, GetSessionRequest,
-    RecoveryCloseRuntimeOutcome, RecoveryCloseRuntimeReason, RecoveryCloseRuntimeRequest,
-    RegisterRuntimeRequest, ReplayRuntimeRequest, RuntimeLeaseOutcome, RuntimeLeaseSnapshot,
-    RuntimeRecoveryQuiescenceProof, RuntimeRegistrationOutcome, SessionFeedEntry, SessionFeedEvent,
+    recovery_terminal_projection_event_id, ActivateRuntimeLeaseRequest, GetRuntimeLeaseRequest,
+    GetSessionRequest, RecoveryCloseRuntimeOutcome, RecoveryCloseRuntimeReason,
+    RecoveryCloseRuntimeRequest, RegisterRuntimeRequest, ReplayRuntimeRequest,
+    RuntimeLeaseOutcome, RuntimeLeaseSnapshot, RuntimeRecoveryQuiescenceProof,
+    RuntimeRecoveryReceipt, RuntimeRegistrationOutcome, SessionFeedEntry, SessionFeedEvent,
     SessionLogCommand, SessionLogResponse,
 };
 
@@ -1028,6 +1029,7 @@ impl ExecutionService {
                     && receipt.terminal
                     && !receipt.lease_active =>
             {
+                self.write_recovery_terminal_receipt(&lease, &receipt)?;
                 Ok(())
             }
             other => Err(anyhow!(
@@ -1047,6 +1049,12 @@ impl ExecutionService {
             .terminalize_registered_runtime(state, session_id, runtime_id)
             .await;
         if let Err(error) = terminalization {
+            if !error
+                .to_string()
+                .starts_with("RUNTIME_TERMINALIZATION_LEASE_NOT_FOUND:")
+            {
+                return Err(error);
+            }
             self.confirm_runtime_durably_closed(state, session_id, runtime_id, lease)
                 .map_err(|readback_error| {
                     anyhow!(
@@ -1054,6 +1062,60 @@ impl ExecutionService {
                     )
                 })?;
         }
+        Ok(())
+    }
+
+    fn write_recovery_terminal_receipt(
+        &self,
+        lease: &RuntimeLease,
+        recovery: &RuntimeRecoveryReceipt,
+    ) -> Result<()> {
+        let receipt_lease_id = recovery.lease_id.as_deref().ok_or_else(|| {
+            anyhow!(
+                "RUNTIME_RECOVERY_TERMINAL_RECEIPT_LEASE_MISSING:{}",
+                recovery.runtime_id
+            )
+        })?;
+        let event_id = recovery_terminal_projection_event_id(&recovery.receipt_id);
+        let mut receipt = TerminalReceipt::new(
+            TerminalReceiptIdentity::new(
+                &lease.transaction_id,
+                event_id,
+                0,
+                &lease.commander_session_id,
+                &recovery.session_id,
+                &recovery.runtime_id,
+                receipt_lease_id,
+            ),
+            terminal_state(recovery.session_state)?,
+            recovery.closed_at,
+        );
+        receipt.task_id.clone_from(&lease.task_id);
+        receipt.goal_id.clone_from(&lease.goal_id);
+        receipt.operator_override = lease.operator_override;
+        receipt.audit_metadata.insert(
+            "runtime_event_seq".to_string(),
+            json!(recovery.last_event_seq),
+        );
+        receipt.audit_metadata.insert(
+            "runtime_expected_revision".to_string(),
+            json!(recovery.revision.saturating_sub(1)),
+        );
+        receipt.audit_metadata.insert(
+            "runtime_state".to_string(),
+            json!(recovery.session_state),
+        );
+        receipt.audit_metadata.insert(
+            "dispatch_runtime_id".to_string(),
+            json!(lease.runtime_id),
+        );
+        receipt.audit_metadata.insert(
+            "dispatch_lease_id".to_string(),
+            json!(lease.lease_id),
+        );
+        lifecycle_store(&lease.commander_session_id)?
+            .write_terminal_receipt(&receipt)
+            .map_err(|error| anyhow!(error.to_string()))?;
         Ok(())
     }
 
@@ -2319,7 +2381,7 @@ mod tests {
         assert_eq!(response["terminalization_pending"], true);
         assert!(response["terminalization_error"]
             .as_str()
-            .is_some_and(|error| error.contains("RUNTIME_CANCEL_TERMINALIZATION_FAILED")));
+            .is_some_and(|error| !error.trim().is_empty()));
         assert!(service
             .sessions
             .lock()

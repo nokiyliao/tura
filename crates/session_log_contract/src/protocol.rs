@@ -503,6 +503,10 @@ pub enum RecoveryCloseRuntimeReason {
     UnbornRuntime,
 }
 
+pub fn recovery_terminal_projection_event_id(receipt_id: &str) -> String {
+    format!("runtime-recovery:{receipt_id}:session-projection")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeRecoveryQuiescenceProof {
