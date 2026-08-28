@@ -225,13 +225,29 @@ impl ExecutionService {
                         )
                         .await
                     {
-                        Ok(()) => {
-                            active_guard.finish();
-                            drop(permit);
-                            return Err(anyhow!(
-                                "TERMINAL_RECEIPT_NOT_DURABLE:{error:#}:RUNTIME_TERMINALIZED"
-                            ));
-                        }
+                        Ok(()) => match self.ensure_terminal_receipt(
+                            &request.session_id,
+                            &request.runtime_id,
+                            request_id,
+                        ) {
+                            Ok(delivery) => delivery,
+                            Err(receipt_error) => {
+                                match self.retain_runtime_slot_if_current(
+                                    &request.session_id,
+                                    &request.runtime_id,
+                                    permit,
+                                ) {
+                                    Ok(()) => active_guard.retain(),
+                                    Err(permit) => {
+                                        active_guard.finish();
+                                        drop(permit);
+                                    }
+                                }
+                                return Err(anyhow!(
+                                    "TERMINAL_RECEIPT_NOT_DURABLE:{error:#}:RUNTIME_TERMINALIZED_BUT_RECEIPT_NOT_DURABLE:{receipt_error:#}"
+                                ));
+                            }
+                        },
                         Err(terminalization_error) => {
                             match self.retain_runtime_slot_if_current(
                                 &request.session_id,
@@ -249,19 +265,20 @@ impl ExecutionService {
                             ));
                         }
                     }
-                }
-                match self.retain_runtime_slot_if_current(
-                    &request.session_id,
-                    &request.runtime_id,
-                    permit,
-                ) {
-                    Ok(()) => active_guard.retain(),
-                    Err(permit) => {
-                        active_guard.finish();
-                        drop(permit);
+                } else {
+                    match self.retain_runtime_slot_if_current(
+                        &request.session_id,
+                        &request.runtime_id,
+                        permit,
+                    ) {
+                        Ok(()) => active_guard.retain(),
+                        Err(permit) => {
+                            active_guard.finish();
+                            drop(permit);
+                        }
                     }
+                    return Err(anyhow!("TERMINAL_RECEIPT_NOT_DURABLE:{error:#}"));
                 }
-                return Err(anyhow!("TERMINAL_RECEIPT_NOT_DURABLE:{error:#}"));
             }
         };
         state
@@ -547,7 +564,7 @@ impl ExecutionService {
             "retained_process_scopes_terminated": retained_process_scopes_terminated,
             "runtime_terminalized": runtime_terminalized,
             "terminalization_pending": !runtime_terminalized,
-            "active_turn_removed": runtime_terminalized,
+            "active_turn_removed": false,
             "terminalization_error": terminalization_error
         })
     }
@@ -1036,13 +1053,6 @@ impl ExecutionService {
                         "RUNTIME_CANCEL_TERMINALIZATION_FAILED:{error:#}:DURABLE_READBACK_FAILED:{readback_error:#}"
                     )
                 })?;
-        }
-        let mut sessions = self.sessions.lock();
-        if sessions
-            .get(session_id)
-            .is_some_and(|current| current.runtime_id == runtime_id)
-        {
-            sessions.remove(session_id);
         }
         Ok(())
     }

@@ -1,5 +1,6 @@
 use super::helpers::{append_session_event, replay_session_events};
 use super::runtime_events::{load_session_projection_row, persist_session_projection};
+use super::feed::append_session_feed_event_tx;
 use super::SessionLogStore;
 use anyhow::{Context, Result};
 use lifecycle::{
@@ -11,6 +12,7 @@ use serde::Serialize;
 use session_log_contract::{
     GetRuntimeLeaseRequest, RecoveryCloseRuntimeOutcome, RecoveryCloseRuntimeReason,
     RecoveryCloseRuntimeRequest, RuntimeLeaseSnapshot, RuntimeRecoveryReceipt,
+    SessionFeedEvent,
 };
 use std::path::{Path, PathBuf};
 
@@ -160,6 +162,16 @@ impl SessionLogStore {
                         current_state: session.state,
                     });
                 }
+                let projection = session.query(SessionQuery::Lifecycle);
+                ensure_recovery_terminal_feed(
+                    &tx,
+                    &receipt.receipt_id,
+                    &receipt.session_id,
+                    &receipt.runtime_id,
+                    &projection,
+                    receipt.closed_at,
+                )?;
+                tx.commit()?;
                 return Ok(RecoveryCloseRuntimeOutcome::AlreadyClosed { receipt });
             }
 
@@ -374,6 +386,15 @@ impl SessionLogStore {
             } else {
                 session_event_seq
             };
+            let projection = session.query(SessionQuery::Lifecycle);
+            ensure_recovery_terminal_feed(
+                &tx,
+                &request.receipt_id,
+                &request.session_id,
+                &request.runtime_id,
+                &projection,
+                now_ms,
+            )?;
             let receipt = RuntimeRecoveryReceipt {
                 receipt_id: request.receipt_id.clone(),
                 database_path: request.database_path.clone(),
@@ -386,7 +407,7 @@ impl SessionLogStore {
                 reason: request.reason,
                 lease_active: false,
                 terminal: true,
-                session_state: session.query(SessionQuery::Lifecycle).state,
+                session_state: projection.state,
                 quiescence: request.quiescence.clone(),
                 closed_at: now_ms,
             };
@@ -405,6 +426,36 @@ impl SessionLogStore {
             Ok(RecoveryCloseRuntimeOutcome::Closed { receipt })
         })
     }
+}
+
+fn ensure_recovery_terminal_feed(
+    tx: &Transaction<'_>,
+    receipt_id: &str,
+    session_id: &str,
+    runtime_id: &str,
+    projection: &lifecycle::SessionProjection,
+    updated_at: i64,
+) -> Result<()> {
+    let event_id = format!("runtime-recovery:{receipt_id}:session-projection");
+    let exists = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_feed_events WHERE event_id = ?1)",
+        params![event_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        append_session_feed_event_tx(
+            tx,
+            session_id,
+            Some(runtime_id),
+            &event_id,
+            &SessionFeedEvent::SessionProjectionUpdated {
+                projection: projection.clone(),
+                session_name: None,
+                updated_at,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_request(request: &RecoveryCloseRuntimeRequest) -> Result<()> {
@@ -543,8 +594,8 @@ mod tests {
     use session_log_contract::{
         ActivateRuntimeLeaseRequest, CommitRuntimeEventRequest, CreateSessionRequest,
         ExecuteSessionCommandRequest, GetSessionRequest, MarkSessionInterruptedRequest,
-        RegisterRuntimeRequest, ReplayRuntimeRequest, RuntimeEventCommitOutcome,
-        RuntimeRecoveryQuiescenceProof, RuntimeRegistrationOutcome,
+        ReadSessionFeedRequest, RegisterRuntimeRequest, ReplayRuntimeRequest,
+        RuntimeEventCommitOutcome, RuntimeRecoveryQuiescenceProof, RuntimeRegistrationOutcome,
     };
 
     #[derive(Debug, PartialEq)]
@@ -916,6 +967,23 @@ mod tests {
             SessionState::Interrupted
         );
         assert!(session.lifecycle_projection.active_runtime_id.is_none());
+        let (feed, _) = fixture
+            .store
+            .read_session_feed(ReadSessionFeedRequest {
+                session_id: fixture.session_id.clone(),
+                after_cursor: 0,
+                limit: 100,
+            })
+            .expect("read recovery terminal feed");
+        assert_eq!(
+            feed.iter()
+                .filter(|entry| {
+                    entry.event_id
+                        == "runtime-recovery:recovery-receipt-orphaned:session-projection"
+                })
+                .count(),
+            1
+        );
 
         let mut replay = request;
         replay.quiescence.active_turn = true;
@@ -926,6 +994,23 @@ mod tests {
                 .expect("replay recovery receipt"),
             RecoveryCloseRuntimeOutcome::AlreadyClosed { .. }
         ));
+        let (feed, _) = fixture
+            .store
+            .read_session_feed(ReadSessionFeedRequest {
+                session_id: fixture.session_id.clone(),
+                after_cursor: 0,
+                limit: 100,
+            })
+            .expect("read replayed recovery terminal feed");
+        assert_eq!(
+            feed.iter()
+                .filter(|entry| {
+                    entry.event_id
+                        == "runtime-recovery:recovery-receipt-orphaned:session-projection"
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]
