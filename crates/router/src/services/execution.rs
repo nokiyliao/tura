@@ -475,18 +475,31 @@ impl ExecutionService {
         };
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
-        let owns_current_lease = self
+        let lease = self
             .sessions
             .lock()
             .get(&session_id)
-            .is_some_and(|lease| lease.runtime_id == runtime_id);
-        if !owns_current_lease {
+            .filter(|lease| lease.runtime_id == runtime_id)
+            .cloned();
+        let Some(lease) = lease else {
             return json!({
                 "status": "idle",
                 "session_id": session_id,
                 "runtime_id": runtime_id,
                 "stopped_worker": false,
                 "active_command_runs_cancelled": 0,
+            });
+        };
+        if let Err(error) = self.mark_terminalizing(&session_id, &runtime_id) {
+            return json!({
+                "status": "error",
+                "session_id": session_id,
+                "runtime_id": runtime_id,
+                "stopped_worker": false,
+                "active_command_runs_cancelled": 0,
+                "runtime_terminalized": false,
+                "terminalization_pending": false,
+                "terminalization_error": error.to_string(),
             });
         }
         let stopped_worker = state
@@ -519,19 +532,22 @@ impl ExecutionService {
         if let Some(notify) = self.retained_watchers.lock().remove(&session_id) {
             notify.notify_one();
         }
-        let terminalization = self.mark_terminalizing(&session_id, &runtime_id);
+        let terminalization = self
+            .terminalize_cancelled_runtime(state, &session_id, &runtime_id, &lease)
+            .await;
         let terminalization_error = terminalization.as_ref().err().map(ToString::to_string);
+        let runtime_terminalized = terminalization.is_ok();
         json!({
-            "status": if terminalization.is_ok() { "cancelling" } else { "error" },
+            "status": if runtime_terminalized { "cancelled" } else { "error" },
             "session_id": session_id,
             "runtime_id": runtime_id,
             "stopped_worker": stopped_worker,
             "active_command_runs_cancelled": active_command_runs_cancelled,
             "active_command_runs_remaining": state.command_run.active_count_for_session(&session_id),
             "retained_process_scopes_terminated": retained_process_scopes_terminated,
-            "runtime_terminalized": false,
-            "terminalization_pending": terminalization.is_ok(),
-            "active_turn_removed": false,
+            "runtime_terminalized": runtime_terminalized,
+            "terminalization_pending": !runtime_terminalized,
+            "active_turn_removed": runtime_terminalized,
             "terminalization_error": terminalization_error
         })
     }
@@ -1001,6 +1017,74 @@ impl ExecutionService {
                 "RUNTIME_TERMINALIZATION_RECOVERY_REJECTED:{other:?}"
             )),
         }
+    }
+
+    async fn terminalize_cancelled_runtime(
+        &self,
+        state: &AppState,
+        session_id: &str,
+        runtime_id: &str,
+        lease: &RuntimeLease,
+    ) -> Result<()> {
+        let terminalization = self
+            .terminalize_registered_runtime(state, session_id, runtime_id)
+            .await;
+        if let Err(error) = terminalization {
+            self.confirm_runtime_durably_closed(state, session_id, runtime_id, lease)
+                .map_err(|readback_error| {
+                    anyhow!(
+                        "RUNTIME_CANCEL_TERMINALIZATION_FAILED:{error:#}:DURABLE_READBACK_FAILED:{readback_error:#}"
+                    )
+                })?;
+        }
+        let mut sessions = self.sessions.lock();
+        if sessions
+            .get(session_id)
+            .is_some_and(|current| current.runtime_id == runtime_id)
+        {
+            sessions.remove(session_id);
+        }
+        Ok(())
+    }
+
+    fn confirm_runtime_durably_closed(
+        &self,
+        state: &AppState,
+        session_id: &str,
+        runtime_id: &str,
+        lease: &RuntimeLease,
+    ) -> Result<()> {
+        state.session_db.start()?;
+        let snapshot = match session_log_contract::client::call_service(
+            &SessionLogCommand::GetRuntimeLease(GetRuntimeLeaseRequest {
+                runtime_id: runtime_id.to_string(),
+                database_path: None,
+            }),
+        )? {
+            SessionLogResponse::RuntimeLeaseRead {
+                runtime: Some(runtime),
+            } => runtime,
+            SessionLogResponse::RuntimeLeaseRead { runtime: None } => {
+                return Err(anyhow!(
+                    "RUNTIME_CANCEL_DURABLE_LEASE_NOT_FOUND:{runtime_id}"
+                ));
+            }
+            SessionLogResponse::Error { error } => return Err(anyhow!(error)),
+            other => {
+                return Err(anyhow!(
+                    "RUNTIME_CANCEL_LEASE_READ_UNEXPECTED:{other:?}"
+                ));
+            }
+        };
+        validate_terminalization_identity(&snapshot, lease, session_id, runtime_id)?;
+        if !snapshot.terminal || snapshot.lease_active {
+            return Err(anyhow!(
+                "RUNTIME_CANCEL_DURABLE_STATE_CONFLICT:runtime={runtime_id},terminal={},lease_active={}",
+                snapshot.terminal,
+                snapshot.lease_active
+            ));
+        }
+        Ok(())
     }
 
     fn ensure_terminal_receipt(
@@ -2203,7 +2287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_active_turn_preserves_identity_until_durable_terminalization() {
+    async fn cancel_active_turn_fails_closed_without_durable_runtime() {
         let state = build_state();
         let service = ExecutionService::new();
         service.set_session_lease_for_test("active-session", true);
@@ -2218,11 +2302,14 @@ mod tests {
             )
             .await;
 
-        assert_eq!(response["status"], "cancelling");
+        assert_eq!(response["status"], "error");
         assert_eq!(response["session_id"], "active-session");
         assert_eq!(response["stopped_worker"], false);
         assert_eq!(response["runtime_terminalized"], false);
         assert_eq!(response["terminalization_pending"], true);
+        assert!(response["terminalization_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("RUNTIME_CANCEL_TERMINALIZATION_FAILED")));
         assert!(service
             .sessions
             .lock()
@@ -2283,9 +2370,11 @@ mod tests {
             )
             .await;
 
-        assert_eq!(response["status"], "cancelling");
+        assert_eq!(response["status"], "error");
         assert_eq!(response["active_command_runs_cancelled"], 1);
         assert_eq!(response["active_command_runs_remaining"], 0);
+        assert_eq!(response["runtime_terminalized"], false);
+        assert_eq!(response["terminalization_pending"], true);
         tokio::time::timeout(Duration::from_secs(2), running)
             .await
             .expect("cancelled command task should terminate promptly")
