@@ -583,7 +583,7 @@ impl ExecutionService {
                 .stop_workers_with_prefix("runtime_worker:")
                 .await;
             let leases = self.sessions.lock().clone();
-            let mut terminalizing_count = 0;
+            let mut terminalized_count = 0;
             let mut terminalization_failures = Vec::new();
             for (session_id, lease) in leases {
                 state.command_run.cancel_session(&session_id);
@@ -601,8 +601,13 @@ impl ExecutionService {
                     notify.notify_one();
                 }
                 let terminalization = if drained {
-                    self.mark_terminalizing(&session_id, &lease.runtime_id)
-                        .map(|_| ())
+                    self.terminalize_cancelled_runtime(
+                        state,
+                        &session_id,
+                        &lease.runtime_id,
+                        &lease,
+                    )
+                    .await
                 } else {
                     Err(anyhow!(
                         "RUNTIME_TERMINALIZATION_COMMAND_RUN_DID_NOT_DRAIN:session={session_id},runtime={}",
@@ -610,7 +615,7 @@ impl ExecutionService {
                     ))
                 };
                 match terminalization {
-                    Ok(()) => terminalizing_count += 1,
+                    Ok(()) => terminalized_count += 1,
                     Err(error) => terminalization_failures.push(json!({
                         "session_id": session_id,
                         "runtime_id": lease.runtime_id,
@@ -623,7 +628,8 @@ impl ExecutionService {
                 "stopped": stopped,
                 "stopped_worker": stopped > 0,
                 "active_turns_removed": 0,
-                "terminalizing_count": terminalizing_count,
+                "terminalized_count": terminalized_count,
+                "terminalizing_count": 0,
                 "terminalization_failures": terminalization_failures
             });
         };
@@ -649,9 +655,10 @@ impl ExecutionService {
             notify.notify_one();
         }
         let terminalization = match lease.as_ref() {
-            Some(lease) if command_runs_drained => self
-                .mark_terminalizing(&session_id, &lease.runtime_id)
-                .map(|_| ()),
+            Some(lease) if command_runs_drained => {
+                self.terminalize_cancelled_runtime(state, &session_id, &lease.runtime_id, lease)
+                    .await
+            }
             Some(lease) => Err(anyhow!(
                 "RUNTIME_TERMINALIZATION_COMMAND_RUN_DID_NOT_DRAIN:session={session_id},runtime={}",
                 lease.runtime_id
@@ -659,8 +666,10 @@ impl ExecutionService {
             None => Ok(()),
         };
         let terminalization_error = terminalization.as_ref().err().map(ToString::to_string);
+        let runtime_terminalized =
+            lease.is_none() || (command_runs_drained && terminalization.is_ok());
         json!({
-            "status": if command_runs_drained && terminalization.is_ok() { "stopping" } else { "error" },
+            "status": if runtime_terminalized { "stopped" } else { "error" },
             "session_id": session_id,
             "stopped": usize::from(stopped_worker),
             "stopped_worker": stopped_worker,
@@ -668,8 +677,8 @@ impl ExecutionService {
             "active_command_runs_cancelled": active_command_runs_cancelled,
             "active_command_runs_remaining": state.command_run.active_count_for_session(&session_id),
             "retained_process_scopes_terminated": retained_process_scopes_terminated,
-            "runtime_terminalized": lease.is_none(),
-            "terminalization_pending": lease.is_some() && terminalization.is_ok(),
+            "runtime_terminalized": runtime_terminalized,
+            "terminalization_pending": false,
             "terminalization_error": terminalization_error
         })
     }

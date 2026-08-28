@@ -253,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_session_workers_preserves_identity_for_terminalization() -> anyhow::Result<()> {
+    fn kill_session_workers_fails_closed_without_durable_runtime() -> anyhow::Result<()> {
         let state = build_state();
         state
             .execution
@@ -271,10 +271,14 @@ mod tests {
         ));
 
         assert!(response.ok, "kill failed: {:?}", response.error);
-        assert_eq!(response.payload["status"], "stopping");
+        assert_eq!(response.payload["status"], "error");
         assert_eq!(response.payload["session_id"], "kill-session");
         assert_eq!(response.payload["active_turn_removed"], false);
-        assert_eq!(response.payload["terminalization_pending"], true);
+        assert_eq!(response.payload["runtime_terminalized"], false);
+        assert_eq!(response.payload["terminalization_pending"], false);
+        assert!(response.payload["terminalization_error"]
+            .as_str()
+            .is_some_and(|error| !error.trim().is_empty()));
 
         let probe = tokio_runtime()?.block_on(handle_ipc_request(
             &state,
