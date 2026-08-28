@@ -144,9 +144,10 @@ impl AgentRegistry {
         self.resolve_by_name_from_roots(name, &agent_lookup_roots())
     }
 
-    #[cfg(test)]
-    fn resolve_by_name_from_root(&self, name: &str, project_root: &Path) -> Option<AgentSpec> {
-        self.resolve_by_name_from_roots(name, &[project_root.to_path_buf()])
+    pub fn resolve_by_name_from_root(&self, name: &str, project_root: &Path) -> Option<AgentSpec> {
+        tura_agents::store::load_agent(project_root, name)
+            .map(spec_from_stored_agent)
+            .or_else(|| self.resolve_by_name(name))
     }
 
     fn resolve_by_name_from_roots(&self, name: &str, roots: &[PathBuf]) -> Option<AgentSpec> {
@@ -187,6 +188,25 @@ impl AgentRegistry {
             && let Some(spec) = self.resolve_by_name(agent)
         {
             return spec;
+        }
+        self.resolve_by_session_type(session_type.unwrap_or("general"))
+    }
+
+    pub fn resolve_for_project(
+        &self,
+        agent: Option<&str>,
+        session_type: Option<&str>,
+        project_root: Option<&Path>,
+    ) -> AgentSpec {
+        if let Some(agent) = agent {
+            if let Some(project_root) = project_root
+                && let Some(spec) = self.resolve_by_name_from_root(agent, project_root)
+            {
+                return spec;
+            }
+            if let Some(spec) = self.resolve_by_name(agent) {
+                return spec;
+            }
         }
         self.resolve_by_session_type(session_type.unwrap_or("general"))
     }
@@ -411,6 +431,50 @@ mod tests {
         assert_eq!(spec.agent_name, "fresh-executor");
         assert_eq!(spec.capabilities, vec!["apply_patch"]);
         assert!(spec.config.is_some());
+    }
+
+    #[test]
+    fn request_project_agent_overrides_router_startup_snapshot() {
+        let project = tempfile::tempdir().expect("project");
+        let registry = AgentRegistry::from_static();
+        let config = tura_agents::store::AgentConfig {
+            agent_name: "direct".to_string(),
+            description: Some("request-scoped direct agent".to_string()),
+            aliases: vec![],
+            icon_emoji: None,
+            agent_directory: "agents/src/direct".into(),
+            parent_agent_id: None,
+            report_to_user: true,
+            default_config: false,
+            reflection: false,
+            op_manual: false,
+            self_reflection: false,
+            provider: serde_json::json!({
+                "current_model": "missing-route",
+                "default_model_tier": "thinking",
+                "tura_llm_name": "fast",
+                "tool_choice": "Auto"
+            }),
+            agent_prompt: vec![],
+            agent_capabilities: vec![],
+            validator: serde_json::json!({
+                "need_validator": false,
+                "validator_name": null
+            }),
+        };
+        tura_agents::store::save_dynamic_agent(project.path(), &config, None)
+            .expect("save request-scoped direct agent");
+
+        let spec = registry
+            .resolve_by_name_from_root("direct", project.path())
+            .expect("request-scoped direct agent should resolve");
+        let current_model = spec
+            .config
+            .as_ref()
+            .and_then(|config| config.provider.get("current_model"))
+            .and_then(serde_json::Value::as_str);
+
+        assert_eq!(current_model, Some("missing-route"));
     }
 
     #[test]

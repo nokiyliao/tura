@@ -9,6 +9,8 @@ use crate::services::runtime_workers::runtime_worker_limit;
 use runtime_contract::{CallContext, LifecycleExecutionContext, RunAgentRequest};
 use tura_router::registry::{binary_target_diagnostics, resolve_binary_target};
 
+const PROJECT_ROOT_ENV: &str = "TURA_PROJECT_ROOT";
+
 /// Maximum recursion depth for child sub-sessions (fork-bomb guard, T5.4).
 const MAX_PLANNING_DEPTH: usize = 3;
 /// Pure-logic core of run_agent: resolve agent spec, spawn the runtime-
@@ -135,10 +137,25 @@ async fn dispatch_run_agent_inner(
         );
     }
 
-    let agent_spec = state
-        .registry
-        .agents
-        .resolve(req.agent.as_deref(), req.session_type.as_deref());
+    let request_project_root = match request_project_root(&req) {
+        Ok(root) => root,
+        Err(error) => {
+            return (
+                400,
+                json!({
+                    "ok": false,
+                    "code": "TURA_PROJECT_ROOT_INVALID",
+                    "error": error,
+                    "session_id": session_id,
+                }),
+            );
+        }
+    };
+    let agent_spec = state.registry.agents.resolve_for_project(
+        req.agent.as_deref(),
+        req.session_type.as_deref(),
+        request_project_root.as_deref(),
+    );
 
     if let Err(error) = state.session_db.start() {
         return (
@@ -204,9 +221,12 @@ async fn dispatch_run_agent_inner(
     // Pass through the gateway-supplied env contract (planning,
     // reasoning, stall-guard, ...) verbatim.
     for (key, value) in &req.worker_env {
+        if key == PROJECT_ROOT_ENV {
+            continue;
+        }
         env.push((key.clone(), value.clone()));
     }
-    push_router_owned_runtime_env(&mut env);
+    push_router_owned_runtime_env(&mut env, request_project_root.as_deref());
     if let Ok(addr) = std::env::var("TURA_ROUTER_ADDR")
         && !addr.trim().is_empty()
     {
@@ -333,16 +353,37 @@ fn resolve_runtime_worker_binary(root: &std::path::Path) -> Option<std::path::Pa
     resolve_binary_target(root, "tura_runtime")
 }
 
-fn push_router_owned_runtime_env(env: &mut Vec<(String, String)>) {
+fn request_project_root(req: &RunAgentRequest) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(value) = req
+        .worker_env
+        .get(PROJECT_ROOT_ENV)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(value);
+    if path.is_dir() {
+        return Ok(Some(path));
+    }
+    Err(format!("{PROJECT_ROOT_ENV} is not a directory: {value}"))
+}
+
+fn push_router_owned_runtime_env(
+    env: &mut Vec<(String, String)>,
+    request_project_root: Option<&std::path::Path>,
+) {
     env.push((
         "TURA_HOME".to_string(),
         tura_path::instance_home().display().to_string(),
     ));
-    let project_root = std::env::var_os("TURA_PROJECT_ROOT")
-        .map(std::path::PathBuf::from)
+    let project_root = request_project_root
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::var_os(PROJECT_ROOT_ENV).map(std::path::PathBuf::from))
         .unwrap_or_else(tura_path::canonical_root);
     env.push((
-        "TURA_PROJECT_ROOT".to_string(),
+        PROJECT_ROOT_ENV.to_string(),
         project_root.display().to_string(),
     ));
     for key in ["SESSION_LOG_DB_ROOT", "TURA_DB_ROOT"] {
@@ -443,6 +484,79 @@ mod tests {
             input["task_context_capsule"]["semantic_sha256"],
             "capsule-digest"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn request_scoped_project_root_controls_agent_spec_and_worker_env() -> anyhow::Result<()> {
+        let state = build_state();
+        let project = tempfile::tempdir()?;
+        let config = tura_agents::store::AgentConfig {
+            agent_name: "direct".to_string(),
+            description: Some("request-scoped direct agent".to_string()),
+            aliases: vec![],
+            icon_emoji: None,
+            agent_directory: "agents/src/direct".into(),
+            parent_agent_id: None,
+            report_to_user: true,
+            default_config: false,
+            reflection: false,
+            op_manual: false,
+            self_reflection: false,
+            provider: serde_json::json!({
+                "current_model": "missing-route",
+                "default_model_tier": "thinking",
+                "tura_llm_name": "fast",
+                "tool_choice": "Auto"
+            }),
+            agent_prompt: vec![],
+            agent_capabilities: vec![],
+            validator: serde_json::json!({
+                "need_validator": false,
+                "validator_name": null
+            }),
+        };
+        tura_agents::store::save_dynamic_agent(project.path(), &config, None)
+            .map_err(anyhow::Error::msg)?;
+        let request: RunAgentRequest = serde_json::from_value(json!({
+            "runtime_id": "runtime-project-root",
+            "lease_id": "lease-project-root",
+            "session_id": "session-project-root",
+            "agent": "direct",
+            "prompt": "do not reach a provider",
+            "worker_env": {
+                "TURA_PROJECT_ROOT": project.path().to_string_lossy()
+            }
+        }))?;
+
+        let project_root = request_project_root(&request)
+            .map_err(anyhow::Error::msg)?
+            .expect("project root");
+        let spec = state.registry.agents.resolve_for_project(
+            request.agent.as_deref(),
+            request.session_type.as_deref(),
+            Some(&project_root),
+        );
+        let current_model = spec
+            .config
+            .as_ref()
+            .and_then(|config| config.provider.get("current_model"))
+            .and_then(Value::as_str);
+        assert_eq!(current_model, Some("missing-route"));
+
+        let mut env = request
+            .worker_env
+            .iter()
+            .filter(|(key, _)| key.as_str() != PROJECT_ROOT_ENV)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        push_router_owned_runtime_env(&mut env, Some(&project_root));
+        let project_roots = env
+            .iter()
+            .filter(|(key, _)| key == PROJECT_ROOT_ENV)
+            .collect::<Vec<_>>();
+        assert_eq!(project_roots.len(), 1);
+        assert_eq!(project_roots[0].1, project.path().to_string_lossy());
         Ok(())
     }
 

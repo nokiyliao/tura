@@ -156,7 +156,7 @@ pub(crate) fn configure_runtime_env(config: &CliConfig) -> Result<(), String> {
             );
         }
     }
-    configure_release_runtime_env();
+    configure_release_runtime_env()?;
     configure_progress_env(config);
     Ok(())
 }
@@ -364,26 +364,28 @@ fn project_root_from_exe() -> String {
         .to_string()
 }
 
-fn configure_release_runtime_env() {
-    let root = std::env::var_os("TURA_PROJECT_ROOT")
-        .map(PathBuf::from)
-        .filter(|path| find_project_root_from(path).is_some())
-        .unwrap_or_else(|| PathBuf::from(project_root_from_exe()))
-        .display()
-        .to_string();
+fn configure_release_runtime_env() -> Result<(), String> {
+    let release_root = PathBuf::from(project_root_from_exe());
+    let project_root = execution_project_root(
+        std::env::var_os("TURA_PROJECT_ROOT").map(PathBuf::from),
+        release_root.clone(),
+    )?;
     // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
     #[allow(
         unsafe_code,
         reason = "Rust 2024 process-environment mutation audited at the caller"
     )]
     unsafe {
-        std::env::set_var("TURA_PROJECT_ROOT", &root)
+        std::env::set_var("TURA_PROJECT_ROOT", &project_root)
     };
     if std::env::var_os("TURA_PROVIDER_CONFIG").is_none() {
-        let provider_config = PathBuf::from(&root)
-            .join("config")
-            .join("provider_config.json");
-        if provider_config.exists() {
+        let provider_config = [
+            project_root.join("config").join("provider_config.json"),
+            release_root.join("config").join("provider_config.json"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(provider_config) = provider_config {
             // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
             #[allow(
                 unsafe_code,
@@ -395,8 +397,10 @@ fn configure_release_runtime_env() {
         }
     }
     if std::env::var_os("TURA_ENV_PATH").is_none() {
-        let env_path = PathBuf::from(&root).join(".env");
-        if env_path.exists() {
+        let env_path = [project_root.join(".env"), release_root.join(".env")]
+            .into_iter()
+            .find(|path| path.is_file());
+        if let Some(env_path) = env_path {
             // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
             #[allow(
                 unsafe_code,
@@ -407,6 +411,23 @@ fn configure_release_runtime_env() {
             };
         }
     }
+    Ok(())
+}
+
+fn execution_project_root(
+    explicit_root: Option<PathBuf>,
+    release_root: PathBuf,
+) -> Result<PathBuf, String> {
+    let Some(explicit_root) = explicit_root else {
+        return Ok(release_root);
+    };
+    if explicit_root.is_dir() {
+        return Ok(explicit_root);
+    }
+    Err(format!(
+        "TURA_PROJECT_ROOT_INVALID:{}",
+        explicit_root.display()
+    ))
 }
 
 fn find_project_root_from(path: &Path) -> Option<PathBuf> {
@@ -426,4 +447,25 @@ fn find_project_root_from(path: &Path) -> Option<PathBuf> {
                         .exists())
         })
         .map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execution_project_root;
+
+    #[test]
+    fn explicit_agent_only_project_root_is_preserved() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("agents/src/direct"))
+            .expect("create agent-only project");
+        let release = tempfile::tempdir().expect("release");
+
+        let selected = execution_project_root(
+            Some(project.path().to_path_buf()),
+            release.path().to_path_buf(),
+        )
+        .expect("explicit root");
+
+        assert_eq!(selected, project.path());
+    }
 }
