@@ -151,11 +151,24 @@ async fn dispatch_run_agent_inner(
             );
         }
     };
-    let agent_spec = state.registry.agents.resolve_for_project(
+    let agent_spec = match state.registry.agents.resolve_for_project(
         req.agent.as_deref(),
         req.session_type.as_deref(),
         request_project_root.as_deref(),
-    );
+    ) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return (
+                400,
+                json!({
+                    "ok": false,
+                    "code": "TURA_AGENT_SELECTION_REJECTED",
+                    "error": error,
+                    "session_id": session_id,
+                }),
+            );
+        }
+    };
 
     if let Err(error) = state.session_db.start() {
         return (
@@ -484,6 +497,13 @@ mod tests {
             input["task_context_capsule"]["semantic_sha256"],
             "capsule-digest"
         );
+        assert_eq!(
+            input["task_context_capsule"],
+            request
+                .task_context_capsule
+                .clone()
+                .expect("request capsule")
+        );
         Ok(())
     }
 
@@ -532,11 +552,15 @@ mod tests {
         let project_root = request_project_root(&request)
             .map_err(anyhow::Error::msg)?
             .expect("project root");
-        let spec = state.registry.agents.resolve_for_project(
-            request.agent.as_deref(),
-            request.session_type.as_deref(),
-            Some(&project_root),
-        );
+        let spec = state
+            .registry
+            .agents
+            .resolve_for_project(
+                request.agent.as_deref(),
+                request.session_type.as_deref(),
+                Some(&project_root),
+            )
+            .expect("request-scoped agent");
         let current_model = spec
             .config
             .as_ref()
@@ -557,6 +581,42 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(project_roots.len(), 1);
         assert_eq!(project_roots[0].1, project.path().to_string_lossy());
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_rejects_explicit_unknown_agent_before_worker_start() -> anyhow::Result<()> {
+        let state = build_state();
+        let runtime = tokio_runtime()?;
+
+        runtime.block_on(async {
+            let request = serde_json::from_value(json!({
+                "runtime_id": "runtime-missing-agent",
+                "lease_id": "lease-missing-agent",
+                "session_id": "session-missing-agent",
+                "agent": "missing-executor",
+                "prompt": "must fail before runtime worker start"
+            }))?;
+
+            let (status, body) =
+                dispatch_run_agent(&state, request, "missing-agent-request".to_string()).await;
+
+            assert_eq!(status, 400);
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["code"], "TURA_AGENT_SELECTION_REJECTED");
+            assert_eq!(body["session_id"], "session-missing-agent");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("unknown explicit agent"))
+            );
+            assert_eq!(
+                state.manager.count_workers_with_prefix("runtime_worker:"),
+                0,
+                "selection rejection must not start a runtime worker"
+            );
+            Ok::<_, anyhow::Error>(())
+        })?;
         Ok(())
     }
 

@@ -197,18 +197,23 @@ impl AgentRegistry {
         agent: Option<&str>,
         session_type: Option<&str>,
         project_root: Option<&Path>,
-    ) -> AgentSpec {
+    ) -> Result<AgentSpec, String> {
         if let Some(agent) = agent {
+            let agent = agent.trim();
+            if agent.is_empty() {
+                return Err("explicit agent name is empty".to_string());
+            }
             if let Some(project_root) = project_root
                 && let Some(spec) = self.resolve_by_name_from_root(agent, project_root)
             {
-                return spec;
+                return Ok(spec);
             }
             if let Some(spec) = self.resolve_by_name(agent) {
-                return spec;
+                return Ok(spec);
             }
+            return Err(format!("unknown explicit agent `{agent}`"));
         }
-        self.resolve_by_session_type(session_type.unwrap_or("general"))
+        Ok(self.resolve_by_session_type(session_type.unwrap_or("general")))
     }
 
     pub fn list_catalog(&self) -> Vec<AgentCatalogItem> {
@@ -475,6 +480,17 @@ mod tests {
             .and_then(serde_json::Value::as_str);
 
         assert_eq!(current_model, Some("missing-route"));
+    }
+
+    #[test]
+    fn explicit_unknown_agent_does_not_fall_back_to_session_type() {
+        let registry = AgentRegistry::from_static();
+
+        let error = registry
+            .resolve_for_project(Some("missing-executor"), Some("coding"), None)
+            .expect_err("an explicit unknown agent must fail closed");
+
+        assert_eq!(error, "unknown explicit agent `missing-executor`");
     }
 
     #[test]

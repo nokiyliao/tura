@@ -68,17 +68,25 @@ pub fn runtime_provider_config_from_tura(
             default_model_tier
         )
     })?;
-    let selected = session_model_override()
-        .or_else(|| explicit_current_model(provider_config))
-        .and_then(|(provider, model)| {
-            provider_base_url(settings, &provider).map(|base_url| tura_llm_rust::ProviderConfig {
-                provider,
-                base_url,
-                model,
-                temperature: primary.temperature,
-            })
-        })
-        .unwrap_or_else(|| primary.clone());
+    let explicit_selection = explicit_model_selection(provider_config)?;
+    let (selected, provider_name) = match explicit_selection {
+        Some((provider, model)) => {
+            let base_url = provider_base_url(settings, &provider).ok_or_else(|| {
+                format!("unknown provider in explicit model selection: {provider}/{model}")
+            })?;
+            let provider_name = format!("{provider}/{model}");
+            (
+                tura_llm_rust::ProviderConfig {
+                    provider,
+                    base_url,
+                    model,
+                    temperature: primary.temperature,
+                },
+                provider_name,
+            )
+        }
+        None => (primary.clone(), default_model_tier.clone()),
+    };
 
     // Latency is chosen from the actual selected provider/model, independent
     // of the agent's default route. Install the model tier's timeouts globally
@@ -99,8 +107,7 @@ pub fn runtime_provider_config_from_tura(
     Ok(RuntimeProviderConfig {
         base,
         thinking,
-        provider_name: explicit_current_model_value(provider_config)
-            .unwrap_or_else(|| default_model_tier.clone()),
+        provider_name,
         model_name: selected.model,
         provider_url_name: selected.base_url,
         llm_provider_name: selected.provider,
@@ -126,13 +133,23 @@ fn explicit_current_model_value(provider_config: &ProviderConfig) -> Option<Stri
         .map(ToString::to_string)
 }
 
-fn explicit_current_model(provider_config: &ProviderConfig) -> Option<(String, String)> {
-    provider_model_pair(&explicit_current_model_value(provider_config)?)
-}
-
-fn session_model_override() -> Option<(String, String)> {
-    let value = std::env::var("TURA_SESSION_MODEL_OVERRIDE").ok()?;
+fn explicit_model_selection(
+    provider_config: &ProviderConfig,
+) -> Result<Option<(String, String)>, String> {
+    if let Ok(value) = std::env::var("TURA_SESSION_MODEL_OVERRIDE") {
+        let value = value.trim();
+        if !value.is_empty() && !value.eq_ignore_ascii_case("default") {
+            return provider_model_pair(value).map(Some).ok_or_else(|| {
+                format!("invalid TURA_SESSION_MODEL_OVERRIDE `{value}`: expected provider/model")
+            });
+        }
+    }
+    let Some(value) = explicit_current_model_value(provider_config) else {
+        return Ok(None);
+    };
     provider_model_pair(&value)
+        .map(Some)
+        .ok_or_else(|| format!("invalid explicit current_model `{value}`: expected provider/model"))
 }
 
 fn provider_model_pair(value: &str) -> Option<(String, String)> {

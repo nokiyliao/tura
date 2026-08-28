@@ -81,7 +81,7 @@ async fn create_runtime_business_flow_builds_runtime_queue_and_provider_config_f
     assert_eq!(runtime.session_id, "session-create-runtime-business");
     assert_eq!(runtime.fallback_from_id, None);
     assert_eq!(runtime.agent_id, "agent-create-runtime-business");
-    assert_eq!(runtime.provider.provider_name, "business_runtime");
+    assert_eq!(runtime.provider.provider_name, "localbeta/beta-runtime");
     assert_eq!(runtime.provider.llm_provider_name, "localbeta");
     assert_eq!(
         runtime.provider.provider_url_name,
@@ -95,7 +95,7 @@ async fn create_runtime_business_flow_builds_runtime_queue_and_provider_config_f
     assert_eq!(runtime.provider.base.max_tokens, 512);
     assert_eq!(runtime.provider.base.tool_choice, ToolChoice::Auto);
     assert_eq!(runtime.provider.base.time_out_ms, 12_345);
-    assert_eq!(queue_item.provider_name, "business_runtime");
+    assert_eq!(queue_item.provider_name, "localbeta/beta-runtime");
 }
 
 #[tokio::test]
@@ -148,7 +148,7 @@ async fn create_runtime_business_flow_records_retry_predecessor_in_creation_even
 }
 
 #[tokio::test]
-async fn create_runtime_business_flow_ignores_unresolvable_model_override_and_uses_primary_route() {
+async fn create_runtime_business_flow_rejects_unresolvable_model_override() {
     let _guard = ENV_LOCK.lock().await;
     let _env = EnvGuard::set(&[
         (
@@ -173,18 +173,81 @@ async fn create_runtime_business_flow_ignores_unresolvable_model_override_and_us
         HashMap::new(),
     );
 
-    let config =
+    let error =
         runtime_provider_config_from_tura(&provider_config("fallback_runtime"), &settings, false)
-            .unwrap_or_else(|error| panic!("provider config should use primary route: {error}"));
+            .expect_err("an explicit unknown provider must fail closed");
 
-    assert_eq!(config.provider_name, "fallback_runtime");
-    assert_eq!(config.llm_provider_name, "localalpha");
-    assert_eq!(config.provider_url_name, "http://127.0.0.1:1111/v1");
-    assert_eq!(config.model_name, "alpha-primary");
-    assert!(!config.thinking);
-    assert!(
-        config.base.time_out_ms > 0,
-        "zero timeout override must fall back to tier defaults"
+    assert_eq!(
+        error,
+        "unknown provider in explicit model selection: missing-provider/missing-model"
+    );
+}
+
+#[tokio::test]
+async fn create_runtime_business_flow_rejects_malformed_operator_model_override() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(&[("TURA_SESSION_MODEL_OVERRIDE", "missing-route")]);
+    let settings = settings_with_routes(
+        vec![(
+            "fast",
+            RouteConfig {
+                default_temperature: 0.2,
+                providers: vec![LlmProviderConfig {
+                    provider: "official_codex_app_server".to_string(),
+                    base_url: "http://127.0.0.1:9".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
+                    temperature: 0.2,
+                }],
+            },
+        )],
+        HashMap::from([(
+            "official_codex_app_server".to_string(),
+            "http://127.0.0.1:9".to_string(),
+        )]),
+    );
+
+    let error = runtime_provider_config_from_tura(&provider_config("fast"), &settings, false)
+        .expect_err("a malformed operator override must not fall back to fast");
+
+    assert_eq!(
+        error,
+        "invalid TURA_SESSION_MODEL_OVERRIDE `missing-route`: expected provider/model"
+    );
+}
+
+#[tokio::test]
+async fn create_runtime_business_flow_rejects_malformed_agent_model_selection() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear(&[
+        "TURA_SESSION_MODEL_OVERRIDE",
+        "TURA_PROVIDER_TOTAL_TIMEOUT_MS",
+    ]);
+    let settings = settings_with_routes(
+        vec![(
+            "fast",
+            RouteConfig {
+                default_temperature: 0.2,
+                providers: vec![LlmProviderConfig {
+                    provider: "official_codex_app_server".to_string(),
+                    base_url: "http://127.0.0.1:9".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
+                    temperature: 0.2,
+                }],
+            },
+        )],
+        HashMap::from([(
+            "official_codex_app_server".to_string(),
+            "http://127.0.0.1:9".to_string(),
+        )]),
+    );
+    let config = provider_config_with_current_model("fast", Some("fast"), Some("missing-route"));
+
+    let error = runtime_provider_config_from_tura(&config, &settings, false)
+        .expect_err("a malformed agent model selection must not fall back to fast");
+
+    assert_eq!(
+        error,
+        "invalid explicit current_model `missing-route`: expected provider/model"
     );
 }
 
