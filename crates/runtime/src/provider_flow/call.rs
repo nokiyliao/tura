@@ -124,8 +124,29 @@ pub(crate) async fn call_runtime_with_writer(
         .mark_waiting_first_token()
         .map_err(|e| format!("failed to mark runtime waiting for first token: {e}"))?;
     flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
+
+    macro_rules! pre_provider_or_failed_runtime {
+        ($stage:literal, $result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    finish_pre_provider_runtime_failure(
+                        &mut runtime,
+                        &mut runtime_event_writer,
+                        $stage,
+                        error.to_string(),
+                    )?;
+                    return Ok(runtime);
+                }
+            }
+        };
+    }
+
     let turn_started_start = Instant::now();
-    checkpointing::turn_started(&runtime)?;
+    pre_provider_or_failed_runtime!(
+        "turn_started_checkpoint",
+        checkpointing::turn_started(&runtime)
+    );
     profile_timings::log_elapsed(
         "call_runtime.checkpoint_turn_started",
         turn_started_start,
@@ -145,10 +166,13 @@ pub(crate) async fn call_runtime_with_writer(
 
     let direct_route = route_for_provider_name(tura_settings.as_ref(), &input.provider_name);
     let configured_route = route_by_name(tura_settings.as_ref(), &input.provider_name);
-    let route_config_base = direct_route
-        .as_ref()
-        .or(configured_route)
-        .ok_or_else(|| format!("unknown provider route: {}", input.provider_name))?;
+    let route_config_base = pre_provider_or_failed_runtime!(
+        "provider_route_resolution",
+        direct_route
+            .as_ref()
+            .or(configured_route)
+            .ok_or_else(|| format!("unknown provider route: {}", input.provider_name))
+    );
     let override_route = session_model_override_route(tura_settings.as_ref(), route_config_base);
     let route_config = override_route.as_ref().unwrap_or(route_config_base);
     let context_window = active_model_context_window(tura_settings.as_ref(), route_config);
@@ -178,23 +202,29 @@ pub(crate) async fn call_runtime_with_writer(
         ..Default::default()
     };
     let set_input_start = Instant::now();
-    runtime.set_input(serde_json::json!({
-        "messages": input_messages,
-        "tools": input_tools,
-        "options": {
-            "stream": input.stream,
-            "parallel_tool_calls": call_options.parallel_tool_calls,
-            "prompt_cache_key": call_options.prompt_cache_key.clone(),
-            "stream_options": call_options.stream_options.clone(),
-            "reasoning_effort": call_options.reasoning_effort.clone(),
-            "service_tier": call_options.service_tier.clone(),
-            "max_tokens": call_options.max_tokens,
-            "store": call_options.store,
-            "tool_choice": call_options.tool_choice.clone(),
-            "context_window": call_options.context_window,
-        }
-    }))?;
-    flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
+    pre_provider_or_failed_runtime!(
+        "provider_input_capture",
+        runtime.set_input(serde_json::json!({
+            "messages": input_messages,
+            "tools": input_tools,
+            "options": {
+                "stream": input.stream,
+                "parallel_tool_calls": call_options.parallel_tool_calls,
+                "prompt_cache_key": call_options.prompt_cache_key.clone(),
+                "stream_options": call_options.stream_options.clone(),
+                "reasoning_effort": call_options.reasoning_effort.clone(),
+                "service_tier": call_options.service_tier.clone(),
+                "max_tokens": call_options.max_tokens,
+                "store": call_options.store,
+                "tool_choice": call_options.tool_choice.clone(),
+                "context_window": call_options.context_window,
+            }
+        }))
+    );
+    pre_provider_or_failed_runtime!(
+        "provider_input_flush",
+        flush_runtime_events(&mut runtime_event_writer, &mut runtime)
+    );
     profile_timings::log_elapsed(
         "call_runtime.set_input",
         set_input_start,
@@ -205,7 +235,10 @@ pub(crate) async fn call_runtime_with_writer(
     );
 
     let provider_call_started_start = Instant::now();
-    checkpointing::provider_call_started(&runtime)?;
+    pre_provider_or_failed_runtime!(
+        "provider_call_started_checkpoint",
+        checkpointing::provider_call_started(&runtime)
+    );
     profile_timings::log_elapsed(
         "call_runtime.checkpoint_provider_call_started",
         provider_call_started_start,
@@ -282,6 +315,26 @@ pub(crate) async fn call_runtime_with_writer(
     }
 
     Ok(runtime)
+}
+
+fn finish_pre_provider_runtime_failure(
+    runtime: &mut RuntimeAggregate,
+    runtime_event_writer: &mut Option<&mut RuntimeEventWriter>,
+    stage: &str,
+    error: String,
+) -> Result<(), String> {
+    let error = format!("{stage}: {error}");
+    finish_runtime_failure_with_retry_policy(
+        runtime,
+        Utc::now(),
+        "PRE_PROVIDER_EXECUTE_TURN_FAILED",
+        error,
+        RuntimeState::Failed,
+        false,
+    )?;
+    flush_runtime_events(runtime_event_writer, runtime)?;
+    checkpointing::best_effort_turn_failed(runtime);
+    Ok(())
 }
 
 fn legacy_codex_provider_requested(provider_name: &str) -> bool {
@@ -506,6 +559,15 @@ mod tests {
         })
     }
 
+    fn empty_settings() -> Arc<Settings> {
+        Arc::new(Settings {
+            provider_base_url: HashMap::new(),
+            routes: HashMap::new(),
+            model_catalog: ModelCatalog::default(),
+            provider_enums: ProviderEnumCatalog::default(),
+        })
+    }
+
     fn legacy_codex_settings() -> Arc<Settings> {
         Arc::new(Settings {
             provider_base_url: HashMap::new(),
@@ -524,6 +586,71 @@ mod tests {
             model_catalog: ModelCatalog::default(),
             provider_enums: ProviderEnumCatalog::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn unknown_route_finishes_exact_runtime_before_provider_request() {
+        let runtime_id = "runtime-pre-provider-failure";
+        let runtime = call_runtime(
+            CallRuntimeInput {
+                runtime: RuntimeAggregate::new(
+                    runtime_id.to_string(),
+                    "session-pre-provider-failure".to_string(),
+                    "agent-pre-provider-failure".to_string(),
+                    RuntimeProviderConfig {
+                        base: ProviderConfig {
+                            tura_llm_name: "missing-route".to_string(),
+                            default_model_tier: None,
+                            current_model: None,
+                            stream: true,
+                            temperature: 0.0,
+                            max_tokens: 1024,
+                            tool_choice: ToolChoice::Auto,
+                            time_out_ms: 30_000,
+                        },
+                        thinking: false,
+                        provider_name: "missing-route".to_string(),
+                        model_name: "never-dispatched".to_string(),
+                        provider_url_name: "missing".to_string(),
+                        llm_provider_name: "missing".to_string(),
+                    },
+                    Utc::now(),
+                ),
+                messages: vec![json!({ "role": "user", "content": "never dispatch" })],
+                tools: Vec::new(),
+                provider_name: "missing-route".to_string(),
+                stream: false,
+                max_tokens: 128,
+                tool_choice: None,
+                session_directory: std::env::temp_dir(),
+                allowed_command_run_commands: Some(BTreeSet::new()),
+                disable_permission_restrictions: false,
+                jspace_contract: None,
+                require_startup_task_state: false,
+            },
+            empty_settings(),
+            Arc::new(TuraConfig::new(".env.pre-provider-failure-test")),
+        )
+        .await
+        .expect("pre-provider failure should remain on the exact runtime");
+
+        assert_eq!(runtime.runtime_id, runtime_id);
+        assert_eq!(runtime.state, lifecycle::RuntimeState::Failed);
+        assert!(runtime.input.is_none());
+        assert!(runtime.usage.is_none());
+        let error = runtime
+            .error
+            .expect("pre-provider failure must be recorded");
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("PRE_PROVIDER_EXECUTE_TURN_FAILED")
+        );
+        assert_eq!(
+            error.error_text.as_deref(),
+            Some("provider_route_resolution: unknown provider route: missing-route")
+        );
+        assert!(!error.retry_allowed);
+        assert!(!error.fallback_allowed);
     }
 
     #[tokio::test]
