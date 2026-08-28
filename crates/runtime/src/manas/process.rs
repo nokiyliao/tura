@@ -1,6 +1,6 @@
 use crate::gateway_events::{
     frontend_session_id, publish_agent_message_from_runtime, publish_runtime_failure_message,
-    publish_runtime_usage_record,
+    publish_runtime_failure_message_from_runtime, publish_runtime_usage_record,
 };
 use crate::manas::constants::PLANNING_TOOL;
 use crate::manas::prompt_messages::push_no_tool_task_status_retry_message;
@@ -225,9 +225,9 @@ pub(crate) fn process_manas_internal(
                     let error = format!(
                         "Provider/model does not support `{content_type}` media input for this request. Use an image-capable model or a route whose model metadata includes that input modality. Original provider error: {error_text}"
                     );
-                    publish_runtime_failure_message(
+                    publish_runtime_failure_message_from_runtime(
                         session,
-                        &runtime.runtime_id,
+                        &runtime,
                         &error,
                         feed_publisher.as_ref(),
                     );
@@ -301,9 +301,9 @@ pub(crate) fn process_manas_internal(
             let error = format!(
                 "Provider runtime failed after 3 retries before completing the task: {error_text}"
             );
-            publish_runtime_failure_message(
+            publish_runtime_failure_message_from_runtime(
                 session,
-                &runtime.runtime_id,
+                &runtime,
                 &error,
                 feed_publisher.as_ref(),
             );
@@ -322,9 +322,9 @@ pub(crate) fn process_manas_internal(
                 error = %error_text,
                 "provider runtime failed"
             );
-            publish_runtime_failure_message(
+            publish_runtime_failure_message_from_runtime(
                 session,
-                &runtime.runtime_id,
+                &runtime,
                 &error_text,
                 feed_publisher.as_ref(),
             );

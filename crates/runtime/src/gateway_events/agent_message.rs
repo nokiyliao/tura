@@ -39,6 +39,34 @@ pub(crate) fn publish_runtime_failure_message(
     }
 }
 
+pub(crate) fn publish_runtime_failure_message_from_runtime(
+    session: &SessionManagement,
+    runtime: &RuntimeAggregate,
+    error: &str,
+    publisher: Option<&RuntimeFeedPublisher>,
+) {
+    let reply_message = summarize_tool_results_for_user(session).map_or_else(
+        || runtime_fallback::no_tool_results_runtime_failed(error),
+        |summary| runtime_fallback::tool_results_then_runtime_failed(&summary, error),
+    );
+    emit_cli_agent_message(&reply_message);
+
+    if let Err(publish_error) = publish_agent_message_from_runtime(
+        &session.session_id,
+        runtime,
+        reply_message,
+        tool_progress::runtime_failed_after_tool_execution(error),
+        publisher,
+    ) {
+        warn!(
+            session_id = %session.session_id,
+            runtime_id = %runtime.runtime_id,
+            error = %publish_error,
+            "failed to publish visible runtime failure"
+        );
+    }
+}
+
 fn emit_cli_agent_message(reply_message: &str) {
     if !env_flag("TURA_CLI_LIVE_JSONL") {
         return;
@@ -125,8 +153,24 @@ pub(crate) fn publish_agent_message_from_runtime(
     new_learning: String,
     publisher: Option<&RuntimeFeedPublisher>,
 ) -> Result<(), String> {
+    publish_agent_message_event(agent_message_from_runtime(
+        session_id,
+        runtime,
+        reply_message,
+        new_learning,
+        publisher,
+    ))
+}
+
+fn agent_message_from_runtime<'a>(
+    session_id: &'a str,
+    runtime: &'a RuntimeAggregate,
+    reply_message: String,
+    new_learning: String,
+    publisher: Option<&'a RuntimeFeedPublisher>,
+) -> AgentMessageEvent<'a> {
     let (created_at, updated_at) = runtime.assistant_message_timestamps();
-    publish_agent_message_event(AgentMessageEvent {
+    AgentMessageEvent {
         session_id,
         runtime_id: &runtime.runtime_id,
         reply_message,
@@ -137,7 +181,7 @@ pub(crate) fn publish_agent_message_from_runtime(
         created_at,
         updated_at,
         publisher,
-    })
+    }
 }
 
 struct AgentMessageEvent<'a> {
@@ -201,6 +245,9 @@ fn planning_child_depth_from_env() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lifecycle::{
+        ProviderConfig, RuntimeError, RuntimeProviderConfig, RuntimeState, ToolChoice,
+    };
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -213,6 +260,64 @@ mod tests {
             runtime_message_id("runtime-123"),
             runtime_message_id("runtime-456")
         );
+    }
+
+    #[test]
+    fn runtime_failure_message_carries_terminal_runtime_status() {
+        let mut runtime = RuntimeAggregate::new(
+            "runtime-terminal-message".to_string(),
+            "session-terminal-message".to_string(),
+            "agent-terminal-message".to_string(),
+            RuntimeProviderConfig {
+                base: ProviderConfig {
+                    tura_llm_name: "missing-route".to_string(),
+                    default_model_tier: Some("thinking".to_string()),
+                    current_model: Some("missing-route".to_string()),
+                    stream: true,
+                    temperature: 0.0,
+                    max_tokens: 128,
+                    tool_choice: ToolChoice::Auto,
+                    time_out_ms: 30_000,
+                },
+                thinking: false,
+                provider_name: "missing-route".to_string(),
+                model_name: "never-dispatched".to_string(),
+                provider_url_name: "missing".to_string(),
+                llm_provider_name: "missing".to_string(),
+            },
+            chrono::Utc::now(),
+        );
+        runtime
+            .finish_failure(
+                chrono::Utc::now(),
+                RuntimeError {
+                    error_code: Some("PRE_PROVIDER_EXECUTE_TURN_FAILED".to_string()),
+                    error_text: Some("missing route".to_string()),
+                    retry_allowed: false,
+                    fallback_allowed: false,
+                    fallback_to_id: None,
+                },
+                RuntimeState::Failed,
+                None,
+            )
+            .expect("runtime should finish failed");
+
+        let message = agent_message_from_runtime(
+            "session-terminal-message",
+            &runtime,
+            "visible failure".to_string(),
+            "failure learning".to_string(),
+            None,
+        );
+        let status = message
+            .runtime_status
+            .expect("runtime-owned failure message must carry status");
+
+        assert_eq!(status.runtime_id, "runtime-terminal-message");
+        assert_eq!(status.state, RuntimeState::Failed);
+        assert!(!status.live);
+        assert_eq!(message.context_tokens, Some(runtime.context_tokens));
+        assert_eq!(message.usage, None);
     }
 
     #[test]
