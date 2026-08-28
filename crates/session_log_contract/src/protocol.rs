@@ -1,8 +1,8 @@
 use crate::CommandCheckpoint;
 use lifecycle::{
     ContextTokenStats, RuntimeAggregate, RuntimeEvent, RuntimeProjection, SessionCommand,
-    SessionEvent, SessionManagement, SessionManagementDelta, SessionProjection, SessionState,
-    UsageReport,
+    RuntimeState, SessionEvent, SessionManagement, SessionManagementDelta, SessionProjection,
+    SessionState, UsageReport,
 };
 use serde::{Deserialize, Serialize};
 
@@ -307,11 +307,50 @@ pub struct SessionCommandResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct RuntimeLifecycleIdentity {
+    pub commander_session_id: String,
+    pub transaction_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<String>,
+    #[serde(default)]
+    pub operator_override: bool,
+    pub dispatch_runtime_id: String,
+    pub dispatch_lease_id: String,
+    pub receipt_event_seq: u64,
+}
+
+impl RuntimeLifecycleIdentity {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("commander_session_id", self.commander_session_id.as_str()),
+            ("transaction_id", self.transaction_id.as_str()),
+            ("dispatch_runtime_id", self.dispatch_runtime_id.as_str()),
+            ("dispatch_lease_id", self.dispatch_lease_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("{name} must be non-empty"));
+            }
+        }
+        for (name, value) in [("task_id", &self.task_id), ("goal_id", &self.goal_id)] {
+            if value.as_deref().is_some_and(|value| value.trim().is_empty()) {
+                return Err(format!("{name} must be null or non-empty"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterRuntimeRequest {
     pub runtime_id: String,
     pub session_id: String,
     #[serde(deserialize_with = "Option::deserialize")]
     pub fallback_from_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<RuntimeLifecycleIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -486,6 +525,8 @@ pub struct RuntimeLeaseSnapshot {
     pub database_path: String,
     pub runtime_id: String,
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<RuntimeLifecycleIdentity>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub lease_id: Option<String>,
     pub lease_active: bool,
@@ -494,6 +535,8 @@ pub struct RuntimeLeaseSnapshot {
     pub terminal: bool,
     pub session_event_seq: u64,
     pub session_state: SessionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<RuntimeState>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -914,6 +957,7 @@ mod tests {
             runtime_id: "runtime-retry".to_string(),
             session_id: "session".to_string(),
             fallback_from_id: Some("runtime-failed".to_string()),
+            lifecycle: None,
         };
         let value = serde_json::to_value(&register).expect("register runtime request");
         assert_eq!(value["fallback_from_id"], "runtime-failed");

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use session_log_contract::{
     client::call_service, GetRuntimeLeaseRequest, ListSessionsRequest,
     RecoveryCloseRuntimeOutcome, RecoveryCloseRuntimeReason, SessionLogCommand,
-    SessionLogResponse,
+    SessionLogResponse, RuntimeLeaseSnapshot,
 };
 use std::collections::BTreeSet;
 
@@ -62,25 +62,24 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                     if !seen_runtime_ids.insert(runtime_id.clone()) {
                         continue;
                     }
-                    let snapshot = match call_service(&SessionLogCommand::GetRuntimeLease(
-                        GetRuntimeLeaseRequest {
-                            runtime_id: runtime_id.clone(),
-                            database_path: None,
-                        },
-                    ))? {
-                        SessionLogResponse::RuntimeLeaseRead {
-                            runtime: Some(runtime),
-                        } => runtime,
-                        SessionLogResponse::RuntimeLeaseRead { runtime: None } => {
-                            bail!("STARTUP_RECOVERY_RUNTIME_NOT_FOUND:{runtime_id}")
-                        }
-                        SessionLogResponse::Error { error } => return Err(anyhow!(error)),
-                        other => {
-                            bail!("unexpected runtime lease response during recovery: {other:?}")
-                        }
-                    };
+                    let snapshot = read_runtime_snapshot(&runtime_id)?;
                     inspected = inspected.saturating_add(1);
                     if snapshot.terminal && !snapshot.lease_active {
+                        if snapshot.lifecycle.is_some()
+                            && let Some(delivery) = state
+                                .execution
+                                .reconcile_durable_terminal_callback(&snapshot)?
+                        {
+                            recovered.push(json!({
+                                "runtime_id": snapshot.runtime_id,
+                                "session_id": snapshot.session_id,
+                                "recovery_action": "callback_reconciled",
+                                "transaction_id": delivery.transaction_id,
+                                "event_id": delivery.event_id,
+                                "terminal": true,
+                                "lease_active": false,
+                            }));
+                        }
                         continue;
                     }
                     let reason =
@@ -119,6 +118,14 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                         | RecoveryCloseRuntimeOutcome::AlreadyClosed { receipt }
                             if receipt.terminal && !receipt.lease_active =>
                         {
+                            let post_snapshot = read_runtime_snapshot(&receipt.runtime_id)?;
+                            let delivery = if post_snapshot.lifecycle.is_some() {
+                                state
+                                    .execution
+                                    .reconcile_durable_terminal_callback(&post_snapshot)?
+                            } else {
+                                None
+                            };
                             recovered.push(json!({
                                 "runtime_id": receipt.runtime_id,
                                 "session_id": receipt.session_id,
@@ -126,6 +133,8 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                                 "reason": receipt.reason,
                                 "terminal": receipt.terminal,
                                 "lease_active": receipt.lease_active,
+                                "callback_transaction_id": delivery.as_ref().map(|value| &value.transaction_id),
+                                "callback_event_id": delivery.as_ref().map(|value| &value.event_id),
                             }));
                         }
                         other => {
@@ -146,6 +155,24 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
     }
 
     Ok((inspected, recovered))
+}
+
+fn read_runtime_snapshot(runtime_id: &str) -> Result<RuntimeLeaseSnapshot> {
+    match call_service(&SessionLogCommand::GetRuntimeLease(
+        GetRuntimeLeaseRequest {
+            runtime_id: runtime_id.to_string(),
+            database_path: None,
+        },
+    ))? {
+        SessionLogResponse::RuntimeLeaseRead {
+            runtime: Some(runtime),
+        } => Ok(runtime),
+        SessionLogResponse::RuntimeLeaseRead { runtime: None } => {
+            bail!("STARTUP_RECOVERY_RUNTIME_NOT_FOUND:{runtime_id}")
+        }
+        SessionLogResponse::Error { error } => Err(anyhow!(error)),
+        other => bail!("unexpected runtime lease response during recovery: {other:?}"),
+    }
 }
 
 fn startup_recovery_reason(revision: u64, last_event_seq: u64) -> RecoveryCloseRuntimeReason {

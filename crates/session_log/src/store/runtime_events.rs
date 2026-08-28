@@ -31,6 +31,17 @@ impl SessionLogStore {
                 anyhow::bail!("runtime cannot fall back from itself");
             }
         }
+        if let Some(lifecycle) = request.lifecycle.as_ref() {
+            lifecycle
+                .validate()
+                .map_err(anyhow::Error::msg)
+                .context("runtime lifecycle identity is invalid")?;
+        }
+        let lifecycle_json = request
+            .lifecycle
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let workspace_db_path = self
             .workspace_db_path_for_session(&request.session_id)?
             .with_context(|| format!("session {} not found", request.session_id))?;
@@ -41,16 +52,33 @@ impl SessionLogStore {
         }
         let outcome = self.with_workspace_connection(&workspace_db_path, |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some((existing_session_id, existing_fallback_from_id)) = tx
+            if let Some((
+                existing_session_id,
+                existing_fallback_from_id,
+                existing_lifecycle_json,
+            )) = tx
                 .query_row(
-                    "SELECT session_id, fallback_from_id FROM runtimes WHERE runtime_id = ?1",
+                    "SELECT session_id, fallback_from_id, lifecycle_json
+                     FROM runtimes WHERE runtime_id = ?1",
                     params![request.runtime_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
                 )
                 .optional()?
             {
+                let existing_lifecycle = existing_lifecycle_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .context("persisted runtime lifecycle identity is invalid")?;
                 return if existing_session_id == request.session_id
                     && existing_fallback_from_id == request.fallback_from_id
+                    && existing_lifecycle == request.lifecycle
                 {
                     let (revision, last_event_seq) = runtime_cursor(&tx, &request.runtime_id)?;
                     let aggregate = replay_session_events(&tx, &request.session_id)?;
@@ -87,12 +115,13 @@ impl SessionLogStore {
             persist_session_projection(&tx, &request.session_id, &aggregate, &mut row, now_ms)?;
             append_session_event(&tx, &request.session_id, &event)?;
             tx.execute(
-                "INSERT INTO runtimes(runtime_id, session_id, fallback_from_id)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO runtimes(runtime_id, session_id, fallback_from_id, lifecycle_json)
+                 VALUES (?1, ?2, ?3, ?4)",
                 params![
                     request.runtime_id,
                     request.session_id,
-                    request.fallback_from_id
+                    request.fallback_from_id,
+                    lifecycle_json,
                 ],
             )?;
             let projection = aggregate.query(SessionQuery::Lifecycle);

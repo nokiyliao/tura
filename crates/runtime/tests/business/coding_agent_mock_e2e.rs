@@ -775,6 +775,7 @@ fn coding_agent_provider_retry_exhaustion_preserves_provider_error() {
                 runtime_id: initial_runtime_id.to_string(),
                 session_id: session_id.to_string(),
                 fallback_from_id: None,
+                lifecycle: None,
             }
         ))
         .expect("initial runtime registration"),

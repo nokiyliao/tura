@@ -8,10 +8,11 @@ use session_log_contract::client::enqueue_command;
 use session_log_contract::{
     ActivateRuntimeLeaseRequest, AppendSessionFeedEventRequest, CheckpointType, CommandCheckpoint,
     CommitRuntimeEventRequest, CreateSessionRequest, DeleteSessionRequest, DeleteWorkspaceRequest,
-    ExecuteSessionCommandRequest, GetSessionRequest, ListSessionRecordsRequest,
+    ExecuteSessionCommandRequest, GetRuntimeLeaseRequest, GetSessionRequest, ListSessionRecordsRequest,
     ListSessionsRequest, MarkSessionInterruptedRequest, PersistSessionDeltaRequest,
     ReadContextSliceRequest, ReadSessionFeedRequest, RegisterRuntimeRequest, ReplayRuntimeRequest,
-    RuntimeEventCommitOutcome, RuntimeLeaseOutcome, RuntimeRegistrationOutcome,
+    RuntimeEventCommitOutcome, RuntimeLeaseOutcome, RuntimeLifecycleIdentity,
+    RuntimeRegistrationOutcome,
     SessionContextRecord, SessionDeltaEntry, SessionFeedAppendOutcome, SessionFeedEvent,
     SessionLogCommand, SessionMetadataPatch, SessionRecordProjection, UpdateSessionRequest,
     UpdateSessionTodosRequest,
@@ -1824,6 +1825,66 @@ fn corrupted_record_json_returns_contextual_error() {
 }
 
 #[test]
+fn runtime_registration_persists_exact_lifecycle_identity_and_rejects_drift() {
+    let db = DirectDbGuard::new();
+    let store = SessionLogStore::open_default().expect("store");
+    let workspace = db.workspace("runtime-lifecycle-identity");
+    let session_id = format!("runtime-lifecycle-{}", uuid::Uuid::new_v4());
+    let runtime_id = format!("runtime-{}", uuid::Uuid::new_v4());
+    create_typed_session(&store, &workspace, &session_id);
+    let lifecycle = RuntimeLifecycleIdentity {
+        commander_session_id: "commander-identity".to_string(),
+        transaction_id: "transaction-identity".to_string(),
+        task_id: Some("task-identity".to_string()),
+        goal_id: Some("goal-identity".to_string()),
+        operator_override: true,
+        dispatch_runtime_id: runtime_id.clone(),
+        dispatch_lease_id: "lease-identity".to_string(),
+        receipt_event_seq: 0,
+    };
+    let request = RegisterRuntimeRequest {
+        runtime_id: runtime_id.clone(),
+        session_id: session_id.clone(),
+        fallback_from_id: None,
+        lifecycle: Some(lifecycle.clone()),
+    };
+    assert!(matches!(
+        store
+            .register_runtime(request.clone())
+            .expect("register runtime with lifecycle identity"),
+        RuntimeRegistrationOutcome::Registered { .. }
+    ));
+    assert!(matches!(
+        store
+            .register_runtime(request)
+            .expect("repeat exact lifecycle identity"),
+        RuntimeRegistrationOutcome::AlreadyRegistered { .. }
+    ));
+    let snapshot = store
+        .get_runtime_lease(GetRuntimeLeaseRequest {
+            runtime_id: runtime_id.clone(),
+            database_path: None,
+        })
+        .expect("read durable runtime lifecycle identity")
+        .expect("runtime exists");
+    assert_eq!(snapshot.lifecycle, Some(lifecycle.clone()));
+
+    let mut drifted = lifecycle;
+    drifted.transaction_id = "transaction-drift".to_string();
+    assert_eq!(
+        store
+            .register_runtime(RegisterRuntimeRequest {
+                runtime_id,
+                session_id,
+                fallback_from_id: None,
+                lifecycle: Some(drifted),
+            })
+            .expect("drifted lifecycle identity must be classified"),
+        RuntimeRegistrationOutcome::RuntimeIdConflict
+    );
+}
+
+#[test]
 fn runtime_event_store_rejects_duplicate_order_revision_and_stale_lease() {
     let db = DirectDbGuard::new();
     let store = SessionLogStore::open_default().expect("store");
@@ -1844,6 +1905,7 @@ fn runtime_event_store_rejects_duplicate_order_revision_and_stale_lease() {
                 runtime_id: runtime_id.clone(),
                 session_id: session_id.clone(),
                 fallback_from_id: None,
+                lifecycle: None,
             })
             .expect("register runtime"),
         RuntimeRegistrationOutcome::Registered {
@@ -1888,6 +1950,7 @@ fn runtime_event_store_rejects_duplicate_order_revision_and_stale_lease() {
                 runtime_id: runtime_id.clone(),
                 session_id: session_id.clone(),
                 fallback_from_id: None,
+                lifecycle: None,
             })
             .expect("repeat runtime registration"),
         RuntimeRegistrationOutcome::AlreadyRegistered { .. }
@@ -1990,6 +2053,7 @@ fn runtime_event_store_replays_and_reduces_terminal_session_state() {
             runtime_id: runtime_id.clone(),
             session_id: session_id.clone(),
             fallback_from_id: None,
+            lifecycle: None,
         })
         .expect("register runtime");
     assert!(matches!(
@@ -2002,6 +2066,7 @@ fn runtime_event_store_replays_and_reduces_terminal_session_state() {
                 runtime_id: runtime_id.clone(),
                 session_id: session_id.clone(),
                 fallback_from_id: None,
+                lifecycle: None,
             })
             .expect("repeat runtime registration"),
         RuntimeRegistrationOutcome::AlreadyRegistered { .. }
@@ -2156,6 +2221,7 @@ fn runtime_event_store_replays_and_reduces_terminal_session_state() {
                 runtime_id: next_runtime_id.clone(),
                 session_id: session_id.clone(),
                 fallback_from_id: None,
+                lifecycle: None,
             })
             .expect("register next runtime after successful terminal event"),
         RuntimeRegistrationOutcome::Registered { .. }
@@ -2191,6 +2257,7 @@ fn session_feed_is_lease_guarded_idempotent_and_cursor_replayable() {
             runtime_id: runtime_id.clone(),
             session_id: session_id.clone(),
             fallback_from_id: None,
+            lifecycle: None,
         })
         .expect("register runtime");
     store
@@ -2435,6 +2502,7 @@ fn runtime_retry_registration_requires_latest_failed_predecessor_and_matching_cr
             runtime_id: failed_runtime_id.clone(),
             session_id: session_id.clone(),
             fallback_from_id: None,
+            lifecycle: None,
         })
         .expect("register failed runtime");
     store
@@ -2484,6 +2552,7 @@ fn runtime_retry_registration_requires_latest_failed_predecessor_and_matching_cr
             runtime_id: retry_runtime_id.clone(),
             session_id: session_id.clone(),
             fallback_from_id: Some("runtime-stale".to_string()),
+            lifecycle: None,
         })
         .is_err());
     assert!(matches!(
@@ -2492,6 +2561,7 @@ fn runtime_retry_registration_requires_latest_failed_predecessor_and_matching_cr
                 runtime_id: retry_runtime_id.clone(),
                 session_id: session_id.clone(),
                 fallback_from_id: Some(failed_runtime_id.clone()),
+                lifecycle: None,
             })
             .expect("register valid retry"),
         RuntimeRegistrationOutcome::Registered { .. }
@@ -2502,6 +2572,7 @@ fn runtime_retry_registration_requires_latest_failed_predecessor_and_matching_cr
                 runtime_id: retry_runtime_id.clone(),
                 session_id: session_id.clone(),
                 fallback_from_id: Some("runtime-conflict".to_string()),
+                lifecycle: None,
             })
             .expect("repeat registration should return an identity conflict"),
         RuntimeRegistrationOutcome::RuntimeIdConflict

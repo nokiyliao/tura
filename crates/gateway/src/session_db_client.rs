@@ -98,6 +98,7 @@ impl SessionDbClient {
             runtime_id,
             session_id,
             fallback_from_id: None,
+            lifecycle: None,
         }))? {
             SessionLogResponse::RuntimeRegistered { result } => Ok(result),
             SessionLogResponse::Error { error } => Err(service_error("register_runtime", error)),

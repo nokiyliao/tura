@@ -365,6 +365,7 @@ pub(super) fn init_workspace_db(conn: &Connection) -> Result<()> {
             revision INTEGER NOT NULL DEFAULT 0,
             last_event_seq INTEGER NOT NULL DEFAULT 0,
             terminal INTEGER NOT NULL DEFAULT 0 CHECK(terminal IN (0, 1)),
+            lifecycle_json TEXT,
             FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_runtimes_session
@@ -419,6 +420,16 @@ const CANONICAL_SESSION_SEQUENCE_COLUMNS: &[&str] = &[
     "retained_from_sequence",
     "next_management_sequence",
 ];
+const LEGACY_RUNTIME_COLUMNS: &[&str] = &[
+    "runtime_id",
+    "session_id",
+    "fallback_from_id",
+    "lease_id",
+    "lease_active",
+    "revision",
+    "last_event_seq",
+    "terminal",
+];
 
 fn database_tables(conn: &Connection) -> Result<BTreeSet<String>> {
     Ok(conn
@@ -442,6 +453,7 @@ fn prepare_workspace_schema(conn: &Connection) -> Result<()> {
     if actual_tables.is_empty() {
         return Ok(());
     }
+    prepare_runtime_schema(conn, &actual_tables)?;
     let expected_tables = WORKSPACE_SCHEMA
         .iter()
         .map(|(table, _)| (*table).to_string())
@@ -526,6 +538,38 @@ fn prepare_workspace_schema(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn prepare_runtime_schema(conn: &Connection, actual_tables: &BTreeSet<String>) -> Result<()> {
+    if !actual_tables.contains("runtimes") {
+        return Ok(());
+    }
+    let actual_columns = table_columns(conn, "runtimes")?;
+    let expected_columns = WORKSPACE_SCHEMA
+        .iter()
+        .find(|(table, _)| *table == "runtimes")
+        .map(|(_, columns)| *columns)
+        .expect("workspace schema must define runtimes");
+    if actual_columns
+        == expected_columns
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect::<Vec<_>>()
+    {
+        return Ok(());
+    }
+    if actual_columns
+        == LEGACY_RUNTIME_COLUMNS
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect::<Vec<_>>()
+    {
+        conn.execute("ALTER TABLE runtimes ADD COLUMN lifecycle_json TEXT", [])?;
+        return Ok(());
+    }
+    anyhow::bail!(
+        "incompatible workspace session database schema: table runtimes has columns {actual_columns:?}, expected {expected_columns:?}"
+    )
 }
 
 fn require_workspace_schema(conn: &Connection) -> Result<()> {
@@ -704,6 +748,7 @@ const WORKSPACE_SCHEMA: &[(&str, &[&str])] = &[
             "revision",
             "last_event_seq",
             "terminal",
+            "lifecycle_json",
         ],
     ),
     (

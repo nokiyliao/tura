@@ -23,9 +23,9 @@ use session_log_contract::{
     recovery_terminal_projection_event_id, ActivateRuntimeLeaseRequest, GetRuntimeLeaseRequest,
     GetSessionRequest, RecoveryCloseRuntimeOutcome, RecoveryCloseRuntimeReason,
     RecoveryCloseRuntimeRequest, RegisterRuntimeRequest, ReplayRuntimeRequest,
-    RuntimeLeaseOutcome, RuntimeLeaseSnapshot, RuntimeRecoveryQuiescenceProof,
-    RuntimeRecoveryReceipt, RuntimeRegistrationOutcome, SessionFeedEntry, SessionFeedEvent,
-    SessionLogCommand, SessionLogResponse,
+    RuntimeLeaseOutcome, RuntimeLeaseSnapshot, RuntimeLifecycleIdentity,
+    RuntimeRecoveryQuiescenceProof, RuntimeRecoveryReceipt, RuntimeRegistrationOutcome,
+    SessionFeedEntry, SessionFeedEvent, SessionLogCommand, SessionLogResponse,
 };
 
 #[derive(Clone)]
@@ -46,6 +46,7 @@ struct RuntimeLease {
     task_id: Option<String>,
     goal_id: Option<String>,
     operator_override: bool,
+    receipt_event_seq: u64,
     slot_acquired: bool,
     terminalizing: bool,
 }
@@ -142,6 +143,16 @@ impl ExecutionService {
             goal_id: goal_id.clone(),
             operator_override,
         });
+        let durable_lifecycle = RuntimeLifecycleIdentity {
+            commander_session_id: commander_session_id.clone(),
+            transaction_id: request_id.to_string(),
+            task_id: task_id.clone(),
+            goal_id: goal_id.clone(),
+            operator_override,
+            dispatch_runtime_id: request.runtime_id.clone(),
+            dispatch_lease_id: lease_id.clone(),
+            receipt_event_seq: 0,
+        };
         let maximum_parallel_runtime_workers =
             runtime_worker_limit(run_request.maximum_parallel_runtime_workers);
         if debug_runtime_enabled() {
@@ -174,6 +185,7 @@ impl ExecutionService {
                     task_id,
                     goal_id,
                     operator_override,
+                    receipt_event_seq: 0,
                     slot_acquired: false,
                     terminalizing: false,
                 },
@@ -198,6 +210,7 @@ impl ExecutionService {
             &request.runtime_id,
             &lease_id,
             fallback_from_id,
+            Some(durable_lifecycle),
         )?;
         if debug_runtime_enabled() {
             eprintln!(
@@ -392,6 +405,58 @@ impl ExecutionService {
             SessionLogResponse::Error { error } => Err(anyhow!(error)),
             other => Err(anyhow!("unexpected get_runtime_lease response: {other:?}")),
         }
+    }
+
+    pub(crate) fn reconcile_durable_terminal_callback(
+        &self,
+        snapshot: &RuntimeLeaseSnapshot,
+    ) -> Result<Option<TerminalDeliveryIdentity>> {
+        if !snapshot.terminal || snapshot.lease_active {
+            return Err(anyhow!(
+                "RUNTIME_CALLBACK_RECONCILIATION_REQUIRES_CLOSED_RUNTIME:runtime={},terminal={},lease_active={}",
+                snapshot.runtime_id,
+                snapshot.terminal,
+                snapshot.lease_active
+            ));
+        }
+        let lease = runtime_lease_from_snapshot(snapshot)?;
+        let entry = terminal_feed_entry_for_runtime(&snapshot.session_id, &snapshot.runtime_id)?;
+        let SessionFeedEvent::SessionProjectionUpdated { projection, .. } = &entry.event else {
+            return Err(anyhow!(
+                "RUNTIME_CALLBACK_TERMINAL_PROJECTION_MISSING:{}",
+                snapshot.runtime_id
+            ));
+        };
+        if !terminal_runtime_is_current(
+            projection,
+            &snapshot.session_id,
+            &lease.runtime_id,
+            &snapshot.runtime_id,
+        )? {
+            return Ok(None);
+        }
+        let expected_terminal_state = runtime_terminal_state_from_snapshot(snapshot, projection)?;
+        self.write_snapshot_terminal_receipt(&lease, snapshot, &entry, expected_terminal_state)?;
+        let store = lifecycle_store(&lease.commander_session_id)?;
+        let delivery = intake_terminal_receipt(
+            &store,
+            &entry,
+            &snapshot.runtime_id,
+            &lease.transaction_id,
+            &lease,
+            expected_terminal_state,
+        )?;
+        if let Some(delivery) = delivery.as_ref() {
+            match store.reclaim_terminal_slot(
+                &delivery.transaction_id,
+                &delivery.event_id,
+                LiveEffectEvidence::default(),
+            )? {
+                ReclaimOutcome::Released | ReclaimOutcome::AlreadyReleased => {}
+                ReclaimOutcome::Retained { blocker } => return Err(anyhow!(blocker)),
+            }
+        }
+        Ok(delivery)
     }
 
     pub async fn recovery_close_runtime(&self, state: &AppState, input: Value) -> Result<Value> {
@@ -806,14 +871,16 @@ impl ExecutionService {
         )? {
             return Ok(None);
         }
+        let snapshot = read_runtime_lease_snapshot(runtime_id)?;
+        let expected_terminal_state = runtime_terminal_state_from_snapshot(&snapshot, projection)?;
         let store = lifecycle_store(&lease.commander_session_id)?;
         intake_terminal_receipt(
             &store,
             entry,
-            projection,
             runtime_id,
             transaction_id,
             &lease,
+            expected_terminal_state,
         )
     }
 
@@ -841,6 +908,7 @@ impl ExecutionService {
                 task_id: None,
                 goal_id: None,
                 operator_override: false,
+                receipt_event_seq: 0,
                 slot_acquired,
                 terminalizing: false,
             },
@@ -1090,13 +1158,13 @@ impl ExecutionService {
             TerminalReceiptIdentity::new(
                 &lease.transaction_id,
                 event_id,
-                0,
+                lease.receipt_event_seq,
                 &lease.commander_session_id,
                 &recovery.session_id,
                 &recovery.runtime_id,
                 receipt_lease_id,
             ),
-            terminal_state(recovery.session_state)?,
+            recovery_terminal_state(recovery),
             recovery.closed_at,
         );
         receipt.task_id.clone_from(&lease.task_id);
@@ -1112,7 +1180,79 @@ impl ExecutionService {
         );
         receipt.audit_metadata.insert(
             "runtime_state".to_string(),
+            recovery_runtime_state(recovery),
+        );
+        receipt.audit_metadata.insert(
+            "session_state".to_string(),
             json!(recovery.session_state),
+        );
+        receipt.audit_metadata.insert(
+            "dispatch_runtime_id".to_string(),
+            json!(lease.runtime_id),
+        );
+        receipt.audit_metadata.insert(
+            "dispatch_lease_id".to_string(),
+            json!(lease.lease_id),
+        );
+        lifecycle_store(&lease.commander_session_id)?
+            .write_terminal_receipt(&receipt)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(())
+    }
+
+    fn write_snapshot_terminal_receipt(
+        &self,
+        lease: &RuntimeLease,
+        snapshot: &RuntimeLeaseSnapshot,
+        entry: &SessionFeedEntry,
+        terminal_state: TerminalState,
+    ) -> Result<()> {
+        let receipt_lease_id = snapshot.lease_id.as_deref().ok_or_else(|| {
+            anyhow!(
+                "RUNTIME_SNAPSHOT_TERMINAL_RECEIPT_LEASE_MISSING:{}",
+                snapshot.runtime_id
+            )
+        })?;
+        let finished_at_ms = match &entry.event {
+            SessionFeedEvent::SessionProjectionUpdated { updated_at, .. } => *updated_at,
+            _ => {
+                return Err(anyhow!(
+                    "RUNTIME_CALLBACK_TERMINAL_PROJECTION_MISSING:{}",
+                    snapshot.runtime_id
+                ));
+            }
+        };
+        let mut receipt = TerminalReceipt::new(
+            TerminalReceiptIdentity::new(
+                &lease.transaction_id,
+                &entry.event_id,
+                lease.receipt_event_seq,
+                &lease.commander_session_id,
+                &snapshot.session_id,
+                &snapshot.runtime_id,
+                receipt_lease_id,
+            ),
+            terminal_state,
+            finished_at_ms,
+        );
+        receipt.task_id.clone_from(&lease.task_id);
+        receipt.goal_id.clone_from(&lease.goal_id);
+        receipt.operator_override = lease.operator_override;
+        receipt.audit_metadata.insert(
+            "runtime_event_seq".to_string(),
+            json!(snapshot.last_event_seq),
+        );
+        receipt.audit_metadata.insert(
+            "runtime_expected_revision".to_string(),
+            json!(snapshot.revision.saturating_sub(1)),
+        );
+        receipt.audit_metadata.insert(
+            "runtime_state".to_string(),
+            snapshot.runtime_state.map_or(Value::Null, |state| json!(state)),
+        );
+        receipt.audit_metadata.insert(
+            "session_state".to_string(),
+            json!(snapshot.session_state),
         );
         receipt.audit_metadata.insert(
             "dispatch_runtime_id".to_string(),
@@ -1315,16 +1455,16 @@ impl ExecutionService {
 fn intake_terminal_receipt(
     store: &SessionLifecycleStore,
     entry: &SessionFeedEntry,
-    projection: &lifecycle::SessionProjection,
     runtime_id: &str,
     transaction_id: &str,
     lease: &RuntimeLease,
+    expected_terminal_state: TerminalState,
 ) -> Result<Option<TerminalDeliveryIdentity>> {
     let receipt = store.terminal_receipt(transaction_id, &entry.event_id)?;
     if receipt.commander_session_id != lease.commander_session_id
         || receipt.child_session_id != entry.session_id
         || receipt.runtime_id != runtime_id
-        || receipt.terminal_state != terminal_state(projection.state)?
+        || receipt.terminal_state != expected_terminal_state
         || receipt.task_id != lease.task_id
         || receipt.goal_id != lease.goal_id
         || receipt.operator_override != lease.operator_override
@@ -1359,6 +1499,134 @@ fn intake_terminal_receipt(
         }
         IntakeOutcome::Pending { blocker } => Err(anyhow!(blocker)),
     }
+}
+
+fn read_runtime_lease_snapshot(runtime_id: &str) -> Result<RuntimeLeaseSnapshot> {
+    match session_log_contract::client::call_service(&SessionLogCommand::GetRuntimeLease(
+        GetRuntimeLeaseRequest {
+            runtime_id: runtime_id.to_string(),
+            database_path: None,
+        },
+    ))? {
+        SessionLogResponse::RuntimeLeaseRead {
+            runtime: Some(snapshot),
+        } => Ok(snapshot),
+        SessionLogResponse::RuntimeLeaseRead { runtime: None } => Err(anyhow!(
+            "RUNTIME_CALLBACK_DURABLE_LEASE_NOT_FOUND:{runtime_id}"
+        )),
+        SessionLogResponse::Error { error } => Err(anyhow!(error)),
+        other => Err(anyhow!(
+            "RUNTIME_CALLBACK_LEASE_READ_UNEXPECTED:{other:?}"
+        )),
+    }
+}
+
+fn runtime_lease_from_snapshot(snapshot: &RuntimeLeaseSnapshot) -> Result<RuntimeLease> {
+    let lifecycle = snapshot.lifecycle.as_ref().ok_or_else(|| {
+        anyhow!(
+            "CRASH_RECOVERY_LACKS_DURABLE_LIFECYCLE_IDENTITY:{}",
+            snapshot.runtime_id
+        )
+    })?;
+    lifecycle
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .map_err(|error| {
+            anyhow!(
+                "RUNTIME_CALLBACK_DURABLE_LIFECYCLE_IDENTITY_INVALID:{}:{error}",
+                snapshot.runtime_id
+            )
+        })?;
+    let runtime_lease_id = snapshot.lease_id.as_deref().ok_or_else(|| {
+        anyhow!(
+            "RUNTIME_CALLBACK_DURABLE_LEASE_ID_MISSING:{}",
+            snapshot.runtime_id
+        )
+    })?;
+    if lifecycle.dispatch_runtime_id == snapshot.runtime_id
+        && lifecycle.dispatch_lease_id != runtime_lease_id
+    {
+        return Err(anyhow!(
+            "RUNTIME_CALLBACK_DISPATCH_LEASE_IDENTITY_MISMATCH:runtime={},durable_lease={},dispatch_lease={}",
+            snapshot.runtime_id,
+            runtime_lease_id,
+            lifecycle.dispatch_lease_id
+        ));
+    }
+    Ok(RuntimeLease {
+        runtime_id: lifecycle.dispatch_runtime_id.clone(),
+        lease_id: lifecycle.dispatch_lease_id.clone(),
+        commander_session_id: lifecycle.commander_session_id.clone(),
+        transaction_id: lifecycle.transaction_id.clone(),
+        task_id: lifecycle.task_id.clone(),
+        goal_id: lifecycle.goal_id.clone(),
+        operator_override: lifecycle.operator_override,
+        receipt_event_seq: lifecycle.receipt_event_seq,
+        slot_acquired: false,
+        terminalizing: true,
+    })
+}
+
+fn runtime_terminal_state_from_snapshot(
+    snapshot: &RuntimeLeaseSnapshot,
+    projection: &lifecycle::SessionProjection,
+) -> Result<TerminalState> {
+    if snapshot.session_state != projection.state {
+        return Err(anyhow!(
+            "RUNTIME_CALLBACK_SESSION_STATE_MISMATCH:runtime={},snapshot={:?},projection={:?}",
+            snapshot.runtime_id,
+            snapshot.session_state,
+            projection.state
+        ));
+    }
+    match snapshot.runtime_state {
+        Some(state) => runtime_terminal_state(state),
+        None => terminal_state(projection.state),
+    }
+}
+
+fn terminal_feed_entry_for_runtime(
+    session_id: &str,
+    runtime_id: &str,
+) -> Result<SessionFeedEntry> {
+    let mut after_cursor = 0;
+    let mut latest = None;
+    loop {
+        let response = session_log_contract::client::call_service(
+            &SessionLogCommand::ReadSessionFeed(session_log_contract::ReadSessionFeedRequest {
+                session_id: session_id.to_string(),
+                after_cursor,
+                limit: 1_000,
+            }),
+        )?;
+        let SessionLogResponse::SessionFeed {
+            entries,
+            next_cursor,
+        } = response
+        else {
+            return Err(anyhow!("TERMINAL_FEED_READ_FAILED:{response:?}"));
+        };
+        for entry in entries {
+            let is_terminal = entry.runtime_id.as_deref() == Some(runtime_id)
+                && matches!(
+                    &entry.event,
+                    SessionFeedEvent::SessionProjectionUpdated { projection, .. }
+                        if projection.state.is_terminal()
+                );
+            if is_terminal {
+                latest = Some(entry);
+            }
+        }
+        if next_cursor <= after_cursor {
+            break;
+        }
+        after_cursor = next_cursor;
+    }
+    latest.ok_or_else(|| {
+        anyhow!(
+            "TERMINAL_FEED_EVENT_NOT_FOUND:session={session_id},runtime={runtime_id}"
+        )
+    })
 }
 
 fn terminal_runtime_is_current(
@@ -1565,17 +1833,42 @@ fn terminal_state(state: SessionState) -> Result<TerminalState> {
     }
 }
 
+fn runtime_terminal_state(state: RuntimeState) -> Result<TerminalState> {
+    match state {
+        RuntimeState::Finished => Ok(TerminalState::Completed),
+        RuntimeState::Failed | RuntimeState::TimedOut => Ok(TerminalState::Failed),
+        RuntimeState::Cancelled => Ok(TerminalState::Cancelled),
+        other => Err(anyhow!("RUNTIME_STATE_NOT_TERMINAL:{other:?}")),
+    }
+}
+
+fn recovery_terminal_state(recovery: &RuntimeRecoveryReceipt) -> TerminalState {
+    match recovery.reason {
+        RecoveryCloseRuntimeReason::OrphanedRuntime => TerminalState::Cancelled,
+        RecoveryCloseRuntimeReason::UnbornRuntime => TerminalState::Interrupted,
+    }
+}
+
+fn recovery_runtime_state(recovery: &RuntimeRecoveryReceipt) -> Value {
+    match recovery.reason {
+        RecoveryCloseRuntimeReason::OrphanedRuntime => json!(RuntimeState::Cancelled),
+        RecoveryCloseRuntimeReason::UnbornRuntime => Value::Null,
+    }
+}
+
 fn register_and_activate_runtime(
     session_id: &str,
     runtime_id: &str,
     lease_id: &str,
     fallback_from_id: Option<String>,
+    lifecycle: Option<RuntimeLifecycleIdentity>,
 ) -> Result<()> {
     let response = session_log_contract::client::call_service(
         &SessionLogCommand::RegisterRuntime(RegisterRuntimeRequest {
             runtime_id: runtime_id.to_string(),
             session_id: session_id.to_string(),
             fallback_from_id,
+            lifecycle,
         }),
     )?;
     match response {
@@ -1821,7 +2114,8 @@ fn debug_runtime_enabled() -> bool {
 mod tests {
     use super::{
         failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
-        payload_to_run_agent_request, terminal_runtime_is_current,
+        payload_to_run_agent_request, runtime_lease_from_snapshot,
+        runtime_terminal_state_from_snapshot, terminal_runtime_is_current,
         validate_terminalization_identity, EnqueueTurnRequest, ExecutionService,
         RetryRuntimeIdentity, RouterRecoveryCloseRuntimeRequest, RuntimeLease,
     };
@@ -1832,7 +2126,9 @@ mod tests {
         LifecycleConfig, SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity,
         TerminalState,
     };
-    use session_log_contract::{RuntimeLeaseSnapshot, SessionFeedEntry, SessionFeedEvent};
+    use session_log_contract::{
+        RuntimeLeaseSnapshot, RuntimeLifecycleIdentity, SessionFeedEntry, SessionFeedEvent,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2097,6 +2393,7 @@ mod tests {
             task_id: None,
             goal_id: None,
             operator_override: false,
+            receipt_event_seq: 0,
             slot_acquired: true,
             terminalizing: true,
         };
@@ -2104,6 +2401,7 @@ mod tests {
             database_path: "/tmp/session_log.sqlite3".to_string(),
             runtime_id: "runtime-exact".to_string(),
             session_id: "session-exact".to_string(),
+            lifecycle: None,
             lease_id: Some("lease-exact".to_string()),
             lease_active: true,
             revision: 0,
@@ -2111,6 +2409,7 @@ mod tests {
             terminal: false,
             session_event_seq: 2,
             session_state: SessionState::Running,
+            runtime_state: None,
         };
         validate_terminalization_identity(&snapshot, &lease, "session-exact", "runtime-exact")
             .expect("exact durable identity should pass");
@@ -2125,6 +2424,55 @@ mod tests {
         .expect_err("lease drift must fail closed")
         .to_string()
         .contains("RUNTIME_TERMINALIZATION_DURABLE_IDENTITY_MISMATCH"));
+    }
+
+    #[test]
+    fn durable_lifecycle_snapshot_restores_callback_identity_and_runtime_terminal_semantics() {
+        let lifecycle = RuntimeLifecycleIdentity {
+            commander_session_id: "commander-durable".to_string(),
+            transaction_id: "transaction-durable".to_string(),
+            task_id: Some("task-durable".to_string()),
+            goal_id: Some("goal-durable".to_string()),
+            operator_override: true,
+            dispatch_runtime_id: "runtime-durable".to_string(),
+            dispatch_lease_id: "lease-durable".to_string(),
+            receipt_event_seq: 2,
+        };
+        let snapshot = RuntimeLeaseSnapshot {
+            database_path: "/tmp/session_log.sqlite3".to_string(),
+            runtime_id: "runtime-durable".to_string(),
+            session_id: "child-durable".to_string(),
+            lifecycle: Some(lifecycle),
+            lease_id: Some("lease-durable".to_string()),
+            lease_active: false,
+            revision: 7,
+            last_event_seq: 7,
+            terminal: true,
+            session_event_seq: 3,
+            session_state: SessionState::Interrupted,
+            runtime_state: Some(RuntimeState::Cancelled),
+        };
+        let projection = SessionProjection {
+            session_id: "child-durable".to_string(),
+            state: SessionState::Interrupted,
+            parent_id: Some("commander-durable".to_string()),
+            task_plan: TaskPlan::default(),
+            pending_user_inputs: Vec::new(),
+            cancelled: false,
+            runtime_ids: vec!["runtime-durable".to_string()],
+            active_runtime_id: None,
+        };
+
+        let lease = runtime_lease_from_snapshot(&snapshot)
+            .expect("durable lifecycle identity should reconstruct the callback owner");
+        assert_eq!(lease.transaction_id, "transaction-durable");
+        assert_eq!(lease.commander_session_id, "commander-durable");
+        assert_eq!(lease.receipt_event_seq, 2);
+        assert_eq!(
+            runtime_terminal_state_from_snapshot(&snapshot, &projection)
+                .expect("runtime terminal state should be authoritative"),
+            TerminalState::Cancelled
+        );
     }
 
     #[test]
@@ -2238,6 +2586,7 @@ mod tests {
             task_id: Some("task-1".to_string()),
             goal_id: Some("goal-1".to_string()),
             operator_override: true,
+            receipt_event_seq: 0,
             slot_acquired: true,
             terminalizing: false,
         };
@@ -2294,20 +2643,20 @@ mod tests {
         let first = intake_terminal_receipt(
             &store,
             &entry,
-            &projection,
             "fallback-runtime",
             "transaction-1",
             &lease,
+            TerminalState::Completed,
         )
         .expect("first intake")
         .expect("terminal delivery");
         let duplicate = intake_terminal_receipt(
             &store,
             &entry,
-            &projection,
             "fallback-runtime",
             "transaction-1",
             &lease,
+            TerminalState::Completed,
         )
         .expect("duplicate intake")
         .expect("duplicate terminal delivery");

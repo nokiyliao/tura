@@ -270,6 +270,25 @@ fn workspace_schema_requires_runtime_fallback_source_column() {
 }
 
 #[test]
+fn workspace_schema_adds_runtime_lifecycle_identity_column_once() {
+    let conn = rusqlite::Connection::open_in_memory().expect("workspace db");
+    init_workspace_db(&conn).expect("initialize canonical workspace schema");
+    conn.execute_batch("ALTER TABLE runtimes DROP COLUMN lifecycle_json;")
+        .expect("remove lifecycle column to model the prior canonical schema");
+
+    init_workspace_db(&conn).expect("runtime lifecycle column should migrate additively");
+    init_workspace_db(&conn).expect("runtime lifecycle migration should be idempotent");
+    let columns = conn
+        .prepare("PRAGMA table_info(runtimes)")
+        .expect("prepare runtime columns")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query runtime columns")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect runtime columns");
+    assert_eq!(columns.last().map(String::as_str), Some("lifecycle_json"));
+}
+
+#[test]
 fn index_schema_does_not_store_canonical_lifecycle_aggregate() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("index.sqlite3");

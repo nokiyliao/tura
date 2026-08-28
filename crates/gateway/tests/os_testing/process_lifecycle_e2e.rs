@@ -254,6 +254,7 @@ fn create_and_register_runtime(
             runtime_id: runtime_id.to_string(),
             session_id: session_id.to_string(),
             fallback_from_id: None,
+            lifecycle: None,
         }),
     )? {
         SessionLogResponse::RuntimeRegistered { .. } => Ok(()),

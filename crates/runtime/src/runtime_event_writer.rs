@@ -10,8 +10,8 @@ use session_lifecycle::{
 use session_log_contract::{
     ActivateRuntimeLeaseRequest, AppendSessionFeedEventRequest, CommitRuntimeEventRequest,
     RegisterRuntimeRequest, RuntimeEventCommitOutcome, RuntimeLeaseOutcome,
-    RuntimeRegistrationOutcome, SessionFeedAppendOutcome, SessionFeedEvent, SessionLogCommand,
-    SessionLogResponse,
+    RuntimeLifecycleIdentity, RuntimeRegistrationOutcome, SessionFeedAppendOutcome,
+    SessionFeedEvent, SessionLogCommand, SessionLogResponse,
 };
 
 use crate::session_log_client::SessionLogClient;
@@ -354,6 +354,18 @@ impl RuntimeEventWriter {
                     runtime_id: runtime_id.to_string(),
                     session_id: self.session_id.clone(),
                     fallback_from_id: runtime.fallback_from_id.clone(),
+                    lifecycle: self.lifecycle.as_ref().map(|lifecycle| {
+                        RuntimeLifecycleIdentity {
+                            commander_session_id: lifecycle.commander_session_id.clone(),
+                            transaction_id: lifecycle.transaction_id.clone(),
+                            task_id: lifecycle.task_id.clone(),
+                            goal_id: lifecycle.goal_id.clone(),
+                            operator_override: lifecycle.operator_override,
+                            dispatch_runtime_id: self.initial_runtime_id.clone(),
+                            dispatch_lease_id: self.initial_lease_id.clone(),
+                            receipt_event_seq: self.next_receipt_event_seq,
+                        }
+                    }),
                 }))?;
         let (revision, next_event_seq) = match response {
             SessionLogResponse::RuntimeRegistered {

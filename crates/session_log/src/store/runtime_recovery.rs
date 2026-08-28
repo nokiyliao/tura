@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 struct RuntimeRow {
     session_id: String,
     fallback_from_id: Option<String>,
+    lifecycle: Option<session_log_contract::RuntimeLifecycleIdentity>,
     lease_id: Option<String>,
     lease_active: bool,
     revision: u64,
@@ -74,10 +75,22 @@ impl SessionLogStore {
             };
             let session = replay_session_events(conn, &row.session_id)?;
             let session_event_seq = load_session_event_seq(conn, &row.session_id)?;
+            let runtime_events = load_runtime_events(conn, &request.runtime_id)?;
+            let runtime_state = if runtime_events.is_empty() {
+                None
+            } else {
+                Some(
+                    RuntimeAggregate::replay(request.runtime_id.clone(), runtime_events)
+                        .map_err(anyhow::Error::msg)
+                        .context("persisted runtime lifecycle is invalid")?
+                        .state,
+                )
+            };
             Ok(Some(RuntimeLeaseSnapshot {
                 database_path: database_path.clone(),
                 runtime_id: request.runtime_id.clone(),
                 session_id: row.session_id,
+                lifecycle: row.lifecycle,
                 lease_id: row.lease_id,
                 lease_active: row.lease_active,
                 revision: row.revision,
@@ -85,6 +98,7 @@ impl SessionLogStore {
                 terminal: row.terminal,
                 session_event_seq,
                 session_state: session.state,
+                runtime_state,
             }))
         })
     }
@@ -506,10 +520,22 @@ fn exact_database_path(database_path: &str) -> Result<PathBuf> {
 fn load_runtime_row(conn: &rusqlite::Connection, runtime_id: &str) -> Result<Option<RuntimeRow>> {
     conn.query_row(
         "SELECT session_id, fallback_from_id, lease_id, lease_active, revision,
-                last_event_seq, terminal
+                last_event_seq, terminal, lifecycle_json
          FROM runtimes WHERE runtime_id = ?1",
         params![runtime_id],
         |row| {
+            let lifecycle_json = row.get::<_, Option<String>>(7)?;
+            let lifecycle = lifecycle_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        7,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
             Ok(RuntimeRow {
                 session_id: row.get(0)?,
                 fallback_from_id: row.get(1)?,
@@ -518,6 +544,7 @@ fn load_runtime_row(conn: &rusqlite::Connection, runtime_id: &str) -> Result<Opt
                 revision: row.get(4)?,
                 last_event_seq: row.get(5)?,
                 terminal: row.get(6)?,
+                lifecycle,
             })
         },
     )
@@ -534,8 +561,8 @@ fn load_session_event_seq(conn: &rusqlite::Connection, session_id: &str) -> Resu
     .map_err(Into::into)
 }
 
-fn load_runtime_events(tx: &Transaction<'_>, runtime_id: &str) -> Result<Vec<RuntimeEvent>> {
-    let mut statement = tx.prepare(
+fn load_runtime_events(conn: &rusqlite::Connection, runtime_id: &str) -> Result<Vec<RuntimeEvent>> {
+    let mut statement = conn.prepare(
         "SELECT event_seq, event_json FROM runtime_events
          WHERE runtime_id = ?1 ORDER BY event_seq",
     )?;
@@ -663,6 +690,7 @@ mod tests {
                         runtime_id: runtime_id.clone(),
                         session_id: session_id.clone(),
                         fallback_from_id: None,
+                        lifecycle: None,
                     })
                     .expect("register recovery runtime"),
                 RuntimeRegistrationOutcome::Registered { .. }

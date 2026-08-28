@@ -205,6 +205,7 @@ fn high_frequency_runtime_feed_keeps_every_event_through_a_readonly_flicker() {
             runtime_id: runtime_id.clone(),
             session_id: session_id.clone(),
             fallback_from_id: None,
+            lifecycle: None,
         })
         .expect("register runtime");
     store

@@ -161,6 +161,7 @@ fn register_and_activate_runtime(
             runtime_id: runtime_id.to_string(),
             session_id: session_id.to_string(),
             fallback_from_id: None,
+            lifecycle: None,
         }),
     )
     .map_err(|error| format!("failed to register embedded runtime `{runtime_id}`: {error}"))?;
