@@ -60,6 +60,7 @@ async fn runtime_provider_timeout_business_flow_marks_runtime_timed_out_without_
             allowed_command_run_commands: Some(BTreeSet::new()),
             disable_permission_restrictions: false,
             require_startup_task_state: false,
+            jspace_contract: None,
         },
         settings,
         Arc::new(TuraConfig::new(".env.runtime-timeout-business-missing")),
@@ -157,6 +158,7 @@ async fn streamed_command_run_waits_for_commands_after_provider_stream_completes
             allowed_command_run_commands: Some(BTreeSet::from(["shell_command".to_string()])),
             disable_permission_restrictions: false,
             require_startup_task_state: false,
+            jspace_contract: None,
         },
         settings,
         Arc::new(TuraConfig::new(
@@ -287,6 +289,7 @@ async fn failed_apply_patch_finishes_tool_turn_without_cancelling_runtime() {
             ])),
             disable_permission_restrictions: false,
             require_startup_task_state: false,
+            jspace_contract: None,
         },
         settings,
         Arc::new(TuraConfig::new(
@@ -388,6 +391,7 @@ async fn streamed_command_run_gateway_callbacks_do_not_gate_command_execution_bu
             allowed_command_run_commands: Some(BTreeSet::from(["shell_command".to_string()])),
             disable_permission_restrictions: false,
             require_startup_task_state: false,
+            jspace_contract: None,
         },
         settings,
         Arc::new(TuraConfig::new(
