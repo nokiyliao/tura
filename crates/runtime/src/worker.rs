@@ -254,7 +254,10 @@ fn handle_call(payload: &Value) -> Value {
         .get("return_log")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let agent_spec = call.get("agent_spec").cloned();
+    let agent_spec = call
+        .get("agent_spec")
+        .filter(|value| !value.is_null())
+        .cloned();
     let jspace_contract = call.get("jspace_contract").cloned();
     let task_context_capsule = match call.get("task_context_capsule").cloned() {
         None | Some(Value::Null) => None,
@@ -277,6 +280,14 @@ fn handle_call(payload: &Value) -> Value {
                 "session_id": session_id,
                 "code": "TASK_CONTEXT_RUNTIME_CONTEXT_CONFLICT",
                 "error": "raw runtime_context cannot accompany a signed Task Context Capsule",
+            });
+        }
+        if agent_spec.is_none() {
+            return json!({
+                "ok": false,
+                "session_id": session_id,
+                "code": "TASK_CONTEXT_AGENT_SPEC_MISSING",
+                "error": "a signed Task Context Capsule requires a router-resolved agent_spec",
             });
         }
         if let Err(error) = capsule.bind_jspace(jspace_contract.as_ref()) {
@@ -503,6 +514,34 @@ mod tests {
     }
 
     #[test]
+    fn task_context_capsule_requires_router_agent_spec_before_runtime_start() {
+        let reply = handle_call(&json!({
+            "input": {
+                "input": {
+                    "session_id": "task-context-missing-agent-spec",
+                    "runtime_id": "runtime-task-context-missing-agent-spec",
+                    "lease_id": "lease-task-context-missing-agent-spec",
+                    "prompt": "must fail before provider selection",
+                    "lifecycle": {
+                        "transaction_id": "transaction-task-context-missing-agent-spec",
+                        "commander_session_id": "commander-task-context-missing-agent-spec"
+                    },
+                    "jspace_contract": {"semantic_sha256": "a".repeat(64)},
+                    "task_context_capsule": test_task_context_capsule()
+                }
+            }
+        }));
+
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["session_id"], "task-context-missing-agent-spec");
+        assert_eq!(reply["code"], "TASK_CONTEXT_AGENT_SPEC_MISSING");
+        assert_eq!(
+            reply["error"],
+            "a signed Task Context Capsule requires a router-resolved agent_spec"
+        );
+    }
+
+    #[test]
     fn unknown_kind_is_reported() {
         let reply = handle_envelope(&WorkerEnvelope {
             kind: "bogus".to_string(),
@@ -670,6 +709,29 @@ mod tests {
             "test prompt".to_string(),
             Utc::now(),
         )
+    }
+
+    fn test_task_context_capsule() -> Value {
+        let mut capsule = json!({
+            "schema_version": runtime_contract::TASK_CONTEXT_CAPSULE_SCHEMA_VERSION,
+            "mission": {
+                "mission_id": "mission-task-context-agent-spec",
+                "task_id": "task-context-agent-spec",
+                "mode": "DELIVERY",
+                "current_predicate": "TASK_PACKET_AND_PROVIDER_SELECTION_INTEGRITY",
+                "objective": "Reject delegated context before provider fallback"
+            },
+            "context_summary": "Use only the router-resolved agent specification.",
+            "dcf_generation": {"generation_id": "generation-task-context-agent-spec"},
+            "surface": {"repo_root": "/workspace", "matched_surface_ids": ["runtime-worker"]},
+            "authority": {"forbidden_effects": ["provider_fallback"]},
+            "evidence_refs": [],
+            "focused_verifiers": [],
+            "jspace_semantic_sha256": "a".repeat(64)
+        });
+        capsule["semantic_sha256"] =
+            Value::String(tura_path::jspace::semantic_sha256(&capsule));
+        capsule
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
