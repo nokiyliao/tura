@@ -17,6 +17,7 @@ use tura_llm_rust::official_codex_app_server::{
 
 pub(crate) struct OfficialCodexRuntimeInput {
     pub(crate) messages: Vec<Value>,
+    pub(crate) turn_context: Option<String>,
     pub(crate) dynamic_tools: Vec<Value>,
     pub(crate) session_directory: PathBuf,
     pub(crate) allowed_command_run_commands: Option<BTreeSet<String>>,
@@ -46,6 +47,7 @@ pub(crate) async fn call_runtime_official_codex(
         session_directory: input.session_directory,
         model: provider.model.clone(),
         messages: input.messages,
+        turn_context: input.turn_context,
         executable: CodexAppServerExecutable {
             path: executable,
             prefix_args: Vec::new(),

@@ -185,6 +185,7 @@ pub struct OfficialCodexTurnRequest {
     pub session_directory: PathBuf,
     pub model: String,
     pub messages: Vec<Value>,
+    pub turn_context: Option<String>,
     pub executable: CodexAppServerExecutable,
     pub dynamic_tools: Vec<Value>,
     pub allowed_command_run_commands: Option<BTreeSet<String>>,
@@ -2462,10 +2463,17 @@ fn canonical_mission_snapshot(
         );
     }
     let thread_start_params = Value::Object(thread_start_params);
-    let turn_input = vec![json!({
+    let mut turn_input = request
+        .turn_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|context| !context.is_empty())
+        .map(|context| vec![json!({"type": "text", "text": context})])
+        .unwrap_or_default();
+    turn_input.push(json!({
         "type": "text",
         "text": latest_user_input(&request.messages)?,
-    })];
+    }));
     let payload = json!({
         "turaSessionId": request.tura_session_id,
         "messages": request.messages,

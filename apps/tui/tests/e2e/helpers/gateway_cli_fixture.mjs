@@ -404,27 +404,36 @@ export async function startGateway(runRoot) {
       const body = await readJson(req);
       records.prompts.push(body);
       const text = body.parts?.[0]?.text ?? "";
-      messages.push({
+      const userMessage = {
         id: `msg-user-${records.prompts.length}`,
         sessionID: session.id,
         role: "user",
         parts: [{ id: `part-user-${records.prompts.length}`, type: "text", text }],
         created_at: Date.now(),
         updated_at: Date.now(),
-      });
-      messages.push({
+      };
+      const promptEchoRegression = text.includes("PROMPT_ECHO_REGRESSION");
+      const assistantMessage = {
         id: `msg-assistant-${records.prompts.length}`,
         sessionID: session.id,
         role: "assistant",
         parts: [
-          { id: `part-assistant-${records.prompts.length}`, type: "text", text: `final: ${text}` },
+          {
+            id: `part-assistant-${records.prompts.length}`,
+            type: "text",
+            text: promptEchoRegression ? "STREAM_FINAL_OK" : `final: ${text}`,
+          },
         ],
         created_at: Date.now() + 1,
         updated_at: Date.now() + 1,
-      });
+      };
+      messages.push(userMessage, assistantMessage);
       emit({
         directory: runRoot,
-        payload: { type: "message.updated", properties: { info: messages.at(-1) } },
+        payload: {
+          type: "message.updated",
+          properties: { info: promptEchoRegression ? userMessage : assistantMessage },
+        },
       });
       return sendJson(res, {});
     }

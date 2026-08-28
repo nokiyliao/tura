@@ -629,6 +629,26 @@ async function main() {
     await client.abort("sess-e2e");
     assert.ok(gateway.records.aborts.includes("sess-e2e"));
 
+    const lastMessageFile = path.join(runRoot, "prompt-echo-last-message.txt");
+    const promptEcho = await expectCliJson([
+      ...baseArgs(gateway),
+      "--json",
+      "run",
+      "PROMPT_ECHO_REGRESSION this user prompt is deliberately longer than the final answer",
+      "--timeout",
+      "5",
+      "--last-message-file",
+      lastMessageFile,
+    ]);
+    assert.equal(promptEcho.status, "completed");
+    assert.equal(promptEcho.finalText, "STREAM_FINAL_OK");
+    assert.equal(await fs.readFile(lastMessageFile, "utf8"), "STREAM_FINAL_OK");
+
+    if (process.env.TURA_TUI_SKIP_WEB_TERMINAL_E2E === "1") {
+      console.log("[tui-minimal-e2e] ok=true scope=cli-only");
+      return;
+    }
+
     gateway.seedRichFixture();
     const requestCountBeforeWebTerminal = gateway.records.requests.length;
     const screenshotsDir = await runWebTerminalE2e(gateway);

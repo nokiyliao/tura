@@ -62,6 +62,19 @@ pub(crate) async fn call_runtime_with_writer(
     let now = Utc::now();
     let profiling = profile_timings::enabled();
     let normalize_start = Instant::now();
+    let turn_context = input
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.get("role").and_then(serde_json::Value::as_str)
+                == Some(crate::context::USER_AGENT_CONTEXT_ROLE)
+        })
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let provider_messages = normalize_provider_messages(input.messages);
     profile_timings::log_elapsed(
         "call_runtime.normalize_provider_messages",
@@ -218,6 +231,7 @@ pub(crate) async fn call_runtime_with_writer(
             provider,
             OfficialCodexRuntimeInput {
                 messages: provider_messages,
+                turn_context,
                 dynamic_tools: input_tools,
                 session_directory: input.session_directory.clone(),
                 allowed_command_run_commands: input.allowed_command_run_commands.clone(),

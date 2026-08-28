@@ -90,6 +90,7 @@ export interface NormalizedEvent {
   directory: string;
   sessionID?: string;
   messageID?: string;
+  role?: Message["role"];
   partID?: string;
   status?: string;
   text?: string;

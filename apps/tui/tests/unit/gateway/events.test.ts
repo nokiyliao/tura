@@ -30,6 +30,7 @@ test("normalizeEvent extracts message and session status fields", () => {
 
   assert.equal(message.sessionID, "sess-1");
   assert.equal(message.messageID, "msg-1");
+  assert.equal(message.role, "assistant");
   assert.equal(message.text, "hello");
 
   const status = normalizeEvent({

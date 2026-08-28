@@ -239,6 +239,7 @@ function updateEventText(
     return text.trim() ? text : latest;
   }
   if (event.type === "message.updated") {
+    if (event.role !== "assistant") return latest;
     const key = event.messageID ?? "assistant";
     texts.set(key, event.text);
     return event.text.trim() ? event.text : latest;

@@ -323,6 +323,7 @@ fn runtime_worker_call_input(
         "runtime_context": req.runtime_context,
         "planning_mode_override": req.planning_mode_override,
         "jspace_contract": req.jspace_contract,
+        "task_context_capsule": req.task_context_capsule,
         "no_op_manual": req.no_op_manual,
         "return_log": req.return_log,
     })
@@ -414,6 +415,10 @@ mod tests {
             "jspace_contract": {
                 "schema_version": "jspace_contract_v1",
                 "semantic_sha256": "jspace-digest"
+            },
+            "task_context_capsule": {
+                "schema_version": "task_context_capsule_v1",
+                "semantic_sha256": "capsule-digest"
             }
         }))?;
         let agent_spec = state
@@ -434,6 +439,10 @@ mod tests {
         assert_eq!(input["session_id"], "session-lease-regression");
         assert_eq!(input["prompt"], "exercise the runtime worker envelope");
         assert_eq!(input["jspace_contract"]["semantic_sha256"], "jspace-digest");
+        assert_eq!(
+            input["task_context_capsule"]["semantic_sha256"],
+            "capsule-digest"
+        );
         Ok(())
     }
 

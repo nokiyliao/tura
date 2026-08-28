@@ -67,6 +67,7 @@ export function normalizeEvent(raw: GatewayEventEnvelope): NormalizedEvent {
   const type = payload?.type ?? "unknown";
   const sessionID = eventSessionID(payload);
   let messageID: string | undefined;
+  let role: Message["role"] | undefined;
   let partID: string | undefined;
   let text: string | undefined;
   let status: string | undefined;
@@ -78,6 +79,7 @@ export function normalizeEvent(raw: GatewayEventEnvelope): NormalizedEvent {
   if (payload?.type === "message.updated") {
     const info = (payload.properties as { info?: Message } | undefined)?.info;
     messageID = info?.id;
+    role = info?.role;
     text = info ? messageText(info) : undefined;
   }
   if (payload?.type === "message.part.updated") {
@@ -126,6 +128,7 @@ export function normalizeEvent(raw: GatewayEventEnvelope): NormalizedEvent {
     directory: raw.directory ?? "global",
     sessionID,
     messageID,
+    role,
     partID,
     status,
     text,

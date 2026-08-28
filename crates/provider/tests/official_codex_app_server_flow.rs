@@ -90,21 +90,20 @@ async fn run_hostile_flow() {
     let _home = EnvGuard::set("HOME", auth_path.parent().unwrap().parent().unwrap());
 
     let first_capture = root.path().join("first.jsonl");
-    let first = run_official_codex_turn(
-        request(
-            &session_directory,
-            &first_capture,
-            vec![
-                json!({"role": "system", "content": "Use the governed Tura tools."}),
-                json!({
-                    "role": "user",
-                    "content": "first official turn",
-                    "previous_response_id": "resp_syntactically_valid_but_nonexistent"
-                }),
-            ],
-        ),
-        None,
-    )
+    let mut first_request = request(
+        &session_directory,
+        &first_capture,
+        vec![
+            json!({"role": "system", "content": "Use the governed Tura tools."}),
+            json!({
+                "role": "user",
+                "content": "first official turn",
+                "previous_response_id": "resp_syntactically_valid_but_nonexistent"
+            }),
+        ],
+    );
+    first_request.turn_context = Some("bounded runtime context".to_string());
+    let first = run_official_codex_turn(first_request, None)
     .await
     .expect("first official turn");
 
@@ -158,6 +157,17 @@ async fn run_hostile_flow() {
         .expect("first thread/start");
     assert_eq!(first_thread_start["params"]["approvalPolicy"], "on-request");
     assert_eq!(first_thread_start["params"]["sandbox"], "workspace-write");
+    let first_turn_start = first_lines
+        .iter()
+        .find(|message| message.get("method").and_then(Value::as_str) == Some("turn/start"))
+        .expect("first turn/start");
+    assert_eq!(
+        first_turn_start["params"]["input"],
+        json!([
+            {"type": "text", "text": "bounded runtime context"},
+            {"type": "text", "text": "first official turn"}
+        ])
+    );
     let first_wire = first_lines
         .iter()
         .map(Value::to_string)
@@ -1177,6 +1187,7 @@ fn request(
         session_directory: session_directory.to_path_buf(),
         model: "gpt-5.6-sol".to_string(),
         messages,
+        turn_context: None,
         executable: CodexAppServerExecutable {
             path: std::env::current_exe().expect("test executable"),
             prefix_args: vec![
