@@ -483,6 +483,7 @@ pub struct GetRuntimeLeaseRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeLeaseSnapshot {
+    pub database_path: String,
     pub runtime_id: String,
     pub session_id: String,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -491,6 +492,8 @@ pub struct RuntimeLeaseSnapshot {
     pub revision: u64,
     pub last_event_seq: u64,
     pub terminal: bool,
+    pub session_event_seq: u64,
+    pub session_state: SessionState,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

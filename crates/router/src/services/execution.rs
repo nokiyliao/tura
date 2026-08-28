@@ -21,10 +21,10 @@ use session_lifecycle::{
 };
 use session_log_contract::{
     ActivateRuntimeLeaseRequest, GetRuntimeLeaseRequest, GetSessionRequest,
-    RecoveryCloseRuntimeReason, RecoveryCloseRuntimeRequest, RegisterRuntimeRequest,
-    ReplayRuntimeRequest, RuntimeLeaseOutcome, RuntimeRecoveryQuiescenceProof,
-    RuntimeRegistrationOutcome, SessionFeedEntry, SessionFeedEvent, SessionLogCommand,
-    SessionLogResponse,
+    RecoveryCloseRuntimeOutcome, RecoveryCloseRuntimeReason, RecoveryCloseRuntimeRequest,
+    RegisterRuntimeRequest, ReplayRuntimeRequest, RuntimeLeaseOutcome, RuntimeLeaseSnapshot,
+    RuntimeRecoveryQuiescenceProof, RuntimeRegistrationOutcome, SessionFeedEntry, SessionFeedEvent,
+    SessionLogCommand, SessionLogResponse,
 };
 
 #[derive(Clone)]
@@ -46,6 +46,7 @@ struct RuntimeLease {
     goal_id: Option<String>,
     operator_override: bool,
     slot_acquired: bool,
+    terminalizing: bool,
 }
 
 fn active_turn_conflict(session_id: &str, active: &RuntimeLease) -> Value {
@@ -155,7 +156,7 @@ impl ExecutionService {
             }
             let queued = sessions
                 .values()
-                .filter(|lease| !lease.slot_acquired)
+                .filter(|lease| !lease.slot_acquired && !lease.terminalizing)
                 .count();
             if queued >= MAX_QUEUED_RUNTIME_TURNS {
                 return Err(anyhow!(
@@ -173,6 +174,7 @@ impl ExecutionService {
                     goal_id,
                     operator_override,
                     slot_acquired: false,
+                    terminalizing: false,
                 },
             );
         }
@@ -211,6 +213,43 @@ impl ExecutionService {
         ) {
             Ok(delivery) => delivery,
             Err(error) => {
+                let missing_terminal_feed = error
+                    .to_string()
+                    .starts_with("TERMINAL_FEED_EVENT_NOT_FOUND:");
+                if missing_terminal_feed {
+                    match self
+                        .terminalize_registered_runtime(
+                            state,
+                            &request.session_id,
+                            &request.runtime_id,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            active_guard.finish();
+                            drop(permit);
+                            return Err(anyhow!(
+                                "TERMINAL_RECEIPT_NOT_DURABLE:{error:#}:RUNTIME_TERMINALIZED"
+                            ));
+                        }
+                        Err(terminalization_error) => {
+                            match self.retain_runtime_slot_if_current(
+                                &request.session_id,
+                                &request.runtime_id,
+                                permit,
+                            ) {
+                                Ok(()) => active_guard.retain(),
+                                Err(permit) => {
+                                    active_guard.finish();
+                                    drop(permit);
+                                }
+                            }
+                            return Err(anyhow!(
+                                "TERMINAL_RECEIPT_NOT_DURABLE:{error:#}:AUTO_TERMINALIZATION_BLOCKED:{terminalization_error:#}"
+                            ));
+                        }
+                    }
+                }
                 match self.retain_runtime_slot_if_current(
                     &request.session_id,
                     &request.runtime_id,
@@ -342,9 +381,13 @@ impl ExecutionService {
         let _admission = self.admission.write().await;
 
         let lease = self.sessions.lock().get(&request.session_id).cloned();
-        let queued_turn = lease.as_ref().is_some_and(|lease| !lease.slot_acquired);
-        let running_turn = lease.as_ref().is_some_and(|lease| lease.slot_acquired);
-        let active_turn = lease.is_some();
+        let queued_turn = lease
+            .as_ref()
+            .is_some_and(|lease| !lease.slot_acquired && !lease.terminalizing);
+        let running_turn = lease
+            .as_ref()
+            .is_some_and(|lease| lease.slot_acquired && !lease.terminalizing);
+        let active_turn = lease.as_ref().is_some_and(|lease| !lease.terminalizing);
         let worker_alive = state
             .manager
             .worker_alive_by_key(&format!("runtime_worker:{}", request.session_id))
@@ -472,31 +515,24 @@ impl ExecutionService {
             code_tools::shell_executor::terminate_retained_shell_process_scopes_for_scope(
                 &session_id,
             );
-        let removed = {
-            let mut sessions = self.sessions.lock();
-            if sessions
-                .get(&session_id)
-                .is_some_and(|lease| lease.runtime_id == runtime_id)
-            {
-                sessions.remove(&session_id).is_some()
-            } else {
-                false
-            }
-        };
-        if removed {
-            self.retained_slots.lock().remove(&session_id);
-            if let Some(notify) = self.retained_watchers.lock().remove(&session_id) {
-                notify.notify_one();
-            }
+        self.retained_slots.lock().remove(&session_id);
+        if let Some(notify) = self.retained_watchers.lock().remove(&session_id) {
+            notify.notify_one();
         }
+        let terminalization = self.mark_terminalizing(&session_id, &runtime_id);
+        let terminalization_error = terminalization.as_ref().err().map(ToString::to_string);
         json!({
-            "status": if removed || stopped_worker { "cancelling" } else { "idle" },
+            "status": if terminalization.is_ok() { "cancelling" } else { "error" },
             "session_id": session_id,
             "runtime_id": runtime_id,
             "stopped_worker": stopped_worker,
             "active_command_runs_cancelled": active_command_runs_cancelled,
             "active_command_runs_remaining": state.command_run.active_count_for_session(&session_id),
-            "retained_process_scopes_terminated": retained_process_scopes_terminated
+            "retained_process_scopes_terminated": retained_process_scopes_terminated,
+            "runtime_terminalized": false,
+            "terminalization_pending": terminalization.is_ok(),
+            "active_turn_removed": false,
+            "terminalization_error": terminalization_error
         })
     }
 
@@ -512,26 +548,53 @@ impl ExecutionService {
                 .manager
                 .stop_workers_with_prefix("runtime_worker:")
                 .await;
-            let active_turns_removed = self.sessions.lock().drain().count();
-            self.retained_slots.lock().clear();
-            let watchers = self
-                .retained_watchers
-                .lock()
-                .drain()
-                .map(|(_, notify)| notify)
-                .collect::<Vec<_>>();
-            for notify in watchers {
-                notify.notify_one();
+            let leases = self.sessions.lock().clone();
+            let mut terminalizing_count = 0;
+            let mut terminalization_failures = Vec::new();
+            for (session_id, lease) in leases {
+                state.command_run.cancel_session(&session_id);
+                let drained = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    state.command_run.wait_for_session_idle(&session_id),
+                )
+                .await
+                .is_ok();
+                code_tools::shell_executor::terminate_retained_shell_process_scopes_for_scope(
+                    &session_id,
+                );
+                self.retained_slots.lock().remove(&session_id);
+                if let Some(notify) = self.retained_watchers.lock().remove(&session_id) {
+                    notify.notify_one();
+                }
+                let terminalization = if drained {
+                    self.mark_terminalizing(&session_id, &lease.runtime_id)
+                        .map(|_| ())
+                } else {
+                    Err(anyhow!(
+                        "RUNTIME_TERMINALIZATION_COMMAND_RUN_DID_NOT_DRAIN:session={session_id},runtime={}",
+                        lease.runtime_id
+                    ))
+                };
+                match terminalization {
+                    Ok(()) => terminalizing_count += 1,
+                    Err(error) => terminalization_failures.push(json!({
+                        "session_id": session_id,
+                        "runtime_id": lease.runtime_id,
+                        "error": error.to_string()
+                    })),
+                }
             }
             return json!({
-                "status": "stopped",
+                "status": if terminalization_failures.is_empty() { "stopped" } else { "error" },
                 "stopped": stopped,
                 "stopped_worker": stopped > 0,
-                "active_turns_removed": active_turns_removed
+                "active_turns_removed": 0,
+                "terminalizing_count": terminalizing_count,
+                "terminalization_failures": terminalization_failures
             });
         };
 
-        let active_turn_removed = self.sessions.lock().remove(&session_id).is_some();
+        let lease = self.sessions.lock().get(&session_id).cloned();
         let stopped_worker = state
             .manager
             .stop_worker_by_key(&format!("runtime_worker:{session_id}"))
@@ -551,15 +614,29 @@ impl ExecutionService {
         if let Some(notify) = self.retained_watchers.lock().remove(&session_id) {
             notify.notify_one();
         }
+        let terminalization = match lease.as_ref() {
+            Some(lease) if command_runs_drained => self
+                .mark_terminalizing(&session_id, &lease.runtime_id)
+                .map(|_| ()),
+            Some(lease) => Err(anyhow!(
+                "RUNTIME_TERMINALIZATION_COMMAND_RUN_DID_NOT_DRAIN:session={session_id},runtime={}",
+                lease.runtime_id
+            )),
+            None => Ok(()),
+        };
+        let terminalization_error = terminalization.as_ref().err().map(ToString::to_string);
         json!({
-            "status": if command_runs_drained { "stopped" } else { "error" },
+            "status": if command_runs_drained && terminalization.is_ok() { "stopping" } else { "error" },
             "session_id": session_id,
             "stopped": usize::from(stopped_worker),
             "stopped_worker": stopped_worker,
-            "active_turn_removed": active_turn_removed,
+            "active_turn_removed": false,
             "active_command_runs_cancelled": active_command_runs_cancelled,
             "active_command_runs_remaining": state.command_run.active_count_for_session(&session_id),
-            "retained_process_scopes_terminated": retained_process_scopes_terminated
+            "retained_process_scopes_terminated": retained_process_scopes_terminated,
+            "runtime_terminalized": lease.is_none(),
+            "terminalization_pending": lease.is_some() && terminalization.is_ok(),
+            "terminalization_error": terminalization_error
         })
     }
 
@@ -574,14 +651,18 @@ impl ExecutionService {
             .filter(|value| !value.is_empty())
         {
             let lease = states.get(&session_id);
-            let queued_turn = lease.is_some_and(|lease| !lease.slot_acquired);
-            let running_turn = lease.is_some_and(|lease| lease.slot_acquired);
-            let active_turn = lease.is_some();
+            let queued_turn =
+                lease.is_some_and(|lease| !lease.slot_acquired && !lease.terminalizing);
+            let running_turn =
+                lease.is_some_and(|lease| lease.slot_acquired && !lease.terminalizing);
+            let active_turn = lease.is_some_and(|lease| !lease.terminalizing);
             let worker_alive = state
                 .manager
                 .worker_alive_by_key(&format!("runtime_worker:{session_id}"))
                 .await;
-            let status = if queued_turn {
+            let status = if lease.is_some_and(|lease| lease.terminalizing) {
+                "terminalizing"
+            } else if queued_turn {
                 "queued"
             } else if running_turn || worker_alive {
                 "running"
@@ -620,6 +701,7 @@ impl ExecutionService {
                 "runtime_id": lease.runtime_id,
                 "transaction_id": lease.transaction_id,
                 "slot_acquired": lease.slot_acquired,
+                "terminalizing": lease.terminalizing,
                 "worker_alive": worker_alive,
                 "active_command_runs": state.command_run.active_count_for_session(&session_id),
                 "retained_process_scopes": code_tools::shell_executor::retained_shell_process_scope_count_for_scope(&session_id),
@@ -717,6 +799,7 @@ impl ExecutionService {
                 goal_id: None,
                 operator_override: false,
                 slot_acquired,
+                terminalizing: false,
             },
         );
     }
@@ -750,6 +833,174 @@ impl ExecutionService {
         }
         lease.slot_acquired = true;
         true
+    }
+
+    fn mark_terminalizing(&self, session_id: &str, runtime_id: &str) -> Result<RuntimeLease> {
+        let mut sessions = self.sessions.lock();
+        let lease = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| anyhow!("RUNTIME_TERMINALIZATION_LEASE_NOT_FOUND:{session_id}"))?;
+        if lease.runtime_id != runtime_id {
+            return Err(anyhow!(
+                "RUNTIME_TERMINALIZATION_IDENTITY_MISMATCH:session={session_id},expected_runtime={runtime_id},current_runtime={}",
+                lease.runtime_id
+            ));
+        }
+        lease.terminalizing = true;
+        Ok(lease.clone())
+    }
+
+    async fn terminalization_quiescence_proof(
+        &self,
+        state: &AppState,
+        session_id: &str,
+        runtime_id: &str,
+    ) -> Result<RuntimeRecoveryQuiescenceProof> {
+        let terminalizing = self
+            .sessions
+            .lock()
+            .get(session_id)
+            .is_some_and(|lease| lease.runtime_id == runtime_id && lease.terminalizing);
+        if !terminalizing {
+            return Err(anyhow!(
+                "RUNTIME_TERMINALIZATION_PHASE_NOT_OWNED:session={session_id},runtime={runtime_id}"
+            ));
+        }
+        let worker_alive = state
+            .manager
+            .worker_alive_by_key(&format!("runtime_worker:{session_id}"))
+            .await;
+        let retained_process_scopes =
+            code_tools::shell_executor::retained_shell_process_scope_count_for_scope(session_id);
+        let retained_slot = self.retained_slots.lock().contains_key(session_id);
+        let global_active_session_count = self.sessions.lock().len() as u64;
+        let global_retained_slot_count = self.retained_slots.lock().len() as u64;
+        let global_active_command_runs = state.command_run.active_count() as u64;
+        let proof = RuntimeRecoveryQuiescenceProof {
+            active_turn: false,
+            queued_turn: false,
+            running_turn: false,
+            worker_alive,
+            active_command_runs: state.command_run.active_count_for_session(session_id) as u64,
+            retained_process_scopes: retained_process_scopes as u64,
+            retained_slot,
+            global_active_session_count,
+            global_retained_slot_count,
+            global_active_command_runs,
+        };
+        if !proof.is_quiescent() {
+            return Err(anyhow!(
+                "RUNTIME_TERMINALIZATION_NOT_QUIESCENT:{}",
+                serde_json::to_string(&proof)?
+            ));
+        }
+        Ok(proof)
+    }
+
+    async fn terminalize_registered_runtime(
+        &self,
+        state: &AppState,
+        session_id: &str,
+        runtime_id: &str,
+    ) -> Result<()> {
+        let lease = self.mark_terminalizing(session_id, runtime_id)?;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            state.command_run.wait_for_session_idle(session_id),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "RUNTIME_TERMINALIZATION_COMMAND_RUN_DID_NOT_DRAIN:session={session_id},runtime={runtime_id}"
+            )
+        })?;
+        let proof = self
+            .terminalization_quiescence_proof(state, session_id, runtime_id)
+            .await?;
+        state.session_db.start()?;
+        let snapshot = match session_log_contract::client::call_service(
+            &SessionLogCommand::GetRuntimeLease(GetRuntimeLeaseRequest {
+                runtime_id: runtime_id.to_string(),
+                database_path: None,
+            }),
+        )? {
+            SessionLogResponse::RuntimeLeaseRead {
+                runtime: Some(runtime),
+            } => runtime,
+            SessionLogResponse::RuntimeLeaseRead { runtime: None } => {
+                return Err(anyhow!(
+                    "RUNTIME_TERMINALIZATION_DURABLE_LEASE_NOT_FOUND:{runtime_id}"
+                ));
+            }
+            SessionLogResponse::Error { error } => return Err(anyhow!(error)),
+            other => {
+                return Err(anyhow!(
+                    "RUNTIME_TERMINALIZATION_LEASE_READ_UNEXPECTED:{other:?}"
+                ));
+            }
+        };
+        validate_terminalization_identity(&snapshot, &lease, session_id, runtime_id)?;
+        if snapshot.terminal {
+            if snapshot.lease_active {
+                return Err(anyhow!(
+                    "RUNTIME_TERMINALIZATION_DURABLE_STATE_CONFLICT:runtime={runtime_id},terminal=true,lease_active=true"
+                ));
+            }
+            return Ok(());
+        }
+        if !snapshot.lease_active {
+            return Err(anyhow!(
+                "RUNTIME_TERMINALIZATION_DURABLE_STATE_CONFLICT:runtime={runtime_id},terminal=false,lease_active=false"
+            ));
+        }
+        let reason = if snapshot.revision == 0 && snapshot.last_event_seq == 0 {
+            RecoveryCloseRuntimeReason::UnbornRuntime
+        } else {
+            RecoveryCloseRuntimeReason::OrphanedRuntime
+        };
+        let recovery = RecoveryCloseRuntimeRequest {
+            receipt_id: format!(
+                "router-auto-terminalize:{}:{}",
+                lease.transaction_id, runtime_id
+            ),
+            database_path: snapshot.database_path.clone(),
+            runtime_id: runtime_id.to_string(),
+            session_id: session_id.to_string(),
+            lease_id: snapshot.lease_id.clone(),
+            expected_lease_active: snapshot.lease_active,
+            expected_revision: snapshot.revision,
+            expected_last_event_seq: snapshot.last_event_seq,
+            expected_session_event_seq: snapshot.session_event_seq,
+            expected_session_state: snapshot.session_state,
+            reason,
+            quiescence: proof,
+        };
+        let result = match session_log_contract::client::call_service(
+            &SessionLogCommand::RecoveryCloseRuntime(recovery),
+        )? {
+            SessionLogResponse::RuntimeRecoveryClosed { result } => result,
+            SessionLogResponse::Error { error } => return Err(anyhow!(error)),
+            other => {
+                return Err(anyhow!(
+                    "RUNTIME_TERMINALIZATION_RECOVERY_UNEXPECTED:{other:?}"
+                ));
+            }
+        };
+        match result {
+            RecoveryCloseRuntimeOutcome::Closed { receipt }
+            | RecoveryCloseRuntimeOutcome::AlreadyClosed { receipt }
+                if receipt.runtime_id == runtime_id
+                    && receipt.session_id == session_id
+                    && receipt.lease_id == snapshot.lease_id
+                    && receipt.terminal
+                    && !receipt.lease_active =>
+            {
+                Ok(())
+            }
+            other => Err(anyhow!(
+                "RUNTIME_TERMINALIZATION_RECOVERY_REJECTED:{other:?}"
+            )),
+        }
     }
 
     fn ensure_terminal_receipt(
@@ -1103,6 +1354,32 @@ fn payload_to_run_agent_request(
     })
 }
 
+fn validate_terminalization_identity(
+    snapshot: &RuntimeLeaseSnapshot,
+    lease: &RuntimeLease,
+    session_id: &str,
+    runtime_id: &str,
+) -> Result<()> {
+    if snapshot.runtime_id != runtime_id
+        || snapshot.session_id != session_id
+        || snapshot.lease_id.as_deref() != Some(lease.lease_id.as_str())
+    {
+        return Err(anyhow!(
+            "RUNTIME_TERMINALIZATION_DURABLE_IDENTITY_MISMATCH:session={session_id},runtime={runtime_id},snapshot_session={},snapshot_runtime={},snapshot_lease={:?},router_lease={}",
+            snapshot.session_id,
+            snapshot.runtime_id,
+            snapshot.lease_id,
+            lease.lease_id
+        ));
+    }
+    if snapshot.database_path.trim().is_empty() {
+        return Err(anyhow!(
+            "RUNTIME_TERMINALIZATION_DATABASE_PATH_MISSING:{runtime_id}"
+        ));
+    }
+    Ok(())
+}
+
 fn lifecycle_store(commander_session_id: &str) -> Result<SessionLifecycleStore> {
     let base = session_log_contract::client::default_db_dir().join("session_lifecycle_v1");
     let root = commander_store_path(&base, commander_session_id)?;
@@ -1379,8 +1656,9 @@ fn debug_runtime_enabled() -> bool {
 mod tests {
     use super::{
         failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
-        payload_to_run_agent_request, terminal_runtime_is_current, EnqueueTurnRequest,
-        ExecutionService, RetryRuntimeIdentity, RouterRecoveryCloseRuntimeRequest, RuntimeLease,
+        payload_to_run_agent_request, terminal_runtime_is_current,
+        validate_terminalization_identity, EnqueueTurnRequest, ExecutionService,
+        RetryRuntimeIdentity, RouterRecoveryCloseRuntimeRequest, RuntimeLease,
     };
     use crate::{build_state, services::manager::ServiceManager};
     use lifecycle::{RuntimeState, SessionProjection, SessionState, TaskPlan};
@@ -1389,7 +1667,7 @@ mod tests {
         LifecycleConfig, SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity,
         TerminalState,
     };
-    use session_log_contract::{SessionFeedEntry, SessionFeedEvent};
+    use session_log_contract::{RuntimeLeaseSnapshot, SessionFeedEntry, SessionFeedEvent};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1612,6 +1890,78 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn terminalizing_phase_is_quiescent_but_keeps_session_reserved() {
+        let state = build_state();
+        let service = ExecutionService::new();
+        service.set_session_lease_for_test("terminalizing-session", true);
+        service
+            .mark_terminalizing("terminalizing-session", "runtime-terminalizing-session")
+            .expect("mark exact runtime terminalizing");
+
+        let proof = service
+            .terminalization_quiescence_proof(
+                &state,
+                "terminalizing-session",
+                "runtime-terminalizing-session",
+            )
+            .await
+            .expect("terminalizing runtime should be quiescent without effects");
+        assert!(proof.is_quiescent());
+        assert_eq!(proof.global_active_session_count, 1);
+        assert!(service
+            .sessions
+            .lock()
+            .contains_key("terminalizing-session"));
+
+        let probe = service
+            .probe_sessions(&state, json!({ "session_ids": ["terminalizing-session"] }))
+            .await
+            .expect("probe terminalizing session");
+        assert_eq!(probe["sessions"][0]["status"], "terminalizing");
+        assert_eq!(probe["sessions"][0]["active_turn"], false);
+    }
+
+    #[test]
+    fn terminalization_identity_requires_exact_database_runtime_session_and_lease() {
+        let lease = RuntimeLease {
+            runtime_id: "runtime-exact".to_string(),
+            lease_id: "lease-exact".to_string(),
+            commander_session_id: "commander-exact".to_string(),
+            transaction_id: "transaction-exact".to_string(),
+            task_id: None,
+            goal_id: None,
+            operator_override: false,
+            slot_acquired: true,
+            terminalizing: true,
+        };
+        let mut snapshot = RuntimeLeaseSnapshot {
+            database_path: "/tmp/session_log.sqlite3".to_string(),
+            runtime_id: "runtime-exact".to_string(),
+            session_id: "session-exact".to_string(),
+            lease_id: Some("lease-exact".to_string()),
+            lease_active: true,
+            revision: 0,
+            last_event_seq: 0,
+            terminal: false,
+            session_event_seq: 2,
+            session_state: SessionState::Running,
+        };
+        validate_terminalization_identity(&snapshot, &lease, "session-exact", "runtime-exact")
+            .expect("exact durable identity should pass");
+
+        snapshot.lease_id = Some("lease-drift".to_string());
+        assert!(validate_terminalization_identity(
+            &snapshot,
+            &lease,
+            "session-exact",
+            "runtime-exact",
+        )
+        .expect_err("lease drift must fail closed")
+        .to_string()
+        .contains("RUNTIME_TERMINALIZATION_DURABLE_IDENTITY_MISMATCH"));
+    }
+
     #[test]
     fn payload_to_run_agent_request_injects_authoritative_session_id() {
         let request = EnqueueTurnRequest {
@@ -1724,6 +2074,7 @@ mod tests {
             goal_id: Some("goal-1".to_string()),
             operator_override: true,
             slot_acquired: true,
+            terminalizing: false,
         };
         let projection = SessionProjection {
             session_id: "child-1".to_string(),
@@ -1852,7 +2203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_active_turn_clears_active_session_without_worker() {
+    async fn cancel_active_turn_preserves_identity_until_durable_terminalization() {
         let state = build_state();
         let service = ExecutionService::new();
         service.set_session_lease_for_test("active-session", true);
@@ -1870,7 +2221,13 @@ mod tests {
         assert_eq!(response["status"], "cancelling");
         assert_eq!(response["session_id"], "active-session");
         assert_eq!(response["stopped_worker"], false);
-        assert!(!service.sessions.lock().contains_key("active-session"));
+        assert_eq!(response["runtime_terminalized"], false);
+        assert_eq!(response["terminalization_pending"], true);
+        assert!(service
+            .sessions
+            .lock()
+            .get("active-session")
+            .is_some_and(|lease| lease.terminalizing));
     }
 
     #[tokio::test]
@@ -1934,13 +2291,15 @@ mod tests {
             .expect("cancelled command task should terminate promptly")
             .expect("cancelled command task should join")
             .expect("cancelled command response should remain deterministic");
-        assert!(!service.sessions.lock().contains_key("command-session"));
-        assert!(
-            !service
-                .retained_slots
-                .lock()
-                .contains_key("command-session")
-        );
+        assert!(service
+            .sessions
+            .lock()
+            .get("command-session")
+            .is_some_and(|lease| lease.terminalizing));
+        assert!(!service
+            .retained_slots
+            .lock()
+            .contains_key("command-session"));
     }
 
     #[tokio::test]
@@ -1959,12 +2318,10 @@ mod tests {
             .expect_err("removed lease must reject retained-slot publication");
         drop(permit);
 
-        assert!(
-            !service
-                .retained_slots
-                .lock()
-                .contains_key("cancelled-session")
-        );
+        assert!(!service
+            .retained_slots
+            .lock()
+            .contains_key("cancelled-session"));
     }
 
     #[tokio::test]
@@ -2054,6 +2411,7 @@ mod tests {
         assert_eq!(response["active_command_runs"], 0);
         assert_eq!(response["sessions"][0]["session_id"], "status-session");
         assert_eq!(response["sessions"][0]["slot_acquired"], true);
+        assert_eq!(response["sessions"][0]["terminalizing"], false);
         assert_eq!(response["sessions"][0]["retained_slot"], false);
     }
 

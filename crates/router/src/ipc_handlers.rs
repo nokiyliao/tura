@@ -1,4 +1,4 @@
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
@@ -8,10 +8,10 @@ use crate::services;
 use crate::shutdown::mark_router_shutting_down;
 use router_contract::{
     ExecuteCommandRequest, GetToolConfigResponse, GetToolResponse, IpcRequest, IpcResponse,
-    ListCommandsRequest, ListCommandsResponse, ListToolsResponse, METHOD_ENQUEUE_TURN,
+    ListCommandsRequest, ListCommandsResponse, ListToolsResponse, PatchToolConfigRequest,
+    PatchToolRequest, ToolRegistryRequest, ToolRequest, METHOD_ENQUEUE_TURN,
     METHOD_EXECUTE_COMMAND, METHOD_GET_TOOL, METHOD_GET_TOOL_CONFIG, METHOD_HEALTH_CHECK,
     METHOD_LIST_COMMANDS, METHOD_LIST_TOOLS, METHOD_PATCH_TOOL, METHOD_PATCH_TOOL_CONFIG,
-    PatchToolConfigRequest, PatchToolRequest, ToolRegistryRequest, ToolRequest,
 };
 use tura_router::registry::ToolRegistry;
 
@@ -213,11 +213,9 @@ mod tests {
         assert!(state.shutdown.load(Ordering::SeqCst));
         assert_eq!(response.payload["status"], "shutting_down");
         assert_eq!(response.payload["runtime_workers_stopped"], 0);
-        assert!(
-            response.payload["background_process_scopes_terminated"]
-                .as_u64()
-                .is_some()
-        );
+        assert!(response.payload["background_process_scopes_terminated"]
+            .as_u64()
+            .is_some());
         Ok(())
     }
 
@@ -255,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_session_workers_clears_router_active_turn_state() -> anyhow::Result<()> {
+    fn kill_session_workers_preserves_identity_for_terminalization() -> anyhow::Result<()> {
         let state = build_state();
         state
             .execution
@@ -273,9 +271,10 @@ mod tests {
         ));
 
         assert!(response.ok, "kill failed: {:?}", response.error);
-        assert_eq!(response.payload["status"], "stopped");
+        assert_eq!(response.payload["status"], "stopping");
         assert_eq!(response.payload["session_id"], "kill-session");
-        assert_eq!(response.payload["active_turn_removed"], true);
+        assert_eq!(response.payload["active_turn_removed"], false);
+        assert_eq!(response.payload["terminalization_pending"], true);
 
         let probe = tokio_runtime()?.block_on(handle_ipc_request(
             &state,
@@ -287,7 +286,7 @@ mod tests {
                 deadline_ms: None,
             },
         ));
-        assert_eq!(probe.payload["sessions"][0]["status"], "inactive");
+        assert_eq!(probe.payload["sessions"][0]["status"], "terminalizing");
         assert_eq!(probe.payload["sessions"][0]["active_turn"], false);
         Ok(())
     }
@@ -340,12 +339,10 @@ mod tests {
             ),
         ));
         assert!(!malformed.ok);
-        assert!(
-            malformed
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("unknown field `legacy`"))
-        );
+        assert!(malformed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unknown field `legacy`")));
         Ok(())
     }
 }

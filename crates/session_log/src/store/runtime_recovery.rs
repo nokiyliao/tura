@@ -57,18 +57,33 @@ impl SessionLogStore {
                 path
             }
         };
+        let database_path = std::fs::canonicalize(&workspace_db_path)
+            .with_context(|| {
+                format!(
+                    "failed to canonicalize runtime database {}",
+                    workspace_db_path.display()
+                )
+            })?
+            .to_string_lossy()
+            .into_owned();
         self.with_workspace_connection(&workspace_db_path, |conn| {
-            Ok(
-                load_runtime_row(conn, &request.runtime_id)?.map(|row| RuntimeLeaseSnapshot {
-                    runtime_id: request.runtime_id.clone(),
-                    session_id: row.session_id,
-                    lease_id: row.lease_id,
-                    lease_active: row.lease_active,
-                    revision: row.revision,
-                    last_event_seq: row.last_event_seq,
-                    terminal: row.terminal,
-                }),
-            )
+            let Some(row) = load_runtime_row(conn, &request.runtime_id)? else {
+                return Ok(None);
+            };
+            let session = replay_session_events(conn, &row.session_id)?;
+            let session_event_seq = load_session_event_seq(conn, &row.session_id)?;
+            Ok(Some(RuntimeLeaseSnapshot {
+                database_path: database_path.clone(),
+                runtime_id: request.runtime_id.clone(),
+                session_id: row.session_id,
+                lease_id: row.lease_id,
+                lease_active: row.lease_active,
+                revision: row.revision,
+                last_event_seq: row.last_event_seq,
+                terminal: row.terminal,
+                session_event_seq,
+                session_state: session.state,
+            }))
         })
     }
 
@@ -795,6 +810,33 @@ mod tests {
                 quiescence: quiescent_proof(),
             }
         }
+    }
+
+    #[test]
+    fn runtime_lease_snapshot_exposes_exact_recovery_preimage() {
+        let fixture = RecoveryFixture::new("lease-snapshot");
+        let snapshot = fixture
+            .store
+            .get_runtime_lease(GetRuntimeLeaseRequest {
+                runtime_id: fixture.runtime_id.clone(),
+                database_path: None,
+            })
+            .expect("read runtime lease snapshot")
+            .expect("runtime lease snapshot exists");
+
+        assert_eq!(snapshot.database_path, fixture.database_path);
+        assert_eq!(snapshot.runtime_id, fixture.runtime_id);
+        assert_eq!(snapshot.session_id, fixture.session_id);
+        assert_eq!(
+            snapshot.lease_id.as_deref(),
+            Some(fixture.lease_id.as_str())
+        );
+        assert!(snapshot.lease_active);
+        assert!(!snapshot.terminal);
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(snapshot.last_event_seq, 0);
+        assert_eq!(snapshot.session_event_seq, 2);
+        assert_eq!(snapshot.session_state, SessionState::Running);
     }
 
     #[test]
