@@ -144,26 +144,33 @@ impl CommandRunService {
                 .entry("execution_id".to_string())
                 .or_insert_with(|| Value::String(execution_id.clone()));
         }
-        let output = code_tools::registry::with_command_environment(
-            request.command_env,
-            code_tools::command_run::execute_async_value_with_allowed_lock_scope_sandbox_and_cancellation(
-                arguments,
-                request.session_directory,
-                request.allowed_commands,
-                session_id.clone(),
-                request.sandbox,
-                active.cancellation_token(),
-            ),
-        )
-        .await;
-        Ok(json!({
-            "status": "finished",
-            "owner": "router",
-            "session_id": session_id,
-            "runtime_id": request.runtime_id,
-            "execution_id": execution_id,
-            "result": output,
-        }))
+        let worker = tokio::spawn(async move {
+            let cancellation = active.cancellation_token();
+            let output = code_tools::registry::with_command_environment(
+                request.command_env,
+                code_tools::command_run::execute_async_value_with_allowed_lock_scope_sandbox_and_cancellation(
+                    arguments,
+                    request.session_directory,
+                    request.allowed_commands,
+                    session_id.clone(),
+                    request.sandbox,
+                    cancellation,
+                ),
+            )
+            .await;
+            drop(active);
+            json!({
+                "status": "finished",
+                "owner": "router",
+                "session_id": session_id,
+                "runtime_id": request.runtime_id,
+                "execution_id": execution_id,
+                "result": output,
+            })
+        });
+        worker
+            .await
+            .map_err(|error| anyhow!("ROUTER_COMMAND_RUN_WORKER_FAILED:{error}"))
     }
 
     pub fn active_count(&self) -> usize {
@@ -570,6 +577,238 @@ mod tests {
         assert_eq!(service.active_count(), 0);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outer_abort_preserves_router_ownership_until_seven_command_batch_terminalizes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let receipt_directory = workspace.path().join(".tura/run/command_receipts");
+        let first_gate = workspace.path().join("first-step.fifo");
+        let cancellation_gate = workspace.path().join("cancel-step.fifo");
+        for gate in [&first_gate, &cancellation_gate] {
+            let status = std::process::Command::new("mkfifo")
+                .arg(gate)
+                .status()
+                .expect("create FIFO");
+            assert!(status.success(), "mkfifo failed for {}", gate.display());
+        }
+        let shell_item = |command: String, step: u64| {
+            json!({
+                "command": "shell_command",
+                "command_line": json!({
+                    "command": command,
+                    "timeout_ms": 10_000
+                }).to_string(),
+                "step": step
+            })
+        };
+        let mut commands = (0..4)
+            .map(|index| shell_item(format!("printf 'ok-{index}\\n'"), 1))
+            .collect::<Vec<_>>();
+        commands.push(shell_item(format!("cat {}", first_gate.display()), 1));
+        commands.push(shell_item("/bin/sh -c 'exit 2'".to_string(), 2));
+        commands.push(shell_item(
+            format!("cat {}", cancellation_gate.display()),
+            3,
+        ));
+
+        let service = CommandRunService::new();
+        let request = json!({
+            "session_id": "outer-abort-session",
+            "runtime_id": "outer-abort-runtime",
+            "session_directory": workspace.path(),
+            "arguments": {"commands": commands}
+        });
+        let outer = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .execute_with_request_id(request, Some("outer-abort-seven"))
+                    .await
+            })
+        };
+
+        wait_for_command_record_count(&receipt_directory, true, 5).await;
+        assert!(!command_record_path(&receipt_directory, "outer-abort-seven", 5, true).exists());
+        assert!(!command_record_path(&receipt_directory, "outer-abort-seven", 6, true).exists());
+        outer.abort();
+        assert!(
+            outer
+                .await
+                .expect_err("outer request must be aborted")
+                .is_cancelled()
+        );
+        assert_eq!(service.active_count_for_session("outer-abort-session"), 1);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                service.wait_for_session_idle("outer-abort-session")
+            )
+            .await
+            .is_err(),
+            "idle must remain false while Router-owned work is active"
+        );
+
+        let release = std::thread::spawn({
+            let first_gate = first_gate.clone();
+            move || std::fs::write(first_gate, b"released\n").expect("release first step")
+        });
+        release.join().expect("FIFO writer");
+        wait_for_command_record_count(&receipt_directory, true, 7).await;
+        assert_eq!(service.cancel_session("outer-abort-session"), 1);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.wait_for_session_idle("outer-abort-session"),
+        )
+        .await
+        .expect("cancelled supervised batch must terminalize");
+        wait_for_command_record_count(&receipt_directory, false, 7).await;
+        assert_eq!(service.active_count_for_session("outer-abort-session"), 0);
+
+        for index in 0..7 {
+            let claim = read_command_record(&receipt_directory, "outer-abort-seven", index, true);
+            let receipt =
+                read_command_record(&receipt_directory, "outer-abort-seven", index, false);
+            assert_eq!(claim["execution_count"], 1, "{claim}");
+            assert_eq!(
+                claim["state"], receipt["terminal_state"],
+                "{claim} {receipt}"
+            );
+            match index {
+                0..=4 => {
+                    assert_eq!(receipt["outcome"], "known", "{receipt}");
+                    assert_eq!(receipt["terminal_state"], "completed", "{receipt}");
+                    assert_eq!(receipt["exit_code"], 0, "{receipt}");
+                }
+                5 => {
+                    assert_eq!(receipt["outcome"], "known", "{receipt}");
+                    assert_eq!(receipt["terminal_state"], "failed", "{receipt}");
+                    assert_eq!(receipt["exit_code"], 2, "{receipt}");
+                }
+                6 => {
+                    assert!(
+                        matches!(
+                            receipt["terminal_state"].as_str(),
+                            Some("cancelled" | "terminated" | "not_started")
+                        ),
+                        "{receipt}"
+                    );
+                    assert_eq!(receipt["outcome"], "unknown", "{receipt}");
+                    assert_eq!(receipt["reconcile_required"], true, "{receipt}");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_request_has_zero_router_admission_and_zero_command_effect() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let service = CommandRunService::new();
+
+        service
+            .execute_with_request_id(json!({"invalid": true}), Some("zero-admission"))
+            .await
+            .expect_err("malformed payload must fail before Router admission");
+
+        assert_eq!(service.active_count(), 0);
+        assert!(!workspace.path().join(".tura/run/command_receipts").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn same_execution_recovery_does_not_duplicate_command_effect() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let marker = workspace.path().join("effect.txt");
+        let service = CommandRunService::new();
+        let request = json!({
+            "session_id": "same-execution-session",
+            "session_directory": workspace.path(),
+            "arguments": {
+                "commands": [{
+                    "command": "shell_command",
+                    "command_line": json!({
+                        "command": format!("printf x >> {}", marker.display()),
+                        "timeout_ms": 3_000
+                    }).to_string(),
+                    "step": 1
+                }]
+            }
+        });
+
+        let first = service
+            .execute_with_request_id(request.clone(), Some("same-execution"))
+            .await
+            .expect("first execution");
+        let recovery = service
+            .execute_with_request_id(request, Some("same-execution"))
+            .await
+            .expect("recovery must return a fail-closed command result");
+
+        assert_eq!(first["result"]["results"][0]["success"], true, "{first}");
+        assert_eq!(
+            recovery["result"]["results"][0]["success"], false,
+            "{recovery}"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).expect("marker"), "x");
+        let claim = read_command_record(
+            &workspace.path().join(".tura/run/command_receipts"),
+            "same-execution",
+            0,
+            true,
+        );
+        assert_eq!(claim["execution_count"], 1, "{claim}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn out_of_order_completion_returns_deterministic_command_order() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let service = CommandRunService::new();
+        let commands = [300, 0, 150]
+            .into_iter()
+            .enumerate()
+            .map(|(index, delay_ms)| {
+                json!({
+                    "command": "shell_command",
+                    "command_line": json!({
+                        "command": delayed_read_only_command(&format!("ordered-{index}"), delay_ms),
+                        "timeout_ms": 3_000
+                    }).to_string(),
+                    "step": 1
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let response = service
+            .execute_with_request_id(
+                json!({
+                    "session_id": "ordered-session",
+                    "session_directory": workspace.path(),
+                    "arguments": {"commands": commands}
+                }),
+                Some("ordered-execution"),
+            )
+            .await
+            .expect("ordered execution");
+        let results = response["result"]["results"]
+            .as_array()
+            .expect("command results");
+        assert_eq!(results.len(), 3, "{response}");
+        for (index, result) in results.iter().enumerate() {
+            assert_eq!(
+                result["output"]["terminal_receipt"]["call_id"],
+                format!("ordered-execution:step:1:index:{index}"),
+                "{response}"
+            );
+            assert!(
+                result["output"]["stdout"]
+                    .as_str()
+                    .is_some_and(|stdout| stdout.contains(&format!("ordered-{index}"))),
+                "{response}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn reserved_session_decode_failure_releases_command_admission() {
         let service = CommandRunService::new();
@@ -835,5 +1074,59 @@ mod tests {
                 delay_ms % 1000
             )
         }
+    }
+
+    async fn wait_for_command_record_count(directory: &Path, claims: bool, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let count = std::fs::read_dir(directory)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if claims {
+                            name.ends_with(".claim.json")
+                        } else {
+                            name.ends_with(".json") && !name.ends_with(".claim.json")
+                        }
+                    })
+                    .count();
+                if count == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("command record count did not converge");
+    }
+
+    fn command_record_path(
+        directory: &Path,
+        execution_id: &str,
+        index: usize,
+        claim: bool,
+    ) -> std::path::PathBuf {
+        let identity = format!(
+            "{execution_id}:step:{}:index:{index}",
+            if index < 5 { 1 } else { index - 3 }
+        );
+        let encoded = identity.replace(':', "_x3a_");
+        let suffix = if claim { ".claim.json" } else { ".json" };
+        directory.join(format!("{encoded}{suffix}"))
+    }
+
+    fn read_command_record(
+        directory: &Path,
+        execution_id: &str,
+        index: usize,
+        claim: bool,
+    ) -> Value {
+        let path = command_record_path(directory, execution_id, index, claim);
+        serde_json::from_slice(&std::fs::read(&path).expect("command record"))
+            .expect("command record JSON")
     }
 }
