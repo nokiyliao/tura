@@ -1,7 +1,7 @@
 use runtime_contract::{
-    maximum_parallel_runtime_workers, maximum_runtime_llm_turns,
     DEFAULT_MAXIMUM_PARALLEL_RUNTIME_WORKERS, DEFAULT_MAXIMUM_RUNTIME_LLM_TURNS,
     MAXIMUM_PARALLEL_RUNTIME_WORKER_OPTIONS, MAXIMUM_RUNTIME_LLM_TURN_OPTIONS,
+    maximum_parallel_runtime_workers, maximum_runtime_llm_turns,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 const TURA_DIR: &str = ".tura";
 const CONFIG_FILE: &str = "config.conf";
 
-pub const DEFAULT_SESSION_MODEL: &str = "codex/gpt-5.6-sol";
-pub const DEFAULT_SESSION_PROVIDER: &str = "codex";
+pub const DEFAULT_SESSION_MODEL: &str = "official_codex_app_server/gpt-5.6-sol";
+pub const DEFAULT_SESSION_PROVIDER: &str = "official_codex_app_server";
 pub const DEFAULT_SESSION_MODEL_ID: &str = "gpt-5.6-sol";
 pub const DEFAULT_SESSION_AGENT: &str = "balanced";
 pub const DEFAULT_SESSION_PERSONA: &str = "tura";
@@ -533,8 +533,21 @@ fn serialize_json_value(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_config, save_config, serialize_config, CommandRunStallGuardConfig, TuraSessionConfig,
+        CommandRunStallGuardConfig, DEFAULT_SESSION_MODEL, DEFAULT_SESSION_PROVIDER,
+        TuraSessionConfig, parse_config, save_config, serialize_config,
     };
+
+    #[test]
+    fn fresh_default_uses_official_codex_app_server() {
+        let config = TuraSessionConfig::default();
+
+        assert_eq!(config.model.as_deref(), Some(DEFAULT_SESSION_MODEL));
+        assert_eq!(
+            config.active_provider.as_deref(),
+            Some(DEFAULT_SESSION_PROVIDER)
+        );
+        assert_eq!(config.active_model.as_deref(), Some("gpt-5.6-sol"));
+    }
 
     #[test]
     fn command_run_stall_guard_defaults_to_balanced_profile() {

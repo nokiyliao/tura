@@ -4,7 +4,7 @@ use lifecycle::{ProviderConfig, ToolChoice};
 use lifecycle::{RuntimeCallResultStatus, RuntimeState};
 use runtime::runtime::create_runtime::{create_runtime, runtime_provider_config_from_tura};
 use runtime::runtime::types::RuntimeQueueItem;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tura_llm_rust::{
@@ -157,7 +157,7 @@ async fn create_runtime_business_flow_rejects_unresolvable_model_override() {
         ),
         ("TURA_PROVIDER_TOTAL_TIMEOUT_MS", "0"),
     ]);
-    let settings = settings_with_routes(
+    let settings = Arc::new(settings_with_routes(
         vec![(
             "fallback_runtime",
             RouteConfig {
@@ -171,15 +171,20 @@ async fn create_runtime_business_flow_rejects_unresolvable_model_override() {
             },
         )],
         HashMap::new(),
-    );
+    ));
 
-    let error =
-        runtime_provider_config_from_tura(&provider_config("fallback_runtime"), &settings, false)
-            .expect_err("an explicit unknown provider must fail closed");
-
-    assert_eq!(
-        error,
-        "unknown provider in explicit model selection: missing-provider/missing-model"
+    assert_error_contains(
+        create_runtime(runtime_input(
+            "session-unknown-explicit-provider",
+            "agent-unknown-explicit-provider",
+            "fallback_runtime",
+            vec![json!({"role": "user", "content": "must not create a provider request"})],
+            vec![json!({"type": "function", "function": {"name": "command_run"}})],
+            settings,
+            false,
+        ))
+        .await,
+        "unknown provider in explicit model selection: missing-provider/missing-model",
     );
 }
 

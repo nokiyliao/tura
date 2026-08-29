@@ -437,7 +437,6 @@ pub(super) fn run_mano_for_prompt(session_id: String, payload: serde_json::Value
     let model_override = prompt_runtime_model_override(
         &payload,
         session.as_ref().and_then(|session| session.model.clone()),
-        session_config.as_ref(),
     );
     let reasoning_effort = prompt_model_variant(&payload)
         .or_else(|| {
@@ -771,14 +770,13 @@ fn prompt_model_override(payload: &serde_json::Value) -> Option<String> {
 fn prompt_runtime_model_override(
     payload: &serde_json::Value,
     session_model: Option<String>,
-    session_config: Option<&PromptSessionConfig>,
 ) -> Option<String> {
     prompt_model_override(payload)
-        .or_else(|| session_config.and_then(explicit_config_model_override))
         .or(session_model)
         .and_then(normalize_model_override)
 }
 
+#[cfg(test)]
 pub(super) fn config_model_override(config: &TuraSessionConfig) -> Option<String> {
     if let Some(model) = non_empty_string(config.model.clone()).filter(|model| model.contains('/'))
     {
@@ -837,19 +835,6 @@ fn config_keys(content: &str) -> std::collections::BTreeSet<String> {
                 .filter(|key| !key.is_empty())
         })
         .collect()
-}
-
-fn explicit_config_model_override(config: &PromptSessionConfig) -> Option<String> {
-    if config.has("model")
-        && let Some(model) =
-            non_empty_string(config.config.model.clone()).filter(|model| model.contains('/'))
-    {
-        return Some(model);
-    }
-    if !(config.has("active_provider") || config.has("active_model")) {
-        return None;
-    }
-    config_model_override(&config.config)
 }
 
 pub(super) fn prompt_model_variant(payload: &serde_json::Value) -> Option<String> {
@@ -998,6 +983,7 @@ fn normalize_model_override(value: String) -> Option<String> {
         "openai-api" => "openai",
         "anthropic-api" => "anthropic",
         "antigravity-api" => "antigravity",
+        "codex" if model == "gpt-5.6-sol" => "official_codex_app_server",
         other => other,
     };
     Some(format!("{provider}/{model}"))
@@ -1230,12 +1216,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_model_override_uses_gateway_config_before_stale_session_model() {
+    fn runtime_model_override_keeps_durable_session_model_before_stale_workspace_config() {
         let config = PromptSessionConfig {
             config: TuraSessionConfig {
-                model: Some("openrouter/qwen/qwen3.7-max".to_string()),
-                active_provider: Some("openrouter".to_string()),
-                active_model: Some("qwen/qwen3.7-max".to_string()),
+                model: Some("codex/gpt-5.6-sol".to_string()),
+                active_provider: Some("codex".to_string()),
+                active_model: Some("gpt-5.6-sol".to_string()),
                 ..TuraSessionConfig::default()
             },
             keys: [
@@ -1249,15 +1235,14 @@ mod tests {
 
         let runtime_model = prompt_runtime_model_override(
             &serde_json::json!({}),
-            Some("codex/gpt-5.5".to_string()),
-            Some(&config),
+            Some("official_codex_app_server/gpt-5.6-terra".to_string()),
         );
 
         assert_eq!(
             runtime_model.as_deref(),
-            Some("openrouter/qwen/qwen3.7-max")
+            Some("official_codex_app_server/gpt-5.6-terra")
         );
-        assert_eq!(runtime_model, config_model_override(&config.config));
+        assert_eq!(config.config.model.as_deref(), Some("codex/gpt-5.6-sol"));
     }
 
     #[test]
@@ -1280,12 +1265,35 @@ mod tests {
 
         assert_eq!(
             prompt_runtime_model_override(
-                &serde_json::json!({ "model": "anthropic/claude-opus-4.5" }),
-                Some("codex/gpt-5.5".to_string()),
-                Some(&config),
+                &serde_json::json!({ "model": "official_codex_app_server/gpt-5.6-sol" }),
+                Some("official_codex_app_server/gpt-5.6-terra".to_string()),
             )
             .as_deref(),
-            Some("anthropic/claude-opus-4.5")
+            Some("official_codex_app_server/gpt-5.6-sol")
+        );
+        assert_eq!(
+            config.config.model.as_deref(),
+            Some("openrouter/qwen/qwen3.7-max")
+        );
+    }
+
+    #[test]
+    fn runtime_model_override_canonicalizes_only_the_legacy_generated_default() {
+        assert_eq!(
+            prompt_runtime_model_override(
+                &serde_json::json!({}),
+                Some("codex/gpt-5.6-sol".to_string()),
+            )
+            .as_deref(),
+            Some("official_codex_app_server/gpt-5.6-sol")
+        );
+        assert_eq!(
+            prompt_runtime_model_override(
+                &serde_json::json!({ "model": "codex/gpt-5.6-terra" }),
+                None,
+            )
+            .as_deref(),
+            Some("codex/gpt-5.6-terra")
         );
     }
 
