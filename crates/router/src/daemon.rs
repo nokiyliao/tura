@@ -95,6 +95,7 @@ pub(crate) async fn serve_socket() -> anyhow::Result<()> {
     }
     let state = build_state();
     let _ = recover_after_start(&state).await?;
+    state.lifecycle.mark_activity();
     // The daemon owns the backend: bring up the single session_db owner now.
     let _ = state.session_db.start();
 

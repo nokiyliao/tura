@@ -207,4 +207,22 @@ mod tests {
         std::thread::sleep(StdDuration::from_millis(20));
         assert!(lifecycle.should_shutdown_idle(0, 0, 0));
     }
+
+    #[test]
+    fn lifecycle_readiness_reset_starts_a_new_idle_epoch() {
+        let lifecycle = FrontLifecycle {
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            leases: Arc::new(ParkingMutex::new(HashMap::new())),
+            last_activity: Arc::new(ParkingMutex::new(
+                Instant::now() - StdDuration::from_millis(100),
+            )),
+            idle_shutdown_after: StdDuration::from_millis(50),
+        };
+
+        assert!(lifecycle.should_shutdown_idle(0, 0, 0));
+        lifecycle.mark_activity();
+        assert!(!lifecycle.should_shutdown_idle(0, 0, 0));
+        std::thread::sleep(StdDuration::from_millis(75));
+        assert!(lifecycle.should_shutdown_idle(0, 0, 0));
+    }
 }
