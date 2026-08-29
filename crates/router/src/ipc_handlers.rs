@@ -171,7 +171,15 @@ fn encode_payload(payload: impl serde::Serialize) -> anyhow::Result<Value> {
     serde_json::to_value(payload).map_err(Into::into)
 }
 
-pub(crate) fn enqueue_turn_identity(request: &IpcRequest) -> Option<(String, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnqueueTurnIdentity {
+    pub(crate) commander_session_id: String,
+    pub(crate) child_session_id: String,
+    pub(crate) runtime_id: String,
+    pub(crate) transaction_id: String,
+}
+
+pub(crate) fn enqueue_turn_identity(request: &IpcRequest) -> Option<EnqueueTurnIdentity> {
     if request.method != METHOD_ENQUEUE_TURN {
         return None;
     }
@@ -187,7 +195,19 @@ pub(crate) fn enqueue_turn_identity(request: &IpcRequest) -> Option<(String, Str
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)?;
-    Some((session_id, runtime_id))
+    let commander_session_id = request
+        .payload
+        .pointer("/payload/parent_session_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| session_id.clone());
+    Some(EnqueueTurnIdentity {
+        commander_session_id,
+        child_session_id: session_id,
+        runtime_id,
+        transaction_id: request.request_id.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -240,7 +260,12 @@ mod tests {
         };
         assert_eq!(
             enqueue_turn_identity(&turn),
-            Some(("session-1".to_string(), "runtime-1".to_string()))
+            Some(EnqueueTurnIdentity {
+                commander_session_id: "session-1".to_string(),
+                child_session_id: "session-1".to_string(),
+                runtime_id: "runtime-1".to_string(),
+                transaction_id: "turn".to_string(),
+            })
         );
 
         let command_run = IpcRequest {
@@ -249,6 +274,26 @@ mod tests {
             ..turn
         };
         assert_eq!(enqueue_turn_identity(&command_run), None);
+
+        let delegated = IpcRequest {
+            request_id: "delegated-turn".to_string(),
+            method: "execution.enqueue_turn".to_string(),
+            payload: json!({
+                "session_id": "child-1",
+                "runtime_id": "runtime-child-1",
+                "payload": {"parent_session_id": "commander-1"}
+            }),
+            ..command_run.clone()
+        };
+        assert_eq!(
+            enqueue_turn_identity(&delegated),
+            Some(EnqueueTurnIdentity {
+                commander_session_id: "commander-1".to_string(),
+                child_session_id: "child-1".to_string(),
+                runtime_id: "runtime-child-1".to_string(),
+                transaction_id: "delegated-turn".to_string(),
+            })
+        );
 
         let blank_session = IpcRequest {
             method: "execution.enqueue_turn".to_string(),

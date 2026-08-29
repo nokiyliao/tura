@@ -369,6 +369,18 @@ pub struct RunAgentRequest {
 }
 
 impl RunAgentRequest {
+    pub fn effective_prompt(&self) -> Option<&str> {
+        self.prompt
+            .as_deref()
+            .or(self.message.as_deref())
+            .or_else(|| self.input.as_ref().and_then(Value::as_str))
+    }
+
+    pub fn effective_prompt_sha256(&self) -> Option<String> {
+        self.effective_prompt()
+            .map(|value| semantic_sha256(&Value::String(value.to_string())))
+    }
+
     pub fn validate_delegated_identity(&self) -> Result<(), String> {
         let delegated = self
             .parent_session_id

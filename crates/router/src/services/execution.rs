@@ -115,11 +115,7 @@ impl ExecutionService {
         let lease_id = format!("lease-{}", uuid::Uuid::new_v4());
         state.session_db.start()?;
         let mut run_request = payload_to_run_agent_request(&request, &lease_id, None)?;
-        let requested_prompt = run_request
-            .prompt
-            .as_deref()
-            .or(run_request.message.as_deref())
-            .or_else(|| run_request.input.as_ref().and_then(Value::as_str));
+        let requested_prompt = run_request.effective_prompt();
         let fallback_from_id =
             runtime_registration_fallback(&request.session_id, requested_prompt)?;
         run_request.fallback_from_id.clone_from(&fallback_from_id);
@@ -128,6 +124,14 @@ impl ExecutionService {
             .clone()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| request.session_id.clone());
+        let delegated = run_request
+            .parent_session_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        validate_delegated_input_digest(
+            &mut run_request,
+            delegated,
+        )?;
         run_request
             .validate_delegated_identity()
             .map_err(anyhow::Error::msg)?;
@@ -454,7 +458,7 @@ impl ExecutionService {
         let expected_terminal_state = runtime_terminal_state_from_snapshot(snapshot, projection)?;
         self.write_snapshot_terminal_receipt(&lease, snapshot, &entry, expected_terminal_state)?;
         let store = lifecycle_store(&lease.commander_session_id)?;
-        let delivery = intake_terminal_receipt(
+        let mut delivery = intake_terminal_receipt(
             &store,
             &entry,
             &snapshot.runtime_id,
@@ -471,6 +475,13 @@ impl ExecutionService {
                 ReclaimOutcome::Released | ReclaimOutcome::AlreadyReleased => {}
                 ReclaimOutcome::Retained { blocker } => return Err(anyhow!(blocker)),
             }
+        }
+        if let Some(current) = delivery.take() {
+            delivery = match publish_terminal_failure_callback_from_store(&store, current.clone())?
+            {
+                Some((_transport, failure_delivery)) => Some(failure_delivery),
+                None => Some(current),
+            };
         }
         Ok(delivery)
     }
@@ -914,6 +925,10 @@ impl ExecutionService {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "reserved for an explicit Commander consumer acknowledgement"
+    )]
     pub(crate) fn acknowledge_terminal_delivery(
         &self,
         delivery: &TerminalDeliveryIdentity,
@@ -923,11 +938,6 @@ impl ExecutionService {
             delivery.callback_payload_sha256.as_deref(),
             delivery.callback_effect_identity.as_ref(),
         ) {
-            store.mark_callback_intaken(
-                &delivery.transaction_id,
-                &delivery.event_id,
-                payload_sha256,
-            )?;
             store.acknowledge_callback(
                 &delivery.transaction_id,
                 &delivery.event_id,
@@ -991,6 +1001,11 @@ impl ExecutionService {
             CallbackEffectIdentity::Exact { effect_id },
         )?;
         store.publish_callback(&record)?;
+        store.mark_callback_intaken(
+            &record.transaction_id,
+            &record.event_id,
+            &record.callback_payload_sha256,
+        )?;
         delivery.callback_payload_sha256 = Some(record.callback_payload_sha256.clone());
         delivery.callback_effect_identity = Some(record.effect_identity.clone());
         Ok((record.transport_payload, delivery))
@@ -998,40 +1013,27 @@ impl ExecutionService {
 
     pub(crate) fn replay_terminal_callbacks(
         &self,
+        commander_session_id: &str,
         child_session_id: &str,
         transaction_id: &str,
     ) -> Result<Vec<(Value, TerminalDeliveryIdentity)>> {
-        let lease = self
-            .sessions
-            .lock()
-            .get(child_session_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("CALLBACK_REPLAY_LEASE_NOT_FOUND:{child_session_id}"))?;
-        if lease.transaction_id != transaction_id {
-            return Err(anyhow!(
-                "CALLBACK_REPLAY_IDENTITY_MISMATCH:session={child_session_id},transaction={transaction_id}"
-            ));
-        }
-        let store = lifecycle_store(&lease.commander_session_id)?;
-        store
-            .callbacks_for_replay()?
-            .into_iter()
-            .filter(|record| {
-                record.child_session_id == child_session_id
-                    && record.transaction_id == transaction_id
-            })
-            .map(|record| {
-                let delivery = TerminalDeliveryIdentity {
-                    commander_session_id: record.commander_session_id.clone(),
-                    transaction_id: record.transaction_id.clone(),
-                    event_id: record.event_id.clone(),
-                    runtime_id: record.runtime_id.clone(),
-                    callback_payload_sha256: Some(record.callback_payload_sha256.clone()),
-                    callback_effect_identity: Some(record.effect_identity.clone()),
-                };
-                Ok((record.transport_payload, delivery))
-            })
-            .collect()
+        let Some(store) = lifecycle_store_if_exists(commander_session_id)? else {
+            return Ok(Vec::new());
+        };
+        replay_terminal_callbacks_from_store(
+            &store,
+            commander_session_id,
+            child_session_id,
+            transaction_id,
+        )
+    }
+
+    pub(crate) fn publish_terminal_failure_callback(
+        &self,
+        delivery: TerminalDeliveryIdentity,
+    ) -> Result<Option<(Value, TerminalDeliveryIdentity)>> {
+        let store = lifecycle_store(&delivery.commander_session_id)?;
+        publish_terminal_failure_callback_from_store(&store, delivery)
     }
 
     #[cfg(test)]
@@ -1629,6 +1631,111 @@ impl ExecutionService {
     }
 }
 
+fn replay_terminal_callbacks_from_store(
+    store: &SessionLifecycleStore,
+    commander_session_id: &str,
+    child_session_id: &str,
+    transaction_id: &str,
+) -> Result<Vec<(Value, TerminalDeliveryIdentity)>> {
+    let mut matching = Vec::new();
+    for record in store.callbacks_for_replay()? {
+        if record.transaction_id != transaction_id {
+            continue;
+        }
+        if record.commander_session_id != commander_session_id
+            || record.child_session_id != child_session_id
+        {
+            return Err(anyhow!(
+                "CALLBACK_REPLAY_IDENTITY_MISMATCH:commander={commander_session_id},session={child_session_id},transaction={transaction_id}"
+            ));
+        }
+        store.mark_callback_intaken(
+            &record.transaction_id,
+            &record.event_id,
+            &record.callback_payload_sha256,
+        )?;
+        matching.push(record);
+    }
+    matching
+        .into_iter()
+        .map(|record| {
+            let delivery = TerminalDeliveryIdentity {
+                commander_session_id: record.commander_session_id.clone(),
+                transaction_id: record.transaction_id.clone(),
+                event_id: record.event_id.clone(),
+                runtime_id: record.runtime_id.clone(),
+                callback_payload_sha256: Some(record.callback_payload_sha256.clone()),
+                callback_effect_identity: Some(record.effect_identity.clone()),
+            };
+            Ok((record.transport_payload, delivery))
+        })
+        .collect()
+}
+
+fn publish_terminal_failure_callback_from_store(
+    store: &SessionLifecycleStore,
+    mut delivery: TerminalDeliveryIdentity,
+) -> Result<Option<(Value, TerminalDeliveryIdentity)>> {
+    let receipt = store.terminal_receipt(&delivery.transaction_id, &delivery.event_id)?;
+    if receipt.child_session_id == receipt.commander_session_id
+        || receipt.terminal_state == TerminalState::Completed
+    {
+        return Ok(None);
+    }
+    let parent_mission_revision_sha256 = receipt
+        .audit_metadata
+        .get("parent_mission_revision_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!("DELEGATED_LIFECYCLE_IDENTITY_MISSING:parent_mission_revision_sha256")
+        })?;
+    let delegated_input_sha256 = receipt
+        .audit_metadata
+        .get("delegated_input_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("DELEGATED_LIFECYCLE_IDENTITY_MISSING:delegated_input_sha256"))?;
+    let receipt_sha256 = session_lifecycle::terminal_receipt_sha256(&receipt)?;
+    let callback_payload = json!({
+        "type": "terminal_failure",
+        "classification": "UNSETTLED_EFFECT",
+        "terminal_receipt_sha256": receipt_sha256,
+        "runtime_id": receipt.runtime_id,
+        "lease_id": receipt.lease_id,
+        "terminal_state": receipt.terminal_state,
+        "parent_mission_revision_sha256": parent_mission_revision_sha256,
+    });
+    let transport_payload = json!({
+        "request_id": delivery.transaction_id,
+        "kind": "gateway.callback",
+        "method": "session.terminal_failure",
+        "payload": {
+            "session_id": receipt.child_session_id,
+            "runtime_id": receipt.runtime_id,
+            "body": { "item": callback_payload }
+        }
+    });
+    let record = DurableCallbackRecord::new(
+        &receipt,
+        callback_payload,
+        transport_payload,
+        parent_mission_revision_sha256,
+        delegated_input_sha256,
+        CallbackEffectIdentity::UnsettledEffect {
+            classification: "terminal_receipt_without_settled_effect_evidence".to_string(),
+            evidence_sha256: receipt_sha256,
+        },
+    )?;
+    store.publish_callback(&record)?;
+    store.mark_callback_intaken(
+        &record.transaction_id,
+        &record.event_id,
+        &record.callback_payload_sha256,
+    )?;
+    delivery.callback_payload_sha256 = Some(record.callback_payload_sha256.clone());
+    delivery.callback_effect_identity = Some(record.effect_identity.clone());
+    Ok(Some((record.transport_payload, delivery)))
+}
+
 fn intake_terminal_receipt(
     store: &SessionLifecycleStore,
     entry: &SessionFeedEntry,
@@ -1967,6 +2074,26 @@ fn payload_to_run_agent_request(
     })
 }
 
+fn validate_delegated_input_digest(request: &mut RunAgentRequest, delegated: bool) -> Result<()> {
+    if !delegated {
+        return Ok(());
+    }
+    let recomputed_digest = request
+        .effective_prompt_sha256()
+        .ok_or_else(|| anyhow!("DELEGATED_LIFECYCLE_IDENTITY_MISSING:effective_prompt"))?;
+    if request.delegated_input_sha256.as_deref() != Some(&recomputed_digest) {
+        return Err(anyhow!(
+            "DELEGATED_INPUT_SHA256_MISMATCH:expected={recomputed_digest},actual={}",
+            request
+                .delegated_input_sha256
+                .as_deref()
+                .unwrap_or("missing")
+        ));
+    }
+    request.delegated_input_sha256 = Some(recomputed_digest);
+    Ok(())
+}
+
 fn validate_terminalization_identity(
     snapshot: &RuntimeLeaseSnapshot,
     lease: &RuntimeLease,
@@ -2001,6 +2128,19 @@ fn lifecycle_store(commander_session_id: &str) -> Result<SessionLifecycleStore> 
         commander_session_id,
         LifecycleConfig::default(),
     )?)
+}
+
+fn lifecycle_store_if_exists(commander_session_id: &str) -> Result<Option<SessionLifecycleStore>> {
+    let base = session_log_contract::client::default_db_dir().join("session_lifecycle_v1");
+    let root = commander_store_path(&base, commander_session_id)?;
+    if !root.exists() {
+        return Ok(None);
+    }
+    Ok(Some(SessionLifecycleStore::open(
+        root,
+        commander_session_id,
+        LifecycleConfig::default(),
+    )?))
 }
 
 fn terminal_state(state: SessionState) -> Result<TerminalState> {
@@ -2294,19 +2434,22 @@ fn debug_runtime_enabled() -> bool {
 mod tests {
     use super::{
         EnqueueTurnRequest, ExecutionService, RetryRuntimeIdentity,
-        RouterRecoveryCloseRuntimeRequest, RuntimeLease, failed_session_retry_root,
-        failed_session_runtime_fallback, intake_terminal_receipt, is_historical_terminal_runtime,
-        payload_to_run_agent_request, runtime_lease_from_snapshot,
-        runtime_terminal_state_from_snapshot, terminal_runtime_is_current,
+        RouterRecoveryCloseRuntimeRequest, RuntimeLease, TerminalDeliveryIdentity,
+        failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
+        is_historical_terminal_runtime, payload_to_run_agent_request,
+        publish_terminal_failure_callback_from_store, replay_terminal_callbacks_from_store,
+        runtime_lease_from_snapshot, runtime_terminal_state_from_snapshot,
+        terminal_runtime_is_current, validate_delegated_input_digest,
         validate_terminalization_identity,
     };
     use crate::{build_state, services::manager::ServiceManager};
     use lifecycle::{RuntimeState, SessionProjection, SessionState, TaskPlan};
     use serde_json::json;
     use session_lifecycle::{
-        LifecycleConfig, SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity,
-        TerminalState,
+        CallbackEffectIdentity, DurableCallbackRecord, LifecycleConfig, SessionLifecycleStore,
+        TerminalReceipt, TerminalReceiptIdentity, TerminalState,
     };
+    use runtime_contract::RunAgentRequest;
     use session_log_contract::{
         RuntimeLeaseSnapshot, RuntimeLifecycleIdentity, SessionFeedEntry, SessionFeedEvent,
     };
@@ -3377,5 +3520,197 @@ mod tests {
             .expect("queued turn should resume after a runtime slot is released")
             .expect("queued task should not panic");
         drop(permit);
+    }
+
+    fn durable_callback_fixture(
+        root: &std::path::Path,
+        terminal_state: TerminalState,
+    ) -> (SessionLifecycleStore, TerminalDeliveryIdentity) {
+        let store =
+            SessionLifecycleStore::open(root, "commander-callback", LifecycleConfig::default())
+                .expect("callback store");
+        let mut receipt = TerminalReceipt::new(
+            TerminalReceiptIdentity::new(
+                "transaction-callback",
+                "event-callback",
+                0,
+                "commander-callback",
+                "child-callback",
+                "runtime-callback",
+                "lease-callback",
+            ),
+            terminal_state,
+            1_786_845_600_000,
+        );
+        receipt.audit_metadata.insert(
+            "parent_mission_revision_sha256".to_string(),
+            json!("a".repeat(64)),
+        );
+        receipt.audit_metadata.insert(
+            "delegated_input_sha256".to_string(),
+            json!(session_lifecycle::canonical_value_sha256(&json!(
+                "delegated prompt"
+            ))),
+        );
+        store
+            .write_terminal_receipt(&receipt)
+            .expect("terminal receipt");
+        store
+            .intake("transaction-callback", "event-callback")
+            .expect("receipt intake");
+        (
+            store,
+            TerminalDeliveryIdentity {
+                commander_session_id: "commander-callback".to_string(),
+                transaction_id: "transaction-callback".to_string(),
+                event_id: "event-callback".to_string(),
+                runtime_id: "runtime-callback".to_string(),
+                callback_payload_sha256: None,
+                callback_effect_identity: None,
+            },
+        )
+    }
+
+    #[test]
+    fn fresh_turn_and_router_restart_replay_without_in_memory_lease() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Completed);
+        let record = DurableCallbackRecord::new(
+            &store
+                .terminal_receipt(&delivery.transaction_id, &delivery.event_id)
+                .expect("receipt"),
+            json!("child result"),
+            json!({"kind": "gateway.callback", "payload": {"body": {"item": {"id": "message-1", "text": "child result"}}}}),
+            "a".repeat(64),
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            CallbackEffectIdentity::Exact {
+                effect_id: "message-1".to_string(),
+            },
+        )
+        .expect("callback");
+        store.publish_callback(&record).expect("pending callback");
+        let fresh_service = ExecutionService::new();
+        assert!(fresh_service.sessions.lock().is_empty());
+
+        let first = replay_terminal_callbacks_from_store(
+            &store,
+            "commander-callback",
+            "child-callback",
+            "transaction-callback",
+        )
+        .expect("fresh replay before lease");
+        assert_eq!(first.len(), 1);
+        let readback = store.readback().expect("durable intake readback");
+        assert_eq!(readback.pending_callbacks, 0);
+        assert_eq!(readback.intaken_callbacks, 1);
+        assert_eq!(readback.acknowledged_callbacks, 0);
+
+        let restarted_service = ExecutionService::new();
+        assert!(restarted_service.sessions.lock().is_empty());
+        let duplicate = replay_terminal_callbacks_from_store(
+            &store,
+            "commander-callback",
+            "child-callback",
+            "transaction-callback",
+        )
+        .expect("restart replay without lease");
+        assert_eq!(duplicate, first);
+        assert_eq!(store.readback().expect("readback").intaken_callbacks, 1);
+    }
+
+    #[test]
+    fn missing_commander_store_is_an_empty_replay() {
+        let service = ExecutionService::new();
+        let commander_session_id = format!("missing-commander-{}", uuid::Uuid::new_v4());
+        let replay = service
+            .replay_terminal_callbacks(
+                &commander_session_id,
+                "missing-child",
+                "missing-transaction",
+            )
+            .expect("missing store is not fatal");
+        assert!(replay.is_empty());
+        assert!(service.sessions.lock().is_empty());
+    }
+
+    #[test]
+    fn replay_changed_immutable_identity_conflicts() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Completed);
+        let record = DurableCallbackRecord::new(
+            &store
+                .terminal_receipt(&delivery.transaction_id, &delivery.event_id)
+                .expect("receipt"),
+            json!("child result"),
+            json!({"payload": {"body": {"item": {"id": "message-1", "text": "child result"}}}}),
+            "a".repeat(64),
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            CallbackEffectIdentity::Exact {
+                effect_id: "message-1".to_string(),
+            },
+        )
+        .expect("callback");
+        store.publish_callback(&record).expect("pending callback");
+
+        let error = replay_terminal_callbacks_from_store(
+            &store,
+            "commander-callback",
+            "different-child",
+            "transaction-callback",
+        )
+        .expect_err("changed child identity must fail closed");
+        assert!(
+            error
+                .to_string()
+                .starts_with("CALLBACK_REPLAY_IDENTITY_MISMATCH:")
+        );
+    }
+
+    #[test]
+    fn delegated_prompt_digest_is_recomputed_and_mismatch_rejected() {
+        let mut request = RunAgentRequest {
+            prompt: Some("authoritative prompt".to_string()),
+            message: Some("ignored message".to_string()),
+            delegated_input_sha256: Some("b".repeat(64)),
+            ..Default::default()
+        };
+        let error = validate_delegated_input_digest(&mut request, true)
+            .expect_err("caller digest mismatch");
+        assert!(
+            error
+                .to_string()
+                .starts_with("DELEGATED_INPUT_SHA256_MISMATCH:")
+        );
+
+        request.delegated_input_sha256 = request.effective_prompt_sha256();
+        validate_delegated_input_digest(&mut request, true).expect("matching digest");
+        assert_eq!(
+            request.delegated_input_sha256,
+            request.effective_prompt_sha256()
+        );
+    }
+
+    #[test]
+    fn terminal_failure_without_agent_message_is_durably_intaken_and_unsettled() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Failed);
+        let (transport, delivery) = publish_terminal_failure_callback_from_store(&store, delivery)
+            .expect("failure callback")
+            .expect("delegated failure callback");
+
+        assert_eq!(transport["method"], "session.terminal_failure");
+        assert_eq!(
+            transport["payload"]["body"]["item"]["classification"],
+            "UNSETTLED_EFFECT"
+        );
+        assert!(matches!(
+            delivery.callback_effect_identity,
+            Some(CallbackEffectIdentity::UnsettledEffect { .. })
+        ));
+        let readback = store.readback().expect("readback");
+        assert_eq!(readback.pending_callbacks, 0);
+        assert_eq!(readback.intaken_callbacks, 1);
+        assert_eq!(readback.acknowledged_callbacks, 0);
+        assert_eq!(readback.acknowledged_receipts, 0);
     }
 }

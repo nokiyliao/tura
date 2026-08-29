@@ -200,6 +200,10 @@ pub enum CallbackEffectIdentity {
         classification: String,
         evidence_sha256: String,
     },
+    UnsettledEffect {
+        classification: String,
+        evidence_sha256: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -649,7 +653,7 @@ impl SessionLifecycleStore {
     }
 
     pub fn callbacks_for_replay(&self) -> LifecycleResult<Vec<DurableCallbackRecord>> {
-        let mut callbacks = Vec::new();
+        let mut callbacks = BTreeMap::new();
         for directory in ["pending", "intaken"] {
             for path in json_files(&self.root.join("callbacks").join(directory))? {
                 let callback: DurableCallbackRecord = read_json(&path)?;
@@ -658,13 +662,20 @@ impl SessionLifecycleStore {
                     continue;
                 }
                 self.validate_callback(&callback)?;
-                callbacks.push(callback);
+                let identity = (callback.transaction_id.clone(), callback.event_id.clone());
+                if let Some(existing) = callbacks.get(&identity) {
+                    if existing == &callback {
+                        continue;
+                    }
+                    return Err(LifecycleBlocker::new(
+                        "CALLBACK_IDENTITY_CONFLICT",
+                        path.display().to_string(),
+                    ));
+                }
+                callbacks.insert(identity, callback);
             }
         }
-        callbacks.sort_by(|left, right| {
-            (&left.transaction_id, &left.event_id).cmp(&(&right.transaction_id, &right.event_id))
-        });
-        Ok(callbacks)
+        Ok(callbacks.into_values().collect())
     }
 
     pub fn mark_callback_intaken(
@@ -703,6 +714,15 @@ impl SessionLifecycleStore {
         effect_identity: &CallbackEffectIdentity,
     ) -> LifecycleResult<AckOutcome> {
         require_sha256("callback_payload_sha256", callback_payload_sha256)?;
+        if matches!(
+            effect_identity,
+            CallbackEffectIdentity::UnsettledEffect { .. }
+        ) {
+            return Err(LifecycleBlocker::new(
+                "CALLBACK_UNSETTLED_EFFECT_ACK_BLOCKED",
+                event_id,
+            ));
+        }
         self.with_lock(|| {
             let key = receipt_key(transaction_id, event_id);
             let acknowledgement = CallbackAcknowledgement {
@@ -1001,9 +1021,13 @@ impl SessionLifecycleStore {
             CallbackEffectIdentity::ProvenZeroEffect {
                 classification,
                 evidence_sha256,
+            }
+            | CallbackEffectIdentity::UnsettledEffect {
+                classification,
+                evidence_sha256,
             } => {
-                require_identifier("zero_effect_classification", classification)?;
-                require_sha256("zero_effect_evidence_sha256", evidence_sha256)?;
+                require_identifier("effect_classification", classification)?;
+                require_sha256("effect_evidence_sha256", evidence_sha256)?;
             }
         }
         let receipt = self.terminal_receipt(&record.transaction_id, &record.event_id)?;
@@ -1710,6 +1734,47 @@ mod tests {
     }
 
     #[test]
+    fn unsettled_effect_callback_cannot_be_acknowledged() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let mut receipt = receipt("callback-unsettled", 0);
+        receipt.terminal_state = TerminalState::Failed;
+        store
+            .write_terminal_receipt(&receipt)
+            .expect("terminal receipt");
+        store
+            .intake("transaction-1", "callback-unsettled")
+            .expect("receipt intake");
+        let mut record = callback(&receipt, "typed failure");
+        record.effect_identity = CallbackEffectIdentity::UnsettledEffect {
+            classification: "terminal_receipt_without_settled_effect_evidence".to_string(),
+            evidence_sha256: record.terminal_receipt_sha256.clone(),
+        };
+        store.publish_callback(&record).expect("publish callback");
+        store
+            .mark_callback_intaken(
+                &record.transaction_id,
+                &record.event_id,
+                &record.callback_payload_sha256,
+            )
+            .expect("durable intake");
+
+        let error = store
+            .acknowledge_callback(
+                &record.transaction_id,
+                &record.event_id,
+                &record.callback_payload_sha256,
+                &record.effect_identity,
+            )
+            .expect_err("unsettled effect must stay unacknowledged");
+        assert_eq!(error.code, "CALLBACK_UNSETTLED_EFFECT_ACK_BLOCKED");
+        let readback = store.readback().expect("readback");
+        assert_eq!(readback.intaken_callbacks, 1);
+        assert_eq!(readback.acknowledged_callbacks, 0);
+        assert_eq!(readback.acknowledged_receipts, 0);
+    }
+
+    #[test]
     fn callback_transport_failure_remains_pending_and_restart_replays_same_record() {
         let root = tempfile::tempdir().expect("temp lifecycle root");
         let first = store(root.path());
@@ -1734,6 +1799,29 @@ mod tests {
         let readback = restarted.readback().expect("restart readback");
         assert_eq!(readback.pending_callbacks, 1);
         assert_eq!(readback.acknowledged_callbacks, 0);
+    }
+
+    #[test]
+    fn intake_crash_window_replays_one_identical_record() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let receipt = receipt("callback-crash-window", 0);
+        store
+            .write_terminal_receipt(&receipt)
+            .expect("terminal receipt");
+        store
+            .intake("transaction-1", "callback-crash-window")
+            .expect("receipt intake");
+        let record = callback(&receipt, "crash-window result");
+        store.publish_callback(&record).expect("pending callback");
+        let key = receipt_key(&record.transaction_id, &record.event_id);
+        durable_write_json(&root.path().join("callbacks/intaken").join(key), &record)
+            .expect("simulate durable intake before pending removal");
+
+        assert_eq!(
+            store.callbacks_for_replay().expect("deduplicated replay"),
+            vec![record]
+        );
     }
 
     #[test]

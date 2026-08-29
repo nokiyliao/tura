@@ -91,15 +91,7 @@ async fn dispatch_run_agent_inner(
         );
     }
 
-    let prompt = req
-        .prompt
-        .clone()
-        .or_else(|| req.message.clone())
-        .or_else(|| {
-            req.input
-                .as_ref()
-                .and_then(|value| value.as_str().map(str::to_string))
-        });
+    let prompt = req.effective_prompt().map(str::to_string);
     let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) else {
         return (
             200,

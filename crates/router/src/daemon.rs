@@ -216,10 +216,11 @@ async fn handle_socket_connection(
         let abort_on_disconnect = should_abort_request_on_connection_close(&parsed);
         let state_for_task = state.clone();
         let write_for_task = Arc::clone(&write);
-        let feed_forwarder = if let Some((session_id, _)) = active_runtime.as_ref() {
+        let feed_forwarder = if let Some(identity) = active_runtime.as_ref() {
             match start_session_round_forwarder(
-                session_id.clone(),
-                parsed.request_id.clone(),
+                identity.commander_session_id.clone(),
+                identity.child_session_id.clone(),
+                identity.transaction_id.clone(),
                 state.execution.clone(),
                 Arc::clone(&write),
             )
@@ -228,7 +229,8 @@ async fn handle_socket_connection(
                 Ok(forwarder) => Some(forwarder),
                 Err(error) => {
                     eprintln!(
-                        "router session round forwarding unavailable for {session_id}: {error:#}"
+                        "router session round forwarding unavailable for {}: {error:#}",
+                        identity.child_session_id
                     );
                     None
                 }
@@ -362,6 +364,7 @@ impl Drop for SessionRoundForwarder {
 }
 
 async fn start_session_round_forwarder(
+    commander_session_id: String,
     session_id: String,
     request_id: String,
     execution: crate::services::execution::ExecutionService,
@@ -372,11 +375,10 @@ async fn start_session_round_forwarder(
         .map_err(|error| anyhow::anyhow!("session feed subscriber task failed: {error}"))??;
     let cancellation = subscription.cancellation_handle()?;
     let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
-    let writer_execution = execution.clone();
     let reader = tokio::task::spawn_blocking(move || {
         let mut subscription = subscription;
         let mut terminal_gate = TerminalCallbackGate::default();
-        match execution.replay_terminal_callbacks(&session_id, &request_id) {
+        match execution.replay_terminal_callbacks(&commander_session_id, &session_id, &request_id) {
             Ok(replays) => {
                 for (callback, delivery) in replays {
                     terminal_gate.mark_completed(delivery.runtime_id.clone());
@@ -431,32 +433,51 @@ async fn start_session_round_forwarder(
             }
             if entry.session_id == session_id {
                 match execution.intake_terminal_feed_entry(&entry, &request_id) {
-                    Ok(Some(delivery)) => match terminal_gate.accept_delivery(delivery) {
-                        Ok(Some((callback, delivery))) => {
-                            let (callback, delivery) = match execution
-                                .publish_terminal_callback(delivery, callback)
-                            {
-                                Ok(value) => value,
-                                Err(error) => {
-                                    eprintln!(
-                                        "router durable terminal callback publication blocked: {error:#}"
-                                    );
+                    Ok(Some(delivery)) => {
+                        match execution.publish_terminal_failure_callback(delivery.clone()) {
+                            Ok(Some((callback, delivery))) => {
+                                terminal_gate.mark_completed(delivery.runtime_id.clone());
+                                if sender
+                                    .blocking_send((vec![callback], Some(delivery)))
+                                    .is_err()
+                                {
                                     return;
                                 }
-                            };
-                            if sender
-                                .blocking_send((vec![callback], Some(delivery)))
-                                .is_err()
-                            {
+                            }
+                            Ok(None) => match terminal_gate.accept_delivery(delivery) {
+                                Ok(Some((callback, delivery))) => {
+                                    let (callback, delivery) = match execution
+                                        .publish_terminal_callback(delivery, callback)
+                                    {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            eprintln!(
+                                                "router durable terminal callback publication blocked: {error:#}"
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    if sender
+                                        .blocking_send((vec![callback], Some(delivery)))
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    eprintln!("router terminal delivery blocked: {error:#}");
+                                    return;
+                                }
+                            },
+                            Err(error) => {
+                                eprintln!(
+                                    "router terminal failure callback publication blocked: {error:#}"
+                                );
                                 return;
                             }
                         }
-                        Ok(None) => {}
-                        Err(error) => {
-                            eprintln!("router terminal delivery blocked: {error:#}");
-                            return;
-                        }
-                    },
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         eprintln!(
@@ -468,35 +489,10 @@ async fn start_session_round_forwarder(
         }
     });
     let writer = tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-
-        while let Some((callbacks, delivery)) = receiver.recv().await {
+        while let Some((callbacks, _delivery)) = receiver.recv().await {
             let mut writer = write.lock().await;
-            let mut batch_delivered = true;
-            for callback in callbacks {
-                let Ok(encoded) = serde_json::to_string(&callback) else {
-                    batch_delivered = false;
-                    break;
-                };
-                if writer
-                    .write_all(format!("{encoded}\n").as_bytes())
-                    .await
-                    .is_err()
-                {
-                    batch_delivered = false;
-                    break;
-                }
-            }
-            if !batch_delivered || writer.flush().await.is_err() {
+            if write_callback_batch(&mut *writer, callbacks).await.is_err() {
                 break;
-            }
-            if let Some(delivery) = delivery
-                && let Err(error) = writer_execution.acknowledge_terminal_delivery(&delivery)
-            {
-                eprintln!(
-                    "router terminal callback acknowledgement blocked for {}: {error:#}",
-                    delivery.commander_session_id
-                );
             }
         }
     });
@@ -505,6 +501,23 @@ async fn start_session_round_forwarder(
         reader: Some(reader),
         writer: Some(writer),
     })
+}
+
+async fn write_callback_batch<W>(
+    writer: &mut W,
+    callbacks: Vec<serde_json::Value>,
+) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    for callback in callbacks {
+        let encoded = serde_json::to_string(&callback)?;
+        writer.write_all(format!("{encoded}\n").as_bytes()).await?;
+    }
+    writer.flush().await?;
+    Ok(())
 }
 
 fn session_round_callback(
@@ -843,6 +856,23 @@ mod tests {
                 .expect("ignore duplicate callback")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn socket_flush_has_no_callback_or_terminal_receipt_ack_side_effect() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut writer, mut reader) = tokio::io::duplex(512);
+        write_callback_batch(&mut writer, vec![json!({"callback": "durable"})])
+            .await
+            .expect("socket write and flush");
+        drop(writer);
+        let mut encoded = String::new();
+        reader
+            .read_to_string(&mut encoded)
+            .await
+            .expect("read callback");
+        assert_eq!(encoded, "{\"callback\":\"durable\"}\n");
     }
 
     fn terminal_delivery(runtime_id: &str) -> crate::services::execution::TerminalDeliveryIdentity {
