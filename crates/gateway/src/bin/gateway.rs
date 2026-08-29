@@ -43,8 +43,8 @@ fn main() {
 
     let port = match select_listen_port(desired_port) {
         PortDecision::Bind(port) => port,
-        PortDecision::AlreadyOwned(port) => {
-            write_active_gateway_url(port);
+        PortDecision::AlreadyOwned { port, identity } => {
+            publish_active_gateway_owner(port, &identity);
             println!("✅ Gateway for this directory is already running on http://127.0.0.1:{port}");
             return;
         }
@@ -64,8 +64,10 @@ fn main() {
     ) {
         Ok(lock) => lock,
         Err(error) => {
-            if gateway_identity_on_port(port).is_some_and(|identity| identity.matches_instance()) {
-                write_active_gateway_url(port);
+            if let Some(identity) =
+                gateway_identity_on_port(port).filter(GatewayIdentity::matches_instance)
+            {
+                publish_active_gateway_owner(port, &identity);
                 println!("✅ Gateway for this home is already running on http://127.0.0.1:{port}");
                 return;
             }
@@ -203,7 +205,10 @@ enum PortDecision {
     /// Bind and serve on this port.
     Bind(u16),
     /// A gateway for this same directory already owns the port; do nothing.
-    AlreadyOwned(u16),
+    AlreadyOwned {
+        port: u16,
+        identity: GatewayIdentity,
+    },
     /// A different process owns the desired port.
     Unavailable(u16),
 }
@@ -217,8 +222,13 @@ fn select_listen_port(desired: PortPreference) -> PortDecision {
     if port_is_free(desired.port) {
         return PortDecision::Bind(desired.port);
     }
-    if gateway_identity_on_port(desired.port).is_some_and(|identity| identity.matches_instance()) {
-        return PortDecision::AlreadyOwned(desired.port);
+    if let Some(identity) =
+        gateway_identity_on_port(desired.port).filter(GatewayIdentity::matches_instance)
+    {
+        return PortDecision::AlreadyOwned {
+            port: desired.port,
+            identity,
+        };
     }
     if desired.explicit {
         return PortDecision::Unavailable(desired.port);
@@ -250,31 +260,34 @@ fn my_home() -> String {
     tura_path::instance_home().to_string_lossy().to_string()
 }
 
-fn write_active_gateway_url(port: u16) {
+fn publish_active_gateway_owner(port: u16, identity: &GatewayIdentity) {
     let url = format!("http://127.0.0.1:{port}");
-    let pid = std::process::id();
+    if !identity.matches_instance() {
+        eprintln!(
+            "gateway already-running identity no longer matches this instance; active metadata unchanged"
+        );
+        return;
+    }
+    let Some(pid) = identity.pid else {
+        eprintln!("gateway already-running identity missing owner pid; active metadata unchanged");
+        return;
+    };
     if let Err(error) = tura_path::write_active_gateway_process_for_home(
         tura_path::instance_home(),
         &url,
         pid,
-        current_process_start_time(pid),
+        identity.process_start_time,
     ) {
         eprintln!("gateway failed to write active URL {url}: {error}");
     }
-}
-
-fn current_process_start_time(pid: u32) -> Option<u64> {
-    let mut system = sysinfo::System::new_all();
-    system.refresh_all();
-    system
-        .process(sysinfo::Pid::from_u32(pid))
-        .map(sysinfo::Process::start_time)
 }
 
 #[derive(Debug, Clone, Default)]
 struct GatewayIdentity {
     root: String,
     home: String,
+    pid: Option<u32>,
+    process_start_time: Option<u64>,
 }
 
 impl GatewayIdentity {
@@ -336,7 +349,19 @@ fn gateway_identity_on_port(port: u16) -> Option<GatewayIdentity> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
-    Some(GatewayIdentity { root, home })
+    let pid = value
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok());
+    let process_start_time = value
+        .get("process_start_time")
+        .and_then(serde_json::Value::as_u64);
+    Some(GatewayIdentity {
+        root,
+        home,
+        pid,
+        process_start_time,
+    })
 }
 
 fn configure_release_runtime_env() {
@@ -409,18 +434,20 @@ fn start_router_front_heartbeat() {
     let front_id = format!("gateway-{}-{}", std::process::id(), uuid::Uuid::new_v4());
     let ttl = gateway_router_lease_ttl();
     let interval = ttl.div_f64(3.0).max(Duration::from_secs(1));
-    std::thread::spawn(move || loop {
-        if let Ok(router_process) = gateway::router_process::global_router_process() {
-            let _ = router_process.call(
-                "lifecycle.front_heartbeat",
-                json!({
-                    "front_id": front_id,
-                    "kind": "gateway",
-                    "ttl_ms": ttl.as_millis() as u64,
-                }),
-            );
+    std::thread::spawn(move || {
+        loop {
+            if let Ok(router_process) = gateway::router_process::global_router_process() {
+                let _ = router_process.call(
+                    "lifecycle.front_heartbeat",
+                    json!({
+                        "front_id": front_id,
+                        "kind": "gateway",
+                        "ttl_ms": ttl.as_millis() as u64,
+                    }),
+                );
+            }
+            std::thread::sleep(interval);
         }
-        std::thread::sleep(interval);
     });
 }
 
@@ -515,8 +542,8 @@ fn run_session_log_command() {
 #[cfg(test)]
 mod tests {
     use super::{
-        desired_port_for_exe, find_release_root_from, select_listen_port, PortDecision,
-        PortPreference,
+        PortDecision, PortPreference, desired_port_for_exe, find_release_root_from,
+        publish_active_gateway_owner, select_listen_port,
     };
     use std::net::TcpListener;
 
@@ -641,9 +668,79 @@ mod tests {
         });
 
         match decision {
-            PortDecision::AlreadyOwned(port) => assert_eq!(port, occupied),
+            PortDecision::AlreadyOwned { port, .. } => assert_eq!(port, occupied),
             _ => panic!("expected already-owned decision"),
         }
+        drop(env);
+    }
+
+    #[test]
+    fn already_owned_gateway_publishes_health_proven_owner_identity() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("home");
+        let root = tempfile::tempdir().expect("root");
+        let home_text = home.path().to_string_lossy().to_string();
+        let root_text = root.path().to_string_lossy().to_string();
+        let env = TestEnv::set([
+            ("TURA_HOME", home_text.as_str()),
+            ("TURA_PROJECT_ROOT", root_text.as_str()),
+        ]);
+        let owner_pid = std::process::id().saturating_add(10_000);
+        let owner_start = 1_787_987_482_u64;
+        let port = spawn_health_endpoint(serde_json::json!({
+            "healthy": true,
+            "root": root_text,
+            "home": home_text,
+            "pid": owner_pid,
+            "process_start_time": owner_start,
+        }));
+
+        let decision = select_listen_port(PortPreference {
+            port,
+            explicit: true,
+        });
+        let PortDecision::AlreadyOwned { port, identity } = decision else {
+            panic!("expected already-owned decision");
+        };
+        publish_active_gateway_owner(port, &identity);
+
+        let active =
+            std::fs::read_to_string(tura_path::active_gateway_env_path_for_home(home.path()))
+                .expect("active gateway metadata");
+        assert!(active.contains(&format!("TURA_GATEWAY_PID={owner_pid}\n")));
+        assert!(active.contains(&format!("TURA_GATEWAY_PROCESS_START_TIME={owner_start}\n")));
+        assert!(!active.contains(&format!("TURA_GATEWAY_PID={}\n", std::process::id())));
+        drop(env);
+    }
+
+    #[test]
+    fn already_owned_gateway_without_owner_pid_writes_no_active_metadata() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("home");
+        let root = tempfile::tempdir().expect("root");
+        let home_text = home.path().to_string_lossy().to_string();
+        let root_text = root.path().to_string_lossy().to_string();
+        let env = TestEnv::set([
+            ("TURA_HOME", home_text.as_str()),
+            ("TURA_PROJECT_ROOT", root_text.as_str()),
+        ]);
+        let port = spawn_health_endpoint(serde_json::json!({
+            "healthy": true,
+            "root": root_text,
+            "home": home_text,
+            "process_start_time": 1_787_995_918_u64,
+        }));
+
+        let decision = select_listen_port(PortPreference {
+            port,
+            explicit: true,
+        });
+        let PortDecision::AlreadyOwned { port, identity } = decision else {
+            panic!("expected already-owned decision");
+        };
+        publish_active_gateway_owner(port, &identity);
+
+        assert!(!tura_path::active_gateway_env_path_for_home(home.path()).exists());
         drop(env);
     }
 
@@ -664,6 +761,25 @@ mod tests {
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn spawn_health_endpoint(body: serde_json::Value) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind gateway port");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept health probe");
+            let mut buffer = [0_u8; 512];
+            let _ = std::io::Read::read(&mut stream, &mut buffer);
+            std::io::Write::write_all(
+                &mut stream,
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+                )
+                .as_bytes(),
+            )
+            .expect("write health response");
+        });
+        port
+    }
 
     fn create_source_checkout_root(root: &std::path::Path) {
         std::fs::create_dir_all(root.join("agents").join("src")).expect("agents dir");
