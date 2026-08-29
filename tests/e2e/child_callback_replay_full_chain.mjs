@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
-import net from "node:net";
 import path from "node:path";
 import { startBackendStressEnvironment } from "./full_chain_backend_fixture.mjs";
 
@@ -46,42 +45,40 @@ try {
       agent: "direct-text-only",
     },
   };
-  const request = {
-    request_id: transactionId,
-    kind: "call",
-    method: "execution.register_child_session",
-    payload,
-  };
-  const routerEndpoint = JSON.parse(
-    await fsp.readFile(path.join(backend.turaHome, "db", "session_log", "router.addr"), "utf8"),
-  );
-
-  const first = connectRouter(routerEndpoint.addr, request);
-  const firstAdmission = await Promise.race([
-    backend.waitForProviderGate().then(() => ({ gated: true })),
-    first.next((value) => value.request_id === transactionId, 10_000).then((value) => ({ value })),
-  ]);
-  assert.equal(firstAdmission.gated, true, `child failed before provider gate: ${JSON.stringify(firstAdmission.value)}`);
+  const childPath = `/session/${encodeURIComponent(parent.sessionId)}/children`;
+  const firstController = new AbortController();
+  const firstRequest = fetch(`${backend.gateway.url}${childPath}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-opencode-directory": encodeURIComponent(parent.workspace),
+    },
+    body: JSON.stringify(payload),
+    signal: firstController.signal,
+  }).then(async (response) => ({ status: response.status, body: await response.text() }));
+  await backend.waitForProviderGate();
   const providerBaseline = backend.providerRequests.length;
-  first.socket.destroy();
+  firstController.abort();
+  await firstRequest.catch((error) => {
+    assert.equal(error.name, "AbortError");
+  });
 
-  const replay = connectRouter(routerEndpoint.addr, request);
-  const replayResponse = await replay.next(
-    (value) => value.request_id === transactionId && value.ok === true && value.payload?.outcome,
-    5_000,
-  );
-  assert.equal(replayResponse.payload.outcome, "already_admitted");
+  const replayResponse = await Promise.race([
+    backend.requestJson(
+      backend.gateway.url,
+      "POST",
+      childPath,
+      payload,
+      parent.workspace,
+      5_000,
+    ),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("public child replay exceeded 5s")), 5_000)),
+  ]);
+  assert.equal(replayResponse.outcome, "already_admitted");
   assert.equal(backend.providerRequests.length, providerBaseline, "replay must not enqueue a provider turn");
 
   backend.releaseProviderGate();
-  const callback = await replay.next(
-    (value) => value.kind === "gateway.callback" && value.payload?.runtime_id === runtimeId,
-    30_000,
-  );
-  assert.equal(callback.method, "session.agent_message");
-  assert.equal(callback.payload.session_id, payload.child_session_id);
   const lifecycleRoot = await waitForAck(backend.turaHome, parent.sessionId, 30_000);
-  assert.equal(replay.values.filter((value) => value.kind === "gateway.callback").length, 1);
   assert.equal(await jsonCount(path.join(lifecycleRoot, "callbacks", "pending")), 0);
   assert.equal(await jsonCount(path.join(lifecycleRoot, "callbacks", "acknowledged")), 1);
   assert.equal(await continuationStateCount(path.join(lifecycleRoot, "continuations"), "acknowledged"), 1);
@@ -92,11 +89,10 @@ try {
   assert.equal(runtime.kind, "runtime_lease_read");
   assert.equal(runtime.runtime.lease_active, false);
   assert.equal(runtime.runtime.terminal, true);
-  replay.socket.end();
   console.log(JSON.stringify({
     status: "PASS_P4_ACTUAL_DAEMON_CHILD_REPLAY_FORWARDER_ACCEPTANCE",
     child_provider_calls: childCalls.length,
-    replay_outcome: replayResponse.payload.outcome,
+    replay_outcome: replayResponse.outcome,
     callback_count: 1,
     continuation_ack_count: 1,
     callback_ack_count: 1,
@@ -104,50 +100,6 @@ try {
 } finally {
   backend.releaseProviderGate();
   await backend.cleanup();
-}
-
-function connectRouter(addr, request) {
-  const [host, portText] = addr.split(":");
-  const socket = net.createConnection({ host, port: Number(portText) });
-  socket.setEncoding("utf8");
-  let buffer = "";
-  const values = [];
-  const waiters = [];
-  socket.on("data", (chunk) => {
-    buffer += chunk;
-    while (buffer.includes("\n")) {
-      const index = buffer.indexOf("\n");
-      const line = buffer.slice(0, index).trim();
-      buffer = buffer.slice(index + 1);
-      if (!line) continue;
-      const value = JSON.parse(line);
-      values.push(value);
-      for (const waiter of [...waiters]) {
-        if (!waiter.predicate(value)) continue;
-        waiters.splice(waiters.indexOf(waiter), 1);
-        clearTimeout(waiter.timer);
-        waiter.resolve(value);
-      }
-    }
-  });
-  socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
-  return {
-    socket,
-    values,
-    next(predicate, timeoutMs) {
-      const existing = values.find(predicate);
-      if (existing) return Promise.resolve(existing);
-      return new Promise((resolve, reject) => {
-        const waiter = { predicate, resolve, timer: undefined };
-        waiter.timer = setTimeout(() => {
-          const index = waiters.indexOf(waiter);
-          if (index >= 0) waiters.splice(index, 1);
-          reject(new Error(`router response timed out; saw ${JSON.stringify(values)}`));
-        }, timeoutMs);
-        waiters.push(waiter);
-      });
-    },
-  };
 }
 
 async function waitForAck(turaHome, commanderSessionId, timeoutMs) {

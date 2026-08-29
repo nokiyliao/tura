@@ -683,9 +683,11 @@ pub async fn register_child_session(
         )
             .into_response();
     }
-    match RouterClient::global().register_child_session(payload) {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => {
+    match tokio::task::spawn_blocking(move || RouterClient::global().register_child_session(payload))
+        .await
+    {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => {
             let message = error.to_string();
             let status = if message.contains("_CONFLICT")
                 || message.contains("EXISTING_CHILD_WITHOUT_IDENTITY")
@@ -708,6 +710,15 @@ pub async fn register_child_session(
             )
                 .into_response()
         }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_admission_failed",
+                "message": format!("router child admission task failed: {error}"),
+            })),
+        )
+            .into_response(),
     }
 }
 
