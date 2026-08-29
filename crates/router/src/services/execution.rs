@@ -459,6 +459,20 @@ impl ExecutionService {
         Ok(delivery)
     }
 
+    pub(crate) fn historical_terminal_state_mismatch(
+        &self,
+        snapshot: &RuntimeLeaseSnapshot,
+    ) -> Result<bool> {
+        let entry = terminal_feed_entry_for_runtime(&snapshot.session_id, &snapshot.runtime_id)?;
+        let SessionFeedEvent::SessionProjectionUpdated { projection, .. } = entry.event else {
+            return Ok(false);
+        };
+        Ok(is_historical_terminal_runtime(
+            projection.active_runtime_id.as_deref(),
+            &snapshot.runtime_id,
+        ))
+    }
+
     pub async fn recovery_close_runtime(&self, state: &AppState, input: Value) -> Result<Value> {
         let request: RouterRecoveryCloseRuntimeRequest = serde_json::from_value(input)?;
         let _admission = self.admission.write().await;
@@ -1694,6 +1708,10 @@ fn terminal_runtime_is_current(
     Ok(true)
 }
 
+fn is_historical_terminal_runtime(active_runtime_id: Option<&str>, runtime_id: &str) -> bool {
+    active_runtime_id != Some(runtime_id)
+}
+
 #[derive(Clone, Default)]
 struct RuntimeSlotGate {
     active: Arc<Mutex<usize>>,
@@ -2148,6 +2166,7 @@ mod tests {
         runtime_terminal_state_from_snapshot, terminal_runtime_is_current,
         validate_terminalization_identity, EnqueueTurnRequest, ExecutionService,
         RetryRuntimeIdentity, RouterRecoveryCloseRuntimeRequest, RuntimeLease,
+        is_historical_terminal_runtime,
     };
     use crate::{build_state, services::manager::ServiceManager};
     use lifecycle::{RuntimeState, SessionProjection, SessionState, TaskPlan};
@@ -2511,6 +2530,13 @@ mod tests {
         assert!(error
             .to_string()
             .contains("RUNTIME_CALLBACK_SESSION_STATE_MISMATCH"));
+    }
+
+    #[test]
+    fn historical_terminal_runtime_requires_no_active_runtime_ownership() {
+        assert!(is_historical_terminal_runtime(None, "runtime-old"));
+        assert!(is_historical_terminal_runtime(Some("runtime-current"), "runtime-old"));
+        assert!(!is_historical_terminal_runtime(Some("runtime-current"), "runtime-current"));
     }
 
     #[test]

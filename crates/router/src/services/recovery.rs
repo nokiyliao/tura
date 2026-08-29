@@ -82,9 +82,27 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
             inspected = inspected.saturating_add(1);
             if snapshot.terminal && !snapshot.lease_active {
                 if snapshot.lifecycle.is_some()
-                    && let Some(delivery) = state
+                    && let Some(delivery) = match state
                         .execution
-                        .reconcile_durable_terminal_callback(&snapshot)?
+                        .reconcile_durable_terminal_callback(&snapshot)
+                    {
+                        Ok(delivery) => delivery,
+                        Err(error)
+                            if error
+                                .to_string()
+                                .starts_with("RUNTIME_CALLBACK_SESSION_STATE_MISMATCH:")
+                                && state
+                                    .execution
+                                    .historical_terminal_state_mismatch(&snapshot)? =>
+                        {
+                            recovered.push(quarantined_historical_terminal_mismatch_result(
+                                &snapshot,
+                                &error,
+                            ));
+                            None
+                        }
+                        Err(error) => return Err(error),
+                    }
                 {
                     recovered.push(json!({
                         "runtime_id": snapshot.runtime_id,
@@ -144,9 +162,27 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                         })?,
                     )?;
                     let delivery = if post_snapshot.lifecycle.is_some() {
-                        state
+                        match state
                             .execution
-                            .reconcile_durable_terminal_callback(&post_snapshot)?
+                            .reconcile_durable_terminal_callback(&post_snapshot)
+                        {
+                            Ok(delivery) => delivery,
+                            Err(error)
+                                if error
+                                    .to_string()
+                                    .starts_with("RUNTIME_CALLBACK_SESSION_STATE_MISMATCH:")
+                                    && state
+                                        .execution
+                                        .historical_terminal_state_mismatch(&post_snapshot)? =>
+                            {
+                                recovered.push(quarantined_historical_terminal_mismatch_result(
+                                    &post_snapshot,
+                                    &error,
+                                ));
+                                None
+                            }
+                            Err(error) => return Err(error),
+                        }
                     } else {
                         None
                     };
@@ -254,6 +290,21 @@ fn quarantined_missing_database_result(location: &RuntimeLocation) -> Value {
         "session_id": location.session_id,
         "recovery_action": "quarantined_missing_database",
         "terminal_proven": false,
+        "effect_authorized": false,
+    })
+}
+
+fn quarantined_historical_terminal_mismatch_result(
+    snapshot: &RuntimeLeaseSnapshot,
+    error: &anyhow::Error,
+) -> Value {
+    json!({
+        "runtime_id": snapshot.runtime_id,
+        "session_id": snapshot.session_id,
+        "recovery_action": "quarantined_historical_terminal_mismatch",
+        "terminal": snapshot.terminal,
+        "lease_active": snapshot.lease_active,
+        "diagnostic": error.to_string(),
         "effect_authorized": false,
     })
 }
@@ -376,6 +427,34 @@ mod tests {
                 "effect_authorized": false,
             })
         );
+    }
+
+    #[test]
+    fn startup_recovery_quarantines_historical_terminal_state_mismatch_without_effect() {
+        let snapshot = RuntimeLeaseSnapshot {
+            database_path: "/unused/session_log.sqlite3".to_string(),
+            runtime_id: "runtime-old".to_string(),
+            session_id: "session-1".to_string(),
+            lifecycle: None,
+            lease_id: None,
+            lease_active: false,
+            revision: 4,
+            last_event_seq: 4,
+            terminal: true,
+            session_event_seq: 9,
+            session_state: SessionState::Completed,
+            runtime_state: None,
+        };
+        let result = super::quarantined_historical_terminal_mismatch_result(
+            &snapshot,
+            &anyhow::anyhow!(
+                "RUNTIME_CALLBACK_SESSION_STATE_MISMATCH:runtime=runtime-old,snapshot=Completed,projection=Interrupted"
+            ),
+        );
+        assert_eq!(result["recovery_action"], "quarantined_historical_terminal_mismatch");
+        assert_eq!(result["effect_authorized"], false);
+        assert_eq!(result["terminal"], true);
+        assert_eq!(result["lease_active"], false);
     }
 
     #[test]
