@@ -978,6 +978,25 @@ impl ExecutionService {
         delivery: &TerminalDeliveryIdentity,
     ) -> Result<Value> {
         let store = lifecycle_store(&delivery.commander_session_id)?;
+        let callback = store
+            .callbacks_for_replay()?
+            .into_iter()
+            .find(|record| {
+                record.transaction_id == delivery.transaction_id
+                    && record.event_id == delivery.event_id
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "PERSISTED_CALLBACK_FOR_CONTINUATION_NOT_FOUND:{}:{}",
+                    delivery.transaction_id,
+                    delivery.event_id
+                )
+            })?;
+        store.mark_callback_intaken(
+            &callback.transaction_id,
+            &callback.event_id,
+            &callback.callback_payload_sha256,
+        )?;
         let persisted = store
             .callback_continuations_for_replay()?
             .into_iter()
@@ -988,20 +1007,6 @@ impl ExecutionService {
         let continuation = if let Some(record) = persisted {
             record
         } else {
-            let callback = store
-                .callbacks_for_replay()?
-                .into_iter()
-                .find(|record| {
-                    record.transaction_id == delivery.transaction_id
-                        && record.event_id == delivery.event_id
-                })
-                .ok_or_else(|| {
-                    anyhow!(
-                        "PERSISTED_CALLBACK_FOR_CONTINUATION_NOT_FOUND:{}:{}",
-                        delivery.transaction_id,
-                        delivery.event_id
-                    )
-                })?;
             ContinuationDispatchRecord::from_callback(&callback)?
         };
         match store.prepare_callback_continuation(&continuation)? {

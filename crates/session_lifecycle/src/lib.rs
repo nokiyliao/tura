@@ -1379,6 +1379,38 @@ impl SessionLifecycleStore {
                 &record.child_event_id,
             ));
         }
+        let callback_result = record
+            .parent_input
+            .pointer("/callback/result")
+            .ok_or_else(|| {
+                LifecycleBlocker::new(
+                    "CONTINUATION_CALLBACK_RESULT_MISSING",
+                    &record.child_event_id,
+                )
+            })?;
+        if canonical_value_sha256(callback_result) != record.callback_payload_sha256 {
+            return Err(LifecycleBlocker::new(
+                "CONTINUATION_CALLBACK_RESULT_HASH_MISMATCH",
+                &record.child_event_id,
+            ));
+        }
+        let callback_key = receipt_key(&record.child_transaction_id, &record.child_event_id);
+        let intaken_path = self.root.join("callbacks/intaken").join(callback_key);
+        if !intaken_path.exists() {
+            return Err(LifecycleBlocker::new(
+                "CONTINUATION_INTAKEN_CALLBACK_NOT_FOUND",
+                &record.child_event_id,
+            ));
+        }
+        let callback: DurableCallbackRecord = read_json(&intaken_path)?;
+        self.validate_callback(&callback)?;
+        let expected = ContinuationDispatchRecord::from_callback(&callback)?;
+        if !continuation_bound_fields_match(&expected, record) {
+            return Err(LifecycleBlocker::new(
+                "CONTINUATION_CALLBACK_BINDING_CONFLICT",
+                &record.child_event_id,
+            ));
+        }
         let digest = continuation_bound_identity_sha256(record)?;
         for (name, actual, expected) in [
             (
@@ -2069,11 +2101,34 @@ mod tests {
         .expect("callback record")
     }
 
+    fn publish_callback_fixture(
+        store: &SessionLifecycleStore,
+        receipt: &TerminalReceipt,
+        callback: &DurableCallbackRecord,
+    ) {
+        store
+            .write_terminal_receipt(receipt)
+            .expect("terminal receipt");
+        store
+            .intake(&receipt.transaction_id, &receipt.event_id)
+            .expect("receipt intake");
+        store.publish_callback(callback).expect("publish callback");
+    }
+
     #[test]
     fn callback_continuation_identity_is_deterministic_and_restart_safe() {
         let root = tempfile::tempdir().expect("temp lifecycle root");
         let lifecycle = store(root.path());
-        let callback = callback(&receipt("continuation-event", 0), "child result");
+        let terminal_receipt = receipt("continuation-event", 0);
+        let callback = callback(&terminal_receipt, "child result");
+        publish_callback_fixture(&lifecycle, &terminal_receipt, &callback);
+        lifecycle
+            .mark_callback_intaken(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+            )
+            .expect("intake callback");
         let first = ContinuationDispatchRecord::from_callback(&callback)
             .expect("derive continuation identity");
         let second = ContinuationDispatchRecord::from_callback(&callback)
@@ -2116,7 +2171,16 @@ mod tests {
     fn callback_continuation_cas_conflicts_and_unsettled_effect_stays_unacked() {
         let root = tempfile::tempdir().expect("temp lifecycle root");
         let store = store(root.path());
-        let callback = callback(&receipt("continuation-conflict", 0), "child result");
+        let terminal_receipt = receipt("continuation-conflict", 0);
+        let callback = callback(&terminal_receipt, "child result");
+        publish_callback_fixture(&store, &terminal_receipt, &callback);
+        store
+            .mark_callback_intaken(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+            )
+            .expect("intake callback");
         let record = ContinuationDispatchRecord::from_callback(&callback)
             .expect("derive continuation identity");
         store
@@ -2129,7 +2193,7 @@ mod tests {
                 .prepare_callback_continuation(&changed)
                 .expect_err("changed binding must conflict")
                 .code,
-            "CONTINUATION_IDENTITY_CONFLICT"
+            "CONTINUATION_CALLBACK_BINDING_CONFLICT"
         );
         assert_eq!(
             store
@@ -2166,10 +2230,100 @@ mod tests {
     }
 
     #[test]
+    fn continuation_requires_exact_intaken_callback_and_canonical_result_hash() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let terminal_receipt = receipt("continuation-binding", 0);
+        let callback = callback(&terminal_receipt, "child result");
+        let continuation =
+            ContinuationDispatchRecord::from_callback(&callback).expect("continuation");
+
+        publish_callback_fixture(&store, &terminal_receipt, &callback);
+        assert_eq!(
+            store
+                .prepare_callback_continuation(&continuation)
+                .expect_err("pending callback must not prepare")
+                .code,
+            "CONTINUATION_INTAKEN_CALLBACK_NOT_FOUND"
+        );
+        store
+            .mark_callback_intaken(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+            )
+            .expect("intake callback");
+        drop(store);
+        let reopened =
+            SessionLifecycleStore::open(root.path(), "commander-1", LifecycleConfig::default())
+                .expect("restart lifecycle store");
+
+        let mut tampered_result = continuation.clone();
+        tampered_result.parent_input["callback"]["result"] = Value::String("changed".into());
+        assert_eq!(
+            reopened
+                .prepare_callback_continuation(&tampered_result)
+                .expect_err("tampered result must fail closed")
+                .code,
+            "CONTINUATION_CALLBACK_RESULT_HASH_MISMATCH"
+        );
+
+        let mut mismatched_sha = continuation.clone();
+        mismatched_sha.callback_payload_sha256 = "b".repeat(64);
+        assert_eq!(
+            reopened
+                .prepare_callback_continuation(&mismatched_sha)
+                .expect_err("mismatched payload sha must fail closed")
+                .code,
+            "CONTINUATION_CALLBACK_RESULT_HASH_MISMATCH"
+        );
+        reopened
+            .prepare_callback_continuation(&continuation)
+            .expect("restart after intake prepares exact callback");
+
+        let intaken_path = root
+            .path()
+            .join("callbacks/intaken")
+            .join(receipt_key(&callback.transaction_id, &callback.event_id));
+        let mut changed_callback = callback.clone();
+        changed_callback.callback_payload = Value::String("changed".into());
+        changed_callback.callback_payload_sha256 =
+            canonical_value_sha256(&changed_callback.callback_payload);
+        durable_write_json(&intaken_path, &changed_callback)
+            .expect("simulate changed durable callback after restart");
+        assert_eq!(
+            reopened
+                .callback_continuations_for_replay()
+                .expect_err("changed callback must fail restart")
+                .code,
+            "CONTINUATION_CALLBACK_BINDING_CONFLICT"
+        );
+
+        durable_write_json(&intaken_path, &callback).expect("restore exact callback");
+        remove_durable(&intaken_path).expect("simulate missing durable callback after restart");
+        assert_eq!(
+            reopened
+                .callback_continuations_for_replay()
+                .expect_err("missing callback must fail restart")
+                .code,
+            "CONTINUATION_INTAKEN_CALLBACK_NOT_FOUND"
+        );
+    }
+
+    #[test]
     fn dispatched_continuation_requires_successful_terminal_and_reclaim_evidence() {
         let root = tempfile::tempdir().expect("temp lifecycle root");
         let store = store(root.path());
-        let callback = callback(&receipt("child-terminal", 0), "child result");
+        let terminal_receipt = receipt("child-terminal", 0);
+        let callback = callback(&terminal_receipt, "child result");
+        publish_callback_fixture(&store, &terminal_receipt, &callback);
+        store
+            .mark_callback_intaken(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+            )
+            .expect("intake callback");
         let continuation = ContinuationDispatchRecord::from_callback(&callback)
             .expect("derive continuation identity");
         store
