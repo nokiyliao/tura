@@ -12,6 +12,16 @@ import { pipeline } from "node:stream";
 
 export const repoRoot = path.resolve(import.meta.dirname, "..", "..");
 
+function cargoTargetDirectory() {
+  if (process.env.CARGO_TARGET_DIR) return process.env.CARGO_TARGET_DIR;
+  const result = spawnSync("cargo", ["metadata", "--no-deps", "--format-version", "1"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) return path.join(repoRoot, "target");
+  return JSON.parse(result.stdout).target_directory;
+}
+
 export function marker(workspaceIndex, taskIndex, turn) {
   return `E2E-STRESS-w${workspaceIndex}-t${taskIndex}-r${turn}`;
 }
@@ -99,7 +109,7 @@ export class BackendStressHarness {
     this.logsDir = path.join(this.runRoot, "logs");
     this.summaryPath = path.join(this.runRoot, "summary.json");
     this.turaHome = path.join(this.runRoot, "tura-home");
-    this.binaryDir = path.join(repoRoot, "target", this.config.binaryProfile);
+    this.binaryDir = path.join(cargoTargetDirectory(), this.config.binaryProfile);
     this.exeSuffix = process.platform === "win32" ? ".exe" : "";
     this.timings = [];
     this.checks = [];
@@ -117,6 +127,14 @@ export class BackendStressHarness {
     this.workspaces = [];
     this.sessions = [];
     this.targetSession = undefined;
+    this.providerGateMarker = options.providerGateMarker;
+    this.providerGateObservedPromise = new Promise((resolve) => {
+      this.providerGateObserved = resolve;
+    });
+    this.providerGateReleasePromise = new Promise((resolve) => {
+      this.providerGateRelease = resolve;
+    });
+    this.providerGateConsumed = false;
   }
 
   remainingBudget(label, reserveMs = 0) {
@@ -253,7 +271,7 @@ export class BackendStressHarness {
         requestInfo.responseError = String(error?.message || error);
       });
       req.on("data", (chunk) => chunks.push(chunk));
-      req.on("end", () => {
+      req.on("end", async () => {
         if (requestFailed || res.destroyed) return;
         const raw = Buffer.concat(chunks).toString("utf8");
         requestInfo.bodyBytes = Buffer.byteLength(raw);
@@ -265,6 +283,15 @@ export class BackendStressHarness {
         }
         const promptText = requestPromptText(body);
         requestInfo.promptText = promptText;
+        if (
+          this.providerGateMarker &&
+          !this.providerGateConsumed &&
+          promptText.includes(this.providerGateMarker)
+        ) {
+          this.providerGateConsumed = true;
+          this.providerGateObserved(requestInfo);
+          await this.providerGateReleasePromise;
+        }
         requestInfo.completedAt = Date.now();
         const content = richAssistantText(index, promptText);
         writeSse(res, { type: "response.output_text.delta", delta: content });
@@ -295,6 +322,19 @@ export class BackendStressHarness {
       server.on("error", reject);
     });
     return { server, url: `http://127.0.0.1:${port}` };
+  }
+
+  async waitForProviderGate(timeoutMs = 10_000) {
+    return Promise.race([
+      this.providerGateObservedPromise,
+      delay(timeoutMs).then(() => {
+        throw new Error(`provider gate ${this.providerGateMarker || "<unset>"} was not reached`);
+      }),
+    ]);
+  }
+
+  releaseProviderGate() {
+    this.providerGateRelease?.();
   }
 
   async writeProviderConfig(providerUrl) {
@@ -549,21 +589,31 @@ export class BackendStressHarness {
   }
 
   async createHttpSession(gatewayUrl, workspace, name) {
-    const session = await this.requestJson(
-      gatewayUrl,
-      "POST",
-      scoped("/session", workspace),
-      {
-        directory: workspace,
-        agent: "direct-text-only",
-        model: "openai/mock-coder",
-        model_variant: "default",
-        model_acceleration_enabled: false,
-        disable_permission_restrictions: true,
-        auto_session_name: false,
-      },
-      workspace,
-    );
+    let session;
+    const deadline = Date.now() + this.boundedTimeout(10_000, "session projection readiness");
+    while (!session && Date.now() < deadline) {
+      try {
+        session = await this.requestJson(
+          gatewayUrl,
+          "POST",
+          scoped("/session", workspace),
+          {
+            directory: workspace,
+            agent: "direct-text-only",
+            model: "openai/mock-coder",
+            model_variant: "default",
+            model_acceleration_enabled: false,
+            disable_permission_restrictions: true,
+            auto_session_name: false,
+          },
+          workspace,
+        );
+      } catch (error) {
+        if (!String(error?.message || error).includes("session_projection_not_ready")) throw error;
+        await delay(100);
+      }
+    }
+    if (!session) throw new Error("session projection did not become ready");
     await this.requestJson(gatewayUrl, "PATCH", `/session/${encodeURIComponent(session.id)}`, { name }, workspace);
     return session.id;
   }

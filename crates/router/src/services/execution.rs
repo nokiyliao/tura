@@ -126,8 +126,30 @@ impl ExecutionService {
     ) -> Result<Value> {
         let request: RegisterChildSessionRequest = serde_json::from_value(input)?;
         request.validate().map_err(anyhow::Error::msg)?;
-        let _admission = self.child_admission.lock().await;
         state.session_db.start()?;
+
+        let replay_store = lifecycle_store(&request.parent_session_id)?;
+        let replay_record = child_admission_record(&request);
+        if replay_store
+            .child_admission(&request.child_session_id)?
+            .is_some()
+        {
+            match replay_store.admit_child(&replay_record)? {
+                ChildAdmissionOutcome::AlreadyAdmitted => {
+                    if child_runtime_is_exact_active_nonterminal(&request)? {
+                        return register_child_session_response(
+                            request,
+                            RegisterChildSessionOutcome::AlreadyAdmitted,
+                        );
+                    }
+                }
+                ChildAdmissionOutcome::Admitted => unreachable!(
+                    "an existing durable child admission cannot be newly admitted"
+                ),
+            }
+        }
+
+        let _admission = self.child_admission.lock().await;
 
         let parent = read_session_snapshot(&request.parent_session_id)?
             .ok_or_else(|| anyhow!("CHILD_ADMISSION_PARENT_SESSION_NOT_FOUND:{}", request.parent_session_id))?;
@@ -173,21 +195,15 @@ impl ExecutionService {
             }
         }
 
-        serde_json::to_value(RegisterChildSessionResponse {
-            outcome: match admitted {
+        register_child_session_response(
+            request,
+            match admitted {
                 ChildAdmissionOutcome::Admitted => RegisterChildSessionOutcome::Admitted,
                 ChildAdmissionOutcome::AlreadyAdmitted => {
                     RegisterChildSessionOutcome::AlreadyAdmitted
                 }
             },
-            parent_session_id: request.parent_session_id,
-            child_session_id: request.child_session_id,
-            child_runtime_id: request.child_runtime_id,
-            child_transaction_id: request.child_transaction_id,
-            callback_request_id: request.callback_request_id,
-            effect_id: request.effect_id,
-        })
-        .map_err(Into::into)
+        )
     }
 
     async fn enqueue_turn_request_with_identity(
@@ -2559,6 +2575,46 @@ fn child_runtime_is_registered(request: &RegisterChildSessionRequest) -> Result<
             request.child_runtime_id
         )),
     }
+}
+
+fn child_runtime_is_exact_active_nonterminal(
+    request: &RegisterChildSessionRequest,
+) -> Result<bool> {
+    match session_log_contract::client::call_service(&SessionLogCommand::GetRuntimeLease(
+        GetRuntimeLeaseRequest {
+            runtime_id: request.child_runtime_id.clone(),
+            database_path: None,
+        },
+    ))? {
+        SessionLogResponse::RuntimeLeaseRead {
+            runtime: Some(runtime),
+        } => {
+            validate_child_runtime_identity(&runtime, request)?;
+            Ok(runtime.lease_active && !runtime.terminal)
+        }
+        SessionLogResponse::RuntimeLeaseRead { runtime: None } => Ok(false),
+        SessionLogResponse::Error { error } => Err(anyhow!(error)),
+        other => Err(anyhow!(
+            "unexpected session_db runtime read response for {}: {other:?}",
+            request.child_runtime_id
+        )),
+    }
+}
+
+fn register_child_session_response(
+    request: RegisterChildSessionRequest,
+    outcome: RegisterChildSessionOutcome,
+) -> Result<Value> {
+    serde_json::to_value(RegisterChildSessionResponse {
+        outcome,
+        parent_session_id: request.parent_session_id,
+        child_session_id: request.child_session_id,
+        child_runtime_id: request.child_runtime_id,
+        child_transaction_id: request.child_transaction_id,
+        callback_request_id: request.callback_request_id,
+        effect_id: request.effect_id,
+    })
+    .map_err(Into::into)
 }
 
 fn validate_child_runtime_identity(

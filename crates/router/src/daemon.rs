@@ -222,6 +222,7 @@ async fn handle_socket_connection(
             match start_session_round_forwarder(
                 identity.commander_session_id.clone(),
                 identity.child_session_id.clone(),
+                identity.runtime_id.clone(),
                 identity.transaction_id.clone(),
                 state.clone(),
                 Arc::clone(&write),
@@ -378,6 +379,7 @@ impl Drop for SessionRoundForwarder {
 async fn start_session_round_forwarder(
     commander_session_id: String,
     session_id: String,
+    runtime_id: String,
     request_id: String,
     state: crate::app::AppState,
     write: SocketWriter,
@@ -417,7 +419,13 @@ async fn start_session_round_forwarder(
         }
         while let Ok(Some(entry)) = subscription.next_entry() {
             let terminal_callback = agent_message_is_terminal(&entry);
-            if let Some(callback) = session_round_callback(entry.clone(), &session_id, &request_id)
+            if let Some(callback) = session_round_callback(
+                entry.clone(),
+                &commander_session_id,
+                &session_id,
+                &runtime_id,
+                &request_id,
+            )
                 && let Some(runtime_id) = entry.runtime_id.as_ref()
             {
                 if terminal_callback {
@@ -586,10 +594,14 @@ where
 
 fn session_round_callback(
     entry: SessionFeedEntry,
-    session_id: &str,
+    commander_session_id: &str,
+    child_session_id: &str,
+    expected_runtime_id: &str,
     request_id: &str,
 ) -> Option<serde_json::Value> {
-    if entry.session_id != session_id {
+    if !matches!(entry.runtime_id.as_deref(), Some(runtime_id) if runtime_id == expected_runtime_id)
+        || (entry.session_id != child_session_id && entry.session_id != commander_session_id)
+    {
         return None;
     }
     let SessionFeedEvent::AgentMessage {
@@ -610,7 +622,7 @@ fn session_round_callback(
         "kind": "gateway.callback",
         "method": "session.agent_message",
         "payload": {
-            "session_id": entry.session_id,
+            "session_id": child_session_id,
             "runtime_id": entry.runtime_id,
             "event_id": entry.event_id,
             "body": {
@@ -795,7 +807,9 @@ mod tests {
                     updated_at: 20,
                 },
             },
+            "commander-1",
             "session-1",
+            "runtime-round-2",
             "request-1",
         )
         .expect("matching agent message should become a callback");
@@ -865,7 +879,16 @@ mod tests {
                 updated_at: 1,
             },
         };
-        assert!(session_round_callback(entry.clone(), "session-1", "request-1").is_none());
+        assert!(
+            session_round_callback(
+                entry.clone(),
+                "commander-1",
+                "session-1",
+                "runtime-1",
+                "request-1",
+            )
+            .is_none()
+        );
 
         let agent_entry = SessionFeedEntry {
             event: SessionFeedEvent::AgentMessage {
@@ -881,7 +904,43 @@ mod tests {
             },
             ..entry
         };
-        assert!(session_round_callback(agent_entry, "session-2", "request-1").is_none());
+        assert!(
+            session_round_callback(
+                agent_entry.clone(),
+                "commander-1",
+                "session-2",
+                "runtime-1",
+                "request-1",
+            )
+            .is_none()
+        );
+
+        let parent_projected = SessionFeedEntry {
+            session_id: "commander-1".to_string(),
+            ..agent_entry.clone()
+        };
+        let callback = session_round_callback(
+            parent_projected.clone(),
+            "commander-1",
+            "session-1",
+            "runtime-1",
+            "request-1",
+        )
+        .expect("exact runtime parent projection should be accepted");
+        assert_eq!(callback["payload"]["session_id"], "session-1");
+        assert!(
+            session_round_callback(
+                SessionFeedEntry {
+                    runtime_id: Some("runtime-other".to_string()),
+                    ..parent_projected
+                },
+                "commander-1",
+                "session-1",
+                "runtime-1",
+                "request-1",
+            )
+            .is_none()
+        );
     }
 
     #[test]
