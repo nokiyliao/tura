@@ -978,6 +978,16 @@ impl ExecutionService {
         delivery: &TerminalDeliveryIdentity,
     ) -> Result<Value> {
         let store = lifecycle_store(&delivery.commander_session_id)?;
+        self.continue_terminal_delivery_with_store(state, delivery, &store)
+            .await
+    }
+
+    async fn continue_terminal_delivery_with_store(
+        &self,
+        state: &AppState,
+        delivery: &TerminalDeliveryIdentity,
+        store: &SessionLifecycleStore,
+    ) -> Result<Value> {
         let persisted = store
             .callback_continuations_for_replay()?
             .into_iter()
@@ -1031,7 +1041,7 @@ impl ExecutionService {
                 return Ok(continuation_result(&continuation, "already_acknowledged"));
             }
             ContinuationWriteOutcome::AlreadyCompleted => {
-                complete_and_ack_callback_continuation(&store, &continuation)?;
+                complete_and_ack_callback_continuation(store, &continuation)?;
                 return Ok(continuation_result(
                     &continuation,
                     "acknowledged_after_restart",
@@ -1039,7 +1049,7 @@ impl ExecutionService {
             }
             ContinuationWriteOutcome::AlreadyDispatched => {
                 if store.callback_continuation_completion_proven(&continuation)? {
-                    complete_and_ack_callback_continuation(&store, &continuation)?;
+                    complete_and_ack_callback_continuation(store, &continuation)?;
                     return Ok(continuation_result(
                         &continuation,
                         "reconciled_and_acknowledged_after_restart",
@@ -2664,11 +2674,11 @@ mod tests {
         RouterRecoveryCloseRuntimeRequest, RuntimeLease, TerminalDeliveryIdentity,
         complete_and_ack_callback_continuation, failed_session_retry_root,
         failed_session_runtime_fallback, intake_terminal_receipt, is_historical_terminal_runtime,
-        lifecycle_store, payload_to_run_agent_request,
-        publish_terminal_failure_callback_from_store, replay_terminal_callbacks_from_store,
-        require_successful_runtime_dispatch, runtime_lease_from_snapshot,
-        runtime_terminal_state_from_snapshot, terminal_runtime_is_current,
-        validate_delegated_input_digest, validate_terminalization_identity,
+        payload_to_run_agent_request, publish_terminal_failure_callback_from_store,
+        replay_terminal_callbacks_from_store, require_successful_runtime_dispatch,
+        runtime_lease_from_snapshot, runtime_terminal_state_from_snapshot,
+        terminal_runtime_is_current, validate_delegated_input_digest,
+        validate_terminalization_identity,
     };
     use crate::{build_state, services::manager::ServiceManager};
     use lifecycle::{RuntimeState, SessionProjection, SessionState, TaskPlan};
@@ -2677,6 +2687,7 @@ mod tests {
     use session_lifecycle::{
         CallbackEffectIdentity, ContinuationDispatchRecord, DurableCallbackRecord, LifecycleConfig,
         SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity, TerminalState,
+        commander_store_path,
     };
     use session_log_contract::{
         RuntimeLeaseSnapshot, RuntimeLifecycleIdentity, SessionFeedEntry, SessionFeedEvent,
@@ -3978,7 +3989,22 @@ mod tests {
     #[tokio::test]
     async fn callback_ack_completed_restart_recovers_without_second_execution() {
         let commander_session_id = format!("commander-callback-{}", uuid::Uuid::new_v4());
-        let store = lifecycle_store(&commander_session_id).expect("callback store");
+        let default_store_path = commander_store_path(
+            &session_log_contract::client::default_db_dir().join("session_lifecycle_v1"),
+            &commander_session_id,
+        )
+        .expect("default callback store path");
+        assert!(
+            !default_store_path.exists(),
+            "test identity must not preexist in the default lifecycle root"
+        );
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = SessionLifecycleStore::open(
+            root.path(),
+            &commander_session_id,
+            LifecycleConfig::default(),
+        )
+        .expect("callback store");
         let mut receipt = TerminalReceipt::new(
             TerminalReceiptIdentity::new(
                 "transaction-callback",
@@ -4062,6 +4088,12 @@ mod tests {
             callback_effect_identity: Some(callback.effect_identity.clone()),
         };
         drop(store);
+        let store = SessionLifecycleStore::open(
+            root.path(),
+            &commander_session_id,
+            LifecycleConfig::default(),
+        )
+        .expect("reopen callback store after restart");
 
         let state = build_state();
         let service = ExecutionService::new();
@@ -4105,7 +4137,7 @@ mod tests {
             ),
         ] {
             let error = service
-                .continue_terminal_delivery(&state, &changed)
+                .continue_terminal_delivery_with_store(&state, &changed, &store)
                 .await
                 .expect_err("changed recovery identity must fail closed");
             assert!(
@@ -4126,7 +4158,7 @@ mod tests {
         );
 
         let result = service
-            .continue_terminal_delivery(&state, &delivery)
+            .continue_terminal_delivery_with_store(&state, &delivery, &store)
             .await
             .expect("restart finishes ack through formal recovery path");
         assert_eq!(result["status"], "acknowledged_after_restart");
@@ -4136,7 +4168,13 @@ mod tests {
             "provider/enqueue execution delta"
         );
 
-        let reopened = lifecycle_store(&commander_session_id).expect("reopen after recovery");
+        drop(store);
+        let reopened = SessionLifecycleStore::open(
+            root.path(),
+            &commander_session_id,
+            LifecycleConfig::default(),
+        )
+        .expect("reopen after recovery");
         let readback = reopened.readback().expect("readback");
         assert_eq!(readback.acknowledged_callbacks, 1);
         assert_eq!(readback.acknowledged_receipts, 1);
@@ -4166,6 +4204,10 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(service.sessions.lock().len(), 0, "final enqueue count");
+        assert!(
+            !default_store_path.exists(),
+            "test must not create its identity in the default lifecycle root"
+        );
     }
 
     #[test]
