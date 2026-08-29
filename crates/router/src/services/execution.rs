@@ -1207,6 +1207,19 @@ impl ExecutionService {
         entry: &SessionFeedEntry,
         terminal_state: TerminalState,
     ) -> Result<()> {
+        let receipt = Self::snapshot_terminal_receipt(lease, snapshot, entry, terminal_state)?;
+        lifecycle_store(&lease.commander_session_id)?
+            .write_terminal_receipt(&receipt)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(())
+    }
+
+    fn snapshot_terminal_receipt(
+        lease: &RuntimeLease,
+        snapshot: &RuntimeLeaseSnapshot,
+        entry: &SessionFeedEntry,
+        terminal_state: TerminalState,
+    ) -> Result<TerminalReceipt> {
         let receipt_lease_id = snapshot.lease_id.as_deref().ok_or_else(|| {
             anyhow!(
                 "RUNTIME_SNAPSHOT_TERMINAL_RECEIPT_LEASE_MISSING:{}",
@@ -1251,10 +1264,6 @@ impl ExecutionService {
             snapshot.runtime_state.map_or(Value::Null, |state| json!(state)),
         );
         receipt.audit_metadata.insert(
-            "session_state".to_string(),
-            json!(snapshot.session_state),
-        );
-        receipt.audit_metadata.insert(
             "dispatch_runtime_id".to_string(),
             json!(lease.runtime_id),
         );
@@ -1262,10 +1271,7 @@ impl ExecutionService {
             "dispatch_lease_id".to_string(),
             json!(lease.lease_id),
         );
-        lifecycle_store(&lease.commander_session_id)?
-            .write_terminal_receipt(&receipt)
-            .map_err(|error| anyhow!(error.to_string()))?;
-        Ok(())
+        Ok(receipt)
     }
 
     fn confirm_runtime_durably_closed(
@@ -2473,6 +2479,111 @@ mod tests {
                 .expect("runtime terminal state should be authoritative"),
             TerminalState::Cancelled
         );
+    }
+
+    #[test]
+    fn snapshot_terminal_receipt_replays_runtime_writer_shape_exactly() {
+        let lifecycle = RuntimeLifecycleIdentity {
+            commander_session_id: "commander-replay".to_string(),
+            transaction_id: "transaction-replay".to_string(),
+            task_id: Some("task-replay".to_string()),
+            goal_id: Some("goal-replay".to_string()),
+            operator_override: true,
+            dispatch_runtime_id: "runtime-replay".to_string(),
+            dispatch_lease_id: "lease-replay".to_string(),
+            receipt_event_seq: 0,
+        };
+        let snapshot = RuntimeLeaseSnapshot {
+            database_path: "/tmp/session_log.sqlite3".to_string(),
+            runtime_id: "runtime-replay".to_string(),
+            session_id: "child-replay".to_string(),
+            lifecycle: Some(lifecycle),
+            lease_id: Some("lease-replay".to_string()),
+            lease_active: false,
+            revision: 8,
+            last_event_seq: 8,
+            terminal: true,
+            session_event_seq: 4,
+            session_state: SessionState::Failed,
+            runtime_state: Some(RuntimeState::Failed),
+        };
+        let lease = runtime_lease_from_snapshot(&snapshot).expect("durable callback identity");
+        let event_id = "runtime-replay:8:session-projection";
+        let entry = SessionFeedEntry {
+            session_id: "child-replay".to_string(),
+            cursor: 12,
+            runtime_id: Some("runtime-replay".to_string()),
+            event_id: event_id.to_string(),
+            event: SessionFeedEvent::SessionProjectionUpdated {
+                projection: SessionProjection {
+                    session_id: "child-replay".to_string(),
+                    state: SessionState::Failed,
+                    parent_id: Some("commander-replay".to_string()),
+                    task_plan: TaskPlan::default(),
+                    pending_user_inputs: Vec::new(),
+                    cancelled: false,
+                    runtime_ids: vec!["runtime-replay".to_string()],
+                    active_runtime_id: None,
+                },
+                session_name: None,
+                updated_at: 1_787_970_243_996,
+            },
+        };
+
+        let replay = ExecutionService::snapshot_terminal_receipt(
+            &lease,
+            &snapshot,
+            &entry,
+            TerminalState::Failed,
+        )
+        .expect("snapshot receipt");
+        let mut original = TerminalReceipt::new(
+            TerminalReceiptIdentity::new(
+                "transaction-replay",
+                event_id,
+                0,
+                "commander-replay",
+                "child-replay",
+                "runtime-replay",
+                "lease-replay",
+            ),
+            TerminalState::Failed,
+            1_787_970_243_996,
+        );
+        original.task_id = Some("task-replay".to_string());
+        original.goal_id = Some("goal-replay".to_string());
+        original.operator_override = true;
+        original
+            .audit_metadata
+            .insert("runtime_event_seq".to_string(), json!(8));
+        original
+            .audit_metadata
+            .insert("runtime_expected_revision".to_string(), json!(7));
+        original
+            .audit_metadata
+            .insert("runtime_state".to_string(), json!(RuntimeState::Failed));
+        original
+            .audit_metadata
+            .insert("dispatch_runtime_id".to_string(), json!("runtime-replay"));
+        original
+            .audit_metadata
+            .insert("dispatch_lease_id".to_string(), json!("lease-replay"));
+
+        assert_eq!(replay, original);
+        assert!(!replay.audit_metadata.contains_key("session_state"));
+        let root = tempfile::tempdir().expect("lifecycle root");
+        let store = SessionLifecycleStore::open(
+            root.path(),
+            "commander-replay",
+            LifecycleConfig::default(),
+        )
+        .expect("lifecycle store");
+        store
+            .write_terminal_receipt(&original)
+            .expect("original runtime receipt");
+        store
+            .write_terminal_receipt(&replay)
+            .expect("snapshot replay must be already durable, not conflicting");
     }
 
     #[test]
