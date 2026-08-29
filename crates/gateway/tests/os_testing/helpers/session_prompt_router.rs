@@ -8,6 +8,7 @@ pub(crate) use gateway::session::MessageRole;
 pub(crate) use gateway::session_store;
 pub(crate) use lifecycle::SessionCommand;
 pub(crate) use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 pub(crate) use session_log::SessionLogStore;
 pub(crate) use session_log_contract::SessionLogCommand;
 pub(crate) use std::collections::VecDeque;
@@ -226,11 +227,13 @@ impl FakeRouter {
         if let Some(parent) = addr_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let binary_sha256 = test_router_binary_sha256()?;
         std::fs::write(
             &addr_path,
             serde_json::to_string(&json!({
                 "addr": addr.to_string(),
                 "version": tura_path::instance_version(),
+                "binary_sha256": binary_sha256,
                 "pid": std::process::id(),
                 "process_start_time": current_process_start_time(std::process::id()),
             }))?,
@@ -320,11 +323,13 @@ pub(crate) fn handle_router_connection(
     }
     let request: Value = serde_json::from_str(line.trim()).context("decode router request")?;
     if request["kind"] == "health_check" || request["method"] == "health_check" {
+        let binary_sha256 = test_router_binary_sha256()?;
         let response = json!({
             "ok": true,
             "request_id": request.get("request_id").cloned().unwrap_or(Value::Null),
             "payload": {
                 "status": "ok",
+                "binary_sha256": binary_sha256,
                 "pid": std::process::id(),
                 "process_start_time": current_process_start_time(std::process::id())
             }
@@ -397,6 +402,22 @@ pub(crate) fn handle_router_connection(
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+fn test_router_binary_sha256() -> Result<String> {
+    let executable = if cfg!(windows) {
+        "tura_router.exe"
+    } else {
+        "tura_router"
+    };
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let path = source_root
+        .join("target")
+        .join(tura_path::build_kind())
+        .join(executable);
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read test router binary {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 pub(crate) fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> Result<()> {

@@ -25,6 +25,7 @@ const ACK_SCHEMA: &str = "tura_terminal_receipt_ack_v1";
 const CALLBACK_SCHEMA: &str = "tura_durable_terminal_callback_v1";
 const CALLBACK_ACK_SCHEMA: &str = "tura_durable_terminal_callback_ack_v1";
 const CONTINUATION_SCHEMA: &str = "tura_callback_continuation_dispatch_v1";
+const CHILD_ADMISSION_SCHEMA: &str = "tura_child_session_admission_v1";
 const RELEASE_SCHEMA: &str = "tura_terminal_slot_release_v1";
 const BLOCKER_SCHEMA: &str = "tura_session_lifecycle_blocker_v1";
 const RECONCILE_SCHEMA: &str = "tura_session_lifecycle_reconcile_v1";
@@ -205,6 +206,67 @@ pub enum CallbackEffectIdentity {
         classification: String,
         evidence_sha256: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildAdmissionRecord {
+    pub schema_version: String,
+    pub parent_session_id: String,
+    pub parent_mission_revision_sha256: String,
+    pub child_session_id: String,
+    pub child_runtime_id: String,
+    pub child_transaction_id: String,
+    pub child_lease_id: String,
+    pub callback_request_id: String,
+    pub effect_id: String,
+    pub delegated_input_sha256: String,
+    pub execution_payload_sha256: String,
+    pub session_directory: String,
+    pub session_name: String,
+    pub created_at_ms: i64,
+}
+
+impl ChildAdmissionRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        parent_session_id: impl Into<String>,
+        parent_mission_revision_sha256: impl Into<String>,
+        child_session_id: impl Into<String>,
+        child_runtime_id: impl Into<String>,
+        child_transaction_id: impl Into<String>,
+        child_lease_id: impl Into<String>,
+        callback_request_id: impl Into<String>,
+        effect_id: impl Into<String>,
+        delegated_input_sha256: impl Into<String>,
+        execution_payload_sha256: impl Into<String>,
+        session_directory: impl Into<String>,
+        session_name: impl Into<String>,
+        created_at_ms: i64,
+    ) -> Self {
+        Self {
+            schema_version: CHILD_ADMISSION_SCHEMA.to_string(),
+            parent_session_id: parent_session_id.into(),
+            parent_mission_revision_sha256: parent_mission_revision_sha256.into(),
+            child_session_id: child_session_id.into(),
+            child_runtime_id: child_runtime_id.into(),
+            child_transaction_id: child_transaction_id.into(),
+            child_lease_id: child_lease_id.into(),
+            callback_request_id: callback_request_id.into(),
+            effect_id: effect_id.into(),
+            delegated_input_sha256: delegated_input_sha256.into(),
+            execution_payload_sha256: execution_payload_sha256.into(),
+            session_directory: session_directory.into(),
+            session_name: session_name.into(),
+            created_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildAdmissionOutcome {
+    Admitted,
+    AlreadyAdmitted,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -589,6 +651,51 @@ impl SessionLifecycleStore {
             let path = self.root.join("receipts/pending").join(key);
             durable_write_json(&path, &stored)?;
             Ok(ReceiptWriteOutcome::Written(path))
+        })
+    }
+
+    pub fn admit_child(
+        &self,
+        record: &ChildAdmissionRecord,
+    ) -> LifecycleResult<ChildAdmissionOutcome> {
+        self.validate_child_admission(record)?;
+        self.with_lock(|| {
+            let path = self
+                .root
+                .join("admissions/children")
+                .join(child_admission_key(&record.child_session_id));
+            if path.exists() {
+                let existing: ChildAdmissionRecord = read_json(&path)?;
+                self.validate_child_admission(&existing)?;
+                if existing == *record {
+                    return Ok(ChildAdmissionOutcome::AlreadyAdmitted);
+                }
+                return Err(LifecycleBlocker::new(
+                    "CHILD_ADMISSION_IDENTITY_CONFLICT",
+                    &record.child_session_id,
+                ));
+            }
+            durable_write_json(&path, record)?;
+            Ok(ChildAdmissionOutcome::Admitted)
+        })
+    }
+
+    pub fn child_admission(
+        &self,
+        child_session_id: &str,
+    ) -> LifecycleResult<Option<ChildAdmissionRecord>> {
+        require_identifier("child_session_id", child_session_id)?;
+        self.with_lock(|| {
+            let path = self
+                .root
+                .join("admissions/children")
+                .join(child_admission_key(child_session_id));
+            if !path.exists() {
+                return Ok(None);
+            }
+            let record: ChildAdmissionRecord = read_json(&path)?;
+            self.validate_child_admission(&record)?;
+            Ok(Some(record))
         })
     }
 
@@ -1183,6 +1290,7 @@ impl SessionLifecycleStore {
 
     fn ensure_layout(&self) -> LifecycleResult<()> {
         for relative in [
+            "admissions/children",
             "receipts/pending",
             "receipts/applied",
             "receipts/acknowledged",
@@ -1197,6 +1305,69 @@ impl SessionLifecycleStore {
             "readback",
         ] {
             fs::create_dir_all(self.root.join(relative)).map_err(io_blocker)?;
+        }
+        Ok(())
+    }
+
+    fn validate_child_admission(&self, record: &ChildAdmissionRecord) -> LifecycleResult<()> {
+        if record.schema_version != CHILD_ADMISSION_SCHEMA {
+            return Err(LifecycleBlocker::new(
+                "CHILD_ADMISSION_SCHEMA_UNSUPPORTED",
+                &record.schema_version,
+            ));
+        }
+        for (name, value) in [
+            ("parent_session_id", record.parent_session_id.as_str()),
+            ("child_session_id", record.child_session_id.as_str()),
+            ("child_runtime_id", record.child_runtime_id.as_str()),
+            ("child_transaction_id", record.child_transaction_id.as_str()),
+            ("child_lease_id", record.child_lease_id.as_str()),
+            ("callback_request_id", record.callback_request_id.as_str()),
+            ("effect_id", record.effect_id.as_str()),
+            ("session_directory", record.session_directory.as_str()),
+            ("session_name", record.session_name.as_str()),
+        ] {
+            require_identifier(name, value)?;
+        }
+        for (name, value) in [
+            (
+                "parent_mission_revision_sha256",
+                record.parent_mission_revision_sha256.as_str(),
+            ),
+            (
+                "delegated_input_sha256",
+                record.delegated_input_sha256.as_str(),
+            ),
+            (
+                "execution_payload_sha256",
+                record.execution_payload_sha256.as_str(),
+            ),
+        ] {
+            require_sha256(name, value)?;
+        }
+        if record.parent_session_id != self.commander_session_id {
+            return Err(LifecycleBlocker::new(
+                "CHILD_ADMISSION_PARENT_IDENTITY_MISMATCH",
+                &record.parent_session_id,
+            ));
+        }
+        if record.parent_session_id == record.child_session_id {
+            return Err(LifecycleBlocker::new(
+                "CHILD_ADMISSION_IDENTITY_CONFLICT",
+                "parent_equals_child",
+            ));
+        }
+        if record.callback_request_id != record.child_transaction_id {
+            return Err(LifecycleBlocker::new(
+                "CHILD_ADMISSION_CALLBACK_IDENTITY_CONFLICT",
+                &record.callback_request_id,
+            ));
+        }
+        if record.created_at_ms <= 0 {
+            return Err(LifecycleBlocker::new(
+                "CHILD_ADMISSION_IDENTITY_INVALID",
+                "created_at_ms",
+            ));
         }
         Ok(())
     }
@@ -1896,6 +2067,10 @@ fn receipt_key(transaction_id: &str, event_id: &str) -> String {
     format!("{:x}.json", hasher.finalize())
 }
 
+fn child_admission_key(child_session_id: &str) -> String {
+    format!("{:x}.json", Sha256::digest(child_session_id.as_bytes()))
+}
+
 fn payload_sha256(receipt: &TerminalReceipt) -> LifecycleResult<String> {
     let bytes = serde_json::to_vec(receipt).map_err(json_blocker)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -2113,6 +2288,115 @@ mod tests {
             .intake(&receipt.transaction_id, &receipt.event_id)
             .expect("receipt intake");
         store.publish_callback(callback).expect("publish callback");
+    }
+
+    fn child_admission() -> ChildAdmissionRecord {
+        ChildAdmissionRecord::new(
+            "commander-1",
+            "69edd74f732aa5bed571d652e7f91874a16881116b454218a508f413a33fcd70",
+            "child-1",
+            "runtime-0",
+            "transaction-1",
+            "lease-0",
+            "transaction-1",
+            "assistant-message-1",
+            &canonical_value_sha256(&Value::String("delegated prompt".to_string())),
+            &canonical_value_sha256(&serde_json::json!({"prompt": "delegated prompt"})),
+            "/tmp/child-1",
+            "delegated child",
+            1_786_845_600_000,
+        )
+    }
+
+    #[test]
+    fn child_admission_is_idempotent_and_reuses_callback_ack_continuation_store() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let admission = child_admission();
+        assert_eq!(
+            store.admit_child(&admission).expect("admit child"),
+            ChildAdmissionOutcome::Admitted
+        );
+        assert_eq!(
+            store.admit_child(&admission).expect("replay admission"),
+            ChildAdmissionOutcome::AlreadyAdmitted
+        );
+        assert_eq!(
+            store
+                .child_admission(&admission.child_session_id)
+                .expect("admission readback"),
+            Some(admission.clone())
+        );
+
+        let mut changed = admission.clone();
+        changed.effect_id = "assistant-message-2".to_string();
+        assert_eq!(
+            store.admit_child(&changed).unwrap_err().code,
+            "CHILD_ADMISSION_IDENTITY_CONFLICT"
+        );
+
+        let terminal = receipt("child-terminal", 0);
+        let callback = callback(&terminal, "child result");
+        publish_callback_fixture(&store, &terminal, &callback);
+        assert!(matches!(
+            store.publish_callback(&callback).expect("callback replay"),
+            CallbackWriteOutcome::AlreadyDurable(_)
+        ));
+        store
+            .mark_callback_intaken(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+            )
+            .expect("callback intake");
+        let continuation = ContinuationDispatchRecord::from_callback(&callback)
+            .expect("continuation identity");
+        assert_eq!(
+            store
+                .prepare_callback_continuation(&continuation)
+                .expect("prepare continuation"),
+            ContinuationWriteOutcome::Prepared
+        );
+        assert_eq!(
+            store
+                .acknowledge_callback(
+                    &callback.transaction_id,
+                    &callback.event_id,
+                    &callback.callback_payload_sha256,
+                    &callback.effect_identity,
+                )
+                .expect("callback ack"),
+            AckOutcome::Acknowledged
+        );
+        assert_eq!(
+            store
+                .acknowledge_callback(
+                    &callback.transaction_id,
+                    &callback.event_id,
+                    &callback.callback_payload_sha256,
+                    &callback.effect_identity,
+                )
+                .expect("callback ack replay"),
+            AckOutcome::AlreadyAcknowledged
+        );
+        assert_eq!(
+            store
+                .callback_continuations_for_replay()
+                .expect("continuation eligibility"),
+            vec![continuation]
+        );
+    }
+
+    #[test]
+    fn child_admission_rejects_missing_parent_identity() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let mut admission = child_admission();
+        admission.parent_session_id.clear();
+        assert_eq!(
+            store.admit_child(&admission).unwrap_err().code,
+            "LIFECYCLE_IDENTITY_MISSING"
+        );
     }
 
     #[test]

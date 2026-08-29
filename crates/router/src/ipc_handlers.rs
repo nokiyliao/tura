@@ -12,6 +12,7 @@ use router_contract::{
     PatchToolRequest, ToolRegistryRequest, ToolRequest, METHOD_ENQUEUE_TURN,
     METHOD_EXECUTE_COMMAND, METHOD_GET_TOOL, METHOD_GET_TOOL_CONFIG, METHOD_HEALTH_CHECK,
     METHOD_LIST_COMMANDS, METHOD_LIST_TOOLS, METHOD_PATCH_TOOL, METHOD_PATCH_TOOL_CONFIG,
+    METHOD_REGISTER_CHILD_SESSION,
 };
 use tura_router::registry::ToolRegistry;
 
@@ -50,6 +51,12 @@ pub(crate) async fn handle_ipc_request(state: &AppState, request: IpcRequest) ->
             state
                 .execution
                 .enqueue_turn_request(state, request.payload, &request.request_id)
+                .await
+        }
+        METHOD_REGISTER_CHILD_SESSION => {
+            state
+                .execution
+                .register_child_session_request(state, request.payload)
                 .await
         }
         "execution.command_run" => {

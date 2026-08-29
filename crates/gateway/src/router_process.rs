@@ -650,7 +650,10 @@ fn read_timeout_for(method: &str) -> Option<Duration> {
         Some(Duration::from_secs(5))
     } else if method == "execution.shutdown" {
         Some(Duration::from_secs(10))
-    } else if method == router_contract::METHOD_ENQUEUE_TURN {
+    } else if matches!(
+        method,
+        router_contract::METHOD_ENQUEUE_TURN | router_contract::METHOD_REGISTER_CHILD_SESSION
+    ) {
         // A turn may legitimately outlive the ordinary router request budget.
         // Keep the socket attached to that one execution unless an operator
         // explicitly configures a deadline.
@@ -1320,6 +1323,10 @@ mod tests {
             let _env = EnvGuard::set("TURA_ROUTER_EXECUTION_TIMEOUT_SECS", None);
             assert_eq!(read_timeout_for("execution.enqueue_turn"), None);
             assert_eq!(
+                read_timeout_for(router_contract::METHOD_REGISTER_CHILD_SESSION),
+                None
+            );
+            assert_eq!(
                 read_timeout_for("health_check"),
                 Some(ROUTER_HEALTH_REQUEST_TIMEOUT)
             );
@@ -1334,6 +1341,10 @@ mod tests {
             read_timeout_for("execution.enqueue_turn"),
             Some(Duration::from_secs(42))
         );
+        assert_eq!(
+            read_timeout_for(router_contract::METHOD_REGISTER_CHILD_SESSION),
+            Some(Duration::from_secs(42))
+        );
     }
 
     #[test]
@@ -1343,6 +1354,9 @@ mod tests {
         ));
         assert!(router_call_is_replay_safe("health_check"));
         assert!(router_call_is_replay_safe("registry.tools.list"));
+        assert!(router_call_is_replay_safe(
+            router_contract::METHOD_REGISTER_CHILD_SESSION
+        ));
     }
 
     #[test]

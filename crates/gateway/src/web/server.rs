@@ -110,6 +110,10 @@ pub fn build_router() -> Router {
             post(api::session::fork_session),
         )
         .route(
+            "/session/{sessionID}/children",
+            post(api::session::register_child_session),
+        )
+        .route(
             "/session/{sessionID}/task-management",
             patch(api::session::update_session_task_management),
         )

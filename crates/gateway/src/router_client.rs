@@ -8,9 +8,10 @@ use router_contract::{
     CancelRuntimeRequest, EnqueueTurnRequest, ExecuteCommandRequest, ExecuteCommandResponse,
     GetToolConfigResponse, GetToolResponse, ListCommandsRequest, ListCommandsResponse,
     ListToolsResponse, PatchToolConfigRequest, PatchToolRequest, ProbeSessionsRequest,
-    ToolRegistryRequest, ToolRequest, METHOD_ENQUEUE_TURN, METHOD_EXECUTE_COMMAND, METHOD_GET_TOOL,
-    METHOD_GET_TOOL_CONFIG, METHOD_LIST_COMMANDS, METHOD_LIST_TOOLS, METHOD_PATCH_TOOL,
-    METHOD_PATCH_TOOL_CONFIG,
+    RegisterChildSessionRequest, RegisterChildSessionResponse, ToolRegistryRequest, ToolRequest,
+    METHOD_ENQUEUE_TURN, METHOD_EXECUTE_COMMAND, METHOD_GET_TOOL, METHOD_GET_TOOL_CONFIG,
+    METHOD_LIST_COMMANDS, METHOD_LIST_TOOLS, METHOD_PATCH_TOOL, METHOD_PATCH_TOOL_CONFIG,
+    METHOD_REGISTER_CHILD_SESSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -34,6 +35,13 @@ impl RouterClient {
         crate::router_process::global_router_process()?
             .call(METHOD_ENQUEUE_TURN, payload)
             .map_err(|error| anyhow!("router execution enqueue failed: {error}"))
+    }
+
+    pub fn register_child_session(
+        &self,
+        request: RegisterChildSessionRequest,
+    ) -> Result<RegisterChildSessionResponse> {
+        self.call_typed(METHOD_REGISTER_CHILD_SESSION, request)
     }
 
     pub fn cancel_runtime(&self, session_id: &str, runtime_id: &str) -> Result<Value> {

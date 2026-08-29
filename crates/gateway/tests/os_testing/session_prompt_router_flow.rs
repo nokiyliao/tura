@@ -3,6 +3,8 @@ mod helpers;
 
 #[path = "session_prompt_router/concurrency.rs"]
 mod concurrency;
+#[path = "session_prompt_router/child_admission.rs"]
+mod child_admission;
 #[path = "session_prompt_router/core_session.rs"]
 mod core_session;
 #[path = "session_prompt_router/errors_config.rs"]

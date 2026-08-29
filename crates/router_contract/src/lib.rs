@@ -8,6 +8,7 @@ pub const IPC_KIND_CALL: &str = "call";
 pub const IPC_KIND_HEALTH_CHECK: &str = "health_check";
 pub const METHOD_HEALTH_CHECK: &str = "health_check";
 pub const METHOD_ENQUEUE_TURN: &str = "execution.enqueue_turn";
+pub const METHOD_REGISTER_CHILD_SESSION: &str = "execution.register_child_session";
 pub const METHOD_LIST_COMMANDS: &str = "registry.commands.list";
 pub const METHOD_EXECUTE_COMMAND: &str = "registry.commands.execute";
 pub const METHOD_LIST_TOOLS: &str = "registry.tools.list";
@@ -96,6 +97,96 @@ pub struct EnqueueTurnRequest {
     pub runtime_id: String,
     pub session_id: String,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterChildSessionRequest {
+    pub parent_session_id: String,
+    pub parent_mission_revision_sha256: String,
+    pub child_session_id: String,
+    pub child_runtime_id: String,
+    pub child_transaction_id: String,
+    pub child_lease_id: String,
+    pub callback_request_id: String,
+    pub effect_id: String,
+    pub delegated_input_sha256: String,
+    pub session_directory: String,
+    pub session_name: String,
+    pub created_at_ms: i64,
+    pub execution_payload: Value,
+}
+
+impl RegisterChildSessionRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("parent_session_id", self.parent_session_id.as_str()),
+            ("child_session_id", self.child_session_id.as_str()),
+            ("child_runtime_id", self.child_runtime_id.as_str()),
+            ("child_transaction_id", self.child_transaction_id.as_str()),
+            ("child_lease_id", self.child_lease_id.as_str()),
+            ("callback_request_id", self.callback_request_id.as_str()),
+            ("effect_id", self.effect_id.as_str()),
+            ("session_directory", self.session_directory.as_str()),
+            ("session_name", self.session_name.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("CHILD_ADMISSION_IDENTITY_MISSING:{name}"));
+            }
+        }
+        for (name, value) in [
+            (
+                "parent_mission_revision_sha256",
+                self.parent_mission_revision_sha256.as_str(),
+            ),
+            (
+                "delegated_input_sha256",
+                self.delegated_input_sha256.as_str(),
+            ),
+        ] {
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(format!("CHILD_ADMISSION_IDENTITY_INVALID:{name}"));
+            }
+        }
+        if self.parent_session_id == self.child_session_id {
+            return Err("CHILD_ADMISSION_IDENTITY_CONFLICT:parent_equals_child".to_string());
+        }
+        if self.callback_request_id != self.child_transaction_id {
+            return Err(
+                "CHILD_ADMISSION_CALLBACK_IDENTITY_CONFLICT:callback_request_id".to_string(),
+            );
+        }
+        if self.created_at_ms <= 0 {
+            return Err("CHILD_ADMISSION_IDENTITY_INVALID:created_at_ms".to_string());
+        }
+        if !self.execution_payload.is_object() {
+            return Err("CHILD_ADMISSION_PAYLOAD_INVALID:execution_payload".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RegisterChildSessionOutcome {
+    Admitted,
+    AlreadyAdmitted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterChildSessionResponse {
+    pub outcome: RegisterChildSessionOutcome,
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub child_runtime_id: String,
+    pub child_transaction_id: String,
+    pub callback_request_id: String,
+    pub effect_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -271,4 +362,76 @@ pub struct GetToolResponse {
 #[serde(deny_unknown_fields)]
 pub struct GetToolConfigResponse {
     pub config: Option<ToolConfigResponse>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn child_request() -> RegisterChildSessionRequest {
+        RegisterChildSessionRequest {
+            parent_session_id: "parent-1".to_string(),
+            parent_mission_revision_sha256: "a".repeat(64),
+            child_session_id: "child-1".to_string(),
+            child_runtime_id: "runtime-1".to_string(),
+            child_transaction_id: "callback-1".to_string(),
+            child_lease_id: "lease-1".to_string(),
+            callback_request_id: "callback-1".to_string(),
+            effect_id: "effect-1".to_string(),
+            delegated_input_sha256: "b".repeat(64),
+            session_directory: "/tmp/child-1".to_string(),
+            session_name: "delegated child".to_string(),
+            created_at_ms: 1_788_000_000_000,
+            execution_payload: json!({"prompt": "perform delegated work"}),
+        }
+    }
+
+    #[test]
+    fn child_admission_contract_binds_all_required_identities() {
+        let request = child_request();
+        request.validate().expect("valid child admission");
+        let encoded = serde_json::to_value(&request).expect("serialize request");
+        let decoded: RegisterChildSessionRequest =
+            serde_json::from_value(encoded).expect("deserialize request");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn child_admission_contract_rejects_missing_and_changed_callback_identity() {
+        let mut missing_parent = child_request();
+        missing_parent.parent_session_id.clear();
+        assert_eq!(
+            missing_parent.validate().unwrap_err(),
+            "CHILD_ADMISSION_IDENTITY_MISSING:parent_session_id"
+        );
+
+        let mut missing_child = child_request();
+        missing_child.child_session_id.clear();
+        assert_eq!(
+            missing_child.validate().unwrap_err(),
+            "CHILD_ADMISSION_IDENTITY_MISSING:child_session_id"
+        );
+
+        let mut changed_callback = child_request();
+        changed_callback.callback_request_id = "callback-2".to_string();
+        assert_eq!(
+            changed_callback.validate().unwrap_err(),
+            "CHILD_ADMISSION_CALLBACK_IDENTITY_CONFLICT:callback_request_id"
+        );
+
+        let mut missing_effect = child_request();
+        missing_effect.effect_id.clear();
+        assert_eq!(
+            missing_effect.validate().unwrap_err(),
+            "CHILD_ADMISSION_IDENTITY_MISSING:effect_id"
+        );
+
+        let mut uppercase_revision = child_request();
+        uppercase_revision.parent_mission_revision_sha256 = "A".repeat(64);
+        assert_eq!(
+            uppercase_revision.validate().unwrap_err(),
+            "CHILD_ADMISSION_IDENTITY_INVALID:parent_mission_revision_sha256"
+        );
+    }
 }

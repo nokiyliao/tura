@@ -662,18 +662,53 @@ pub async fn register_child_session(
     Path(session_id): Path<String>,
     Json(payload): Json<RegisterChildSessionRequest>,
 ) -> impl IntoResponse {
-    let session = session_store().register_canonical_child_session(
-        &session_id,
-        &payload.child_session_id,
-        Some(payload.directory.clone()),
-        Some(payload.name.clone()),
-        Some(payload.task_instruction.clone()),
-    );
-    let session = match session {
-        Ok(session) => session,
-        Err(error) => return session_mutation_error(error),
-    };
-    Json(session).into_response()
+    if session_id != payload.parent_session_id {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_admission_parent_path_conflict",
+            })),
+        )
+            .into_response();
+    }
+    if let Err(error) = payload.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_admission_invalid",
+                "message": error,
+            })),
+        )
+            .into_response();
+    }
+    match RouterClient::global().register_child_session(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => {
+            let message = error.to_string();
+            let status = if message.contains("_CONFLICT")
+                || message.contains("EXISTING_CHILD_WITHOUT_IDENTITY")
+            {
+                StatusCode::CONFLICT
+            } else if message.contains("PARENT_SESSION_NOT_FOUND") {
+                StatusCode::NOT_FOUND
+            } else if message.contains("_MISSING") || message.contains("_INVALID") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "child_admission_failed",
+                    "message": message,
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 pub async fn update_session_status_for_runtime(

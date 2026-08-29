@@ -248,10 +248,4 @@ pub struct RuntimeSessionStatusRequest {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct RegisterChildSessionRequest {
-    pub child_session_id: String,
-    pub directory: String,
-    pub name: String,
-    pub task_instruction: String,
-}
+pub use router_contract::RegisterChildSessionRequest;

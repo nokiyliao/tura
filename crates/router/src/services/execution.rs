@@ -4,7 +4,7 @@
 //! cancel turns, but must not spawn runtime workers directly.
 
 use anyhow::{Result, anyhow};
-use lifecycle::{RuntimeAggregate, RuntimeId, RuntimeState, SessionState};
+use lifecycle::{RuntimeAggregate, RuntimeId, RuntimeState, SessionCommand, SessionState};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -14,26 +14,30 @@ use tokio::sync::{Notify, RwLock};
 use crate::ipc_handlers::enqueue_turn_identity;
 use crate::services::runtime_workers::{MAX_QUEUED_RUNTIME_TURNS, runtime_worker_limit};
 use crate::{AppState, dispatch_run_agent_with_runtime_slot};
-use router_contract::{CancelRuntimeRequest, EnqueueTurnRequest, IpcRequest, ProbeSessionsRequest};
+use router_contract::{
+    CancelRuntimeRequest, EnqueueTurnRequest, IpcRequest, ProbeSessionsRequest,
+    RegisterChildSessionOutcome, RegisterChildSessionRequest, RegisterChildSessionResponse,
+};
 use runtime_contract::{LifecycleExecutionContext, RunAgentRequest};
 use session_lifecycle::{
-    CallbackEffectIdentity, ContinuationDispatchRecord, ContinuationWriteOutcome,
-    DurableCallbackRecord, IntakeOutcome, LifecycleConfig, LiveEffectEvidence, ReclaimOutcome,
-    SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity, TerminalState,
-    commander_store_path,
+    CallbackEffectIdentity, ChildAdmissionOutcome, ChildAdmissionRecord,
+    ContinuationDispatchRecord, ContinuationWriteOutcome, DurableCallbackRecord, IntakeOutcome,
+    LifecycleConfig, LiveEffectEvidence, ReclaimOutcome, SessionLifecycleStore, TerminalReceipt,
+    TerminalReceiptIdentity, TerminalState, canonical_value_sha256, commander_store_path,
 };
 use session_log_contract::{
-    ActivateRuntimeLeaseRequest, GetRuntimeLeaseRequest, GetSessionRequest,
+    ActivateRuntimeLeaseRequest, CreateSessionRequest, GetRuntimeLeaseRequest, GetSessionRequest,
     RecoveryCloseRuntimeOutcome, RecoveryCloseRuntimeReason, RecoveryCloseRuntimeRequest,
     RegisterRuntimeRequest, ReplayRuntimeRequest, RuntimeLeaseOutcome, RuntimeLeaseSnapshot,
     RuntimeLifecycleIdentity, RuntimeRecoveryQuiescenceProof, RuntimeRecoveryReceipt,
     RuntimeRegistrationOutcome, SessionFeedEntry, SessionFeedEvent, SessionLogCommand,
-    SessionLogResponse, recovery_terminal_projection_event_id,
+    SessionLogResponse, SessionSnapshot, recovery_terminal_projection_event_id,
 };
 
 #[derive(Clone)]
 pub struct ExecutionService {
     admission: Arc<RwLock<()>>,
+    child_admission: Arc<tokio::sync::Mutex<()>>,
     sessions: Arc<Mutex<HashMap<String, RuntimeLease>>>,
     runtime_slots: RuntimeSlotGate,
     retained_slots: Arc<Mutex<HashMap<String, RuntimeSlotPermit>>>,
@@ -96,6 +100,7 @@ impl ExecutionService {
     pub fn new() -> Self {
         Self {
             admission: Arc::new(RwLock::new(())),
+            child_admission: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             runtime_slots: RuntimeSlotGate::default(),
             retained_slots: Arc::new(Mutex::new(HashMap::new())),
@@ -112,6 +117,77 @@ impl ExecutionService {
         let lease_id = format!("lease-{}", uuid::Uuid::new_v4());
         self.enqueue_turn_request_with_identity(state, input, request_id, lease_id, None)
             .await
+    }
+
+    pub async fn register_child_session_request(
+        &self,
+        state: &AppState,
+        input: Value,
+    ) -> Result<Value> {
+        let request: RegisterChildSessionRequest = serde_json::from_value(input)?;
+        request.validate().map_err(anyhow::Error::msg)?;
+        let _admission = self.child_admission.lock().await;
+        state.session_db.start()?;
+
+        let parent = read_session_snapshot(&request.parent_session_id)?
+            .ok_or_else(|| anyhow!("CHILD_ADMISSION_PARENT_SESSION_NOT_FOUND:{}", request.parent_session_id))?;
+        let existing_child = read_session_snapshot(&request.child_session_id)?;
+        let store = lifecycle_store(&request.parent_session_id)?;
+        if existing_child.is_some() && store.child_admission(&request.child_session_id)?.is_none() {
+            return Err(anyhow!(
+                "CHILD_ADMISSION_EXISTING_CHILD_WITHOUT_IDENTITY:{}",
+                request.child_session_id
+            ));
+        }
+
+        let record = child_admission_record(&request);
+        let admitted = store.admit_child(&record)?;
+        match existing_child {
+            Some(child) => ensure_child_parent_identity(&child, &request.parent_session_id)?,
+            None => create_child_session(&parent, &request)?,
+        }
+
+        if !child_runtime_is_registered(&request)? {
+            let payload = child_execution_payload(&request)?;
+            let response = self
+                .enqueue_turn_request_with_identity(
+                    state,
+                    serde_json::to_value(EnqueueTurnRequest {
+                        runtime_id: request.child_runtime_id.clone(),
+                        session_id: request.child_session_id.clone(),
+                        payload,
+                    })?,
+                    &request.child_transaction_id,
+                    request.child_lease_id.clone(),
+                    None,
+                )
+                .await?;
+            if response.get("ok").and_then(Value::as_bool) == Some(false) {
+                return Err(anyhow!(
+                    "CHILD_ADMISSION_EXECUTION_REJECTED:{}",
+                    response
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("router execution rejected")
+                ));
+            }
+        }
+
+        serde_json::to_value(RegisterChildSessionResponse {
+            outcome: match admitted {
+                ChildAdmissionOutcome::Admitted => RegisterChildSessionOutcome::Admitted,
+                ChildAdmissionOutcome::AlreadyAdmitted => {
+                    RegisterChildSessionOutcome::AlreadyAdmitted
+                }
+            },
+            parent_session_id: request.parent_session_id,
+            child_session_id: request.child_session_id,
+            child_runtime_id: request.child_runtime_id,
+            child_transaction_id: request.child_transaction_id,
+            callback_request_id: request.callback_request_id,
+            effect_id: request.effect_id,
+        })
+        .map_err(Into::into)
     }
 
     async fn enqueue_turn_request_with_identity(
@@ -1186,6 +1262,27 @@ impl ExecutionService {
                 )
             })?
             .to_string();
+        if let Some(admission) = store.child_admission(&receipt.child_session_id)? {
+            if admission.parent_session_id != receipt.commander_session_id
+                || admission.parent_mission_revision_sha256 != parent_mission_revision_sha256
+                || admission.child_runtime_id != receipt.runtime_id
+                || admission.child_transaction_id != receipt.transaction_id
+                || admission.child_lease_id != receipt.lease_id
+                || admission.callback_request_id != receipt.transaction_id
+                || admission.delegated_input_sha256 != delegated_input_sha256
+            {
+                return Err(anyhow!(
+                    "TERMINAL_CALLBACK_ADMISSION_IDENTITY_MISMATCH:{}",
+                    receipt.child_session_id
+                ));
+            }
+            if admission.effect_id != effect_id {
+                return Err(anyhow!(
+                    "TERMINAL_CALLBACK_EFFECT_IDENTITY_CONFLICT:expected={},actual={effect_id}",
+                    admission.effect_id
+                ));
+            }
+        }
         let record = DurableCallbackRecord::new(
             &receipt,
             callback_payload,
@@ -2331,6 +2428,177 @@ fn validate_delegated_input_digest(request: &mut RunAgentRequest, delegated: boo
     Ok(())
 }
 
+fn read_session_snapshot(session_id: &str) -> Result<Option<SessionSnapshot>> {
+    match session_log_contract::client::call_service(&SessionLogCommand::GetSession(
+        GetSessionRequest {
+            session_id: session_id.to_string(),
+        },
+    ))? {
+        SessionLogResponse::Session { session } => Ok(session.map(|session| *session)),
+        SessionLogResponse::Error { error } => Err(anyhow!(error)),
+        other => Err(anyhow!(
+            "unexpected session_db response while reading {session_id}: {other:?}"
+        )),
+    }
+}
+
+fn create_child_session(
+    parent: &SessionSnapshot,
+    request: &RegisterChildSessionRequest,
+) -> Result<()> {
+    let metadata = &parent.metadata;
+    let command = SessionLogCommand::CreateSession(Box::new(CreateSessionRequest {
+        command_id: format!("child-admission-create-{}", request.callback_request_id),
+        session_id: request.child_session_id.clone(),
+        creation_command: SessionCommand::RegisterChildSession {
+            parent_id: request.parent_session_id.clone(),
+        },
+        copy_context: false,
+        workspace: parent.workspace.clone(),
+        session_directory: request.session_directory.clone(),
+        name: request.session_name.clone(),
+        created_at: request.created_at_ms,
+        model: metadata.model.clone(),
+        agent: metadata.agent.clone(),
+        session_type: metadata.session_type.clone(),
+        kill_processes_on_start: metadata.kill_processes_on_start,
+        validator_enabled: metadata.validator_enabled,
+        force_planning: metadata.force_planning,
+        model_variant: metadata.model_variant.clone(),
+        model_acceleration_enabled: metadata.model_acceleration_enabled,
+        disable_permission_restrictions: metadata.disable_permission_restrictions,
+        use_last_tool_call_response: metadata.use_last_tool_call_response,
+        auto_session_name: false,
+        initial_task_plan_patch: None,
+    }));
+    match session_log_contract::client::call_service(&command)? {
+        SessionLogResponse::SessionCommandApplied { result }
+            if result.projection.parent_id.as_deref()
+                == Some(request.parent_session_id.as_str()) =>
+        {
+            Ok(())
+        }
+        SessionLogResponse::SessionCommandApplied { .. } => Err(anyhow!(
+            "CHILD_ADMISSION_PARENT_IDENTITY_MISMATCH:{}",
+            request.child_session_id
+        )),
+        SessionLogResponse::Error { error } => Err(anyhow!(error)),
+        other => Err(anyhow!(
+            "unexpected session_db child creation response: {other:?}"
+        )),
+    }
+}
+
+fn ensure_child_parent_identity(child: &SessionSnapshot, parent_session_id: &str) -> Result<()> {
+    if child.lifecycle_projection.parent_id.as_deref() == Some(parent_session_id) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "CHILD_ADMISSION_PARENT_IDENTITY_MISMATCH:{}",
+        child.session_id
+    ))
+}
+
+fn child_runtime_is_registered(request: &RegisterChildSessionRequest) -> Result<bool> {
+    match session_log_contract::client::call_service(&SessionLogCommand::GetRuntimeLease(
+        GetRuntimeLeaseRequest {
+            runtime_id: request.child_runtime_id.clone(),
+            database_path: None,
+        },
+    ))? {
+        SessionLogResponse::RuntimeLeaseRead {
+            runtime: Some(runtime),
+        } => {
+            validate_child_runtime_identity(&runtime, request)?;
+            Ok(true)
+        }
+        SessionLogResponse::RuntimeLeaseRead { runtime: None } => Ok(false),
+        SessionLogResponse::Error { error } => Err(anyhow!(error)),
+        other => Err(anyhow!(
+            "unexpected session_db runtime read response for {}: {other:?}",
+            request.child_runtime_id
+        )),
+    }
+}
+
+fn validate_child_runtime_identity(
+    runtime: &RuntimeLeaseSnapshot,
+    request: &RegisterChildSessionRequest,
+) -> Result<()> {
+    let lifecycle = runtime.lifecycle.as_ref();
+    let exact = runtime.runtime_id == request.child_runtime_id
+        && runtime.session_id == request.child_session_id
+        && runtime.lease_id.as_deref() == Some(request.child_lease_id.as_str())
+        && lifecycle.is_some_and(|identity| {
+            identity.commander_session_id == request.parent_session_id
+                && identity.transaction_id == request.child_transaction_id
+                && identity.parent_mission_revision_sha256.as_deref()
+                    == Some(request.parent_mission_revision_sha256.as_str())
+                && identity.delegated_input_sha256.as_deref()
+                    == Some(request.delegated_input_sha256.as_str())
+                && identity.dispatch_runtime_id == request.child_runtime_id
+                && identity.dispatch_lease_id == request.child_lease_id
+        });
+    if exact {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "CHILD_ADMISSION_RUNTIME_IDENTITY_CONFLICT:{}",
+            request.child_runtime_id
+        ))
+    }
+}
+
+fn child_admission_record(request: &RegisterChildSessionRequest) -> ChildAdmissionRecord {
+    ChildAdmissionRecord::new(
+        &request.parent_session_id,
+        &request.parent_mission_revision_sha256,
+        &request.child_session_id,
+        &request.child_runtime_id,
+        &request.child_transaction_id,
+        &request.child_lease_id,
+        &request.callback_request_id,
+        &request.effect_id,
+        &request.delegated_input_sha256,
+        canonical_value_sha256(&request.execution_payload),
+        &request.session_directory,
+        &request.session_name,
+        request.created_at_ms,
+    )
+}
+
+fn child_execution_payload(request: &RegisterChildSessionRequest) -> Result<Value> {
+    let mut payload = request.execution_payload.clone();
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("CHILD_ADMISSION_PAYLOAD_INVALID:execution_payload"))?;
+    object.insert(
+        "parent_session_id".to_string(),
+        Value::String(request.parent_session_id.clone()),
+    );
+    object.insert(
+        "parent_mission_revision_sha256".to_string(),
+        Value::String(request.parent_mission_revision_sha256.clone()),
+    );
+    object.insert(
+        "delegated_input_sha256".to_string(),
+        Value::String(request.delegated_input_sha256.clone()),
+    );
+    object.insert(
+        "lifecycle".to_string(),
+        json!({
+            "transaction_id": request.child_transaction_id,
+            "commander_session_id": request.parent_session_id,
+            "parent_mission_revision_sha256": request.parent_mission_revision_sha256,
+            "delegated_input_sha256": request.delegated_input_sha256,
+            "task_id": null,
+            "goal_id": null,
+            "operator_override": false,
+        }),
+    );
+    Ok(payload)
+}
+
 fn validate_terminalization_identity(
     snapshot: &RuntimeLeaseSnapshot,
     lease: &RuntimeLease,
@@ -2678,7 +2946,7 @@ mod tests {
         replay_terminal_callbacks_from_store, require_successful_runtime_dispatch,
         runtime_lease_from_snapshot, runtime_terminal_state_from_snapshot,
         terminal_runtime_is_current, validate_delegated_input_digest,
-        validate_terminalization_identity,
+        validate_child_runtime_identity, validate_terminalization_identity,
     };
     use crate::{build_state, services::manager::ServiceManager};
     use lifecycle::{RuntimeState, SessionProjection, SessionState, TaskPlan};
@@ -2991,6 +3259,63 @@ mod tests {
                 .expect_err("lease drift must fail closed")
                 .to_string()
                 .contains("RUNTIME_TERMINALIZATION_DURABLE_IDENTITY_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn child_runtime_replay_requires_exact_durable_lifecycle_identity() {
+        let request = router_contract::RegisterChildSessionRequest {
+            parent_session_id: "commander-exact".to_string(),
+            parent_mission_revision_sha256: "a".repeat(64),
+            child_session_id: "child-exact".to_string(),
+            child_runtime_id: "runtime-exact".to_string(),
+            child_transaction_id: "transaction-exact".to_string(),
+            child_lease_id: "lease-exact".to_string(),
+            callback_request_id: "transaction-exact".to_string(),
+            effect_id: "effect-exact".to_string(),
+            delegated_input_sha256: "b".repeat(64),
+            session_directory: "/tmp/child-exact".to_string(),
+            session_name: "child exact".to_string(),
+            created_at_ms: 1_786_845_600_000,
+            execution_payload: json!({"prompt": "delegated prompt"}),
+        };
+        let lifecycle = RuntimeLifecycleIdentity {
+            commander_session_id: request.parent_session_id.clone(),
+            transaction_id: request.child_transaction_id.clone(),
+            parent_mission_revision_sha256: Some(
+                request.parent_mission_revision_sha256.clone(),
+            ),
+            delegated_input_sha256: Some(request.delegated_input_sha256.clone()),
+            task_id: None,
+            goal_id: None,
+            operator_override: false,
+            dispatch_runtime_id: request.child_runtime_id.clone(),
+            dispatch_lease_id: request.child_lease_id.clone(),
+            receipt_event_seq: 0,
+        };
+        let mut snapshot = RuntimeLeaseSnapshot {
+            database_path: "/tmp/session.sqlite3".to_string(),
+            runtime_id: request.child_runtime_id.clone(),
+            session_id: request.child_session_id.clone(),
+            lifecycle: Some(lifecycle),
+            lease_id: Some(request.child_lease_id.clone()),
+            lease_active: false,
+            revision: 1,
+            last_event_seq: 1,
+            terminal: true,
+            session_event_seq: 1,
+            session_state: SessionState::Running,
+            runtime_state: Some(RuntimeState::Cancelled),
+        };
+        validate_child_runtime_identity(&snapshot, &request)
+            .expect("exact runtime replay identity");
+
+        snapshot.lease_id = Some("changed-lease".to_string());
+        assert!(
+            validate_child_runtime_identity(&snapshot, &request)
+                .expect_err("changed runtime lease must conflict")
+                .to_string()
+                .contains("CHILD_ADMISSION_RUNTIME_IDENTITY_CONFLICT")
         );
     }
 
