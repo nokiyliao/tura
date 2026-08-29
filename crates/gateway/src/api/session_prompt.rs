@@ -973,11 +973,16 @@ fn prompt_source_is_cli(payload: &serde_json::Value) -> bool {
 
 fn normalize_model_override(value: String) -> Option<String> {
     let trimmed = value.trim();
-    let (provider, model) = trimmed.split_once('/')?;
+    if trimmed.is_empty() {
+        return None;
+    }
+    let Some((provider, model)) = trimmed.split_once('/') else {
+        return Some(trimmed.to_string());
+    };
     let provider = provider.trim();
     let model = model.trim();
     if provider.is_empty() || model.is_empty() {
-        return None;
+        return Some(trimmed.to_string());
     }
     let provider = match provider {
         "openai-api" => "openai",
@@ -1294,6 +1299,30 @@ mod tests {
             )
             .as_deref(),
             Some("codex/gpt-5.6-terra")
+        );
+    }
+
+    #[test]
+    fn runtime_model_override_preserves_non_empty_malformed_explicit_values() {
+        assert_eq!(
+            prompt_runtime_model_override(
+                &serde_json::json!({ "model": "missing-route" }),
+                Some("official_codex_app_server/gpt-5.6-sol".to_string()),
+            )
+            .as_deref(),
+            Some("missing-route")
+        );
+        assert_eq!(
+            prompt_runtime_model_override(
+                &serde_json::json!({}),
+                Some("missing-provider/".to_string()),
+            )
+            .as_deref(),
+            Some("missing-provider/")
+        );
+        assert_eq!(
+            prompt_runtime_model_override(&serde_json::json!({ "model": "   " }), None),
+            None
         );
     }
 
