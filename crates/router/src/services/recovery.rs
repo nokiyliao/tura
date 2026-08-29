@@ -96,14 +96,15 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                                     .historical_terminal_state_mismatch(&snapshot)? =>
                         {
                             recovered.push(quarantined_historical_terminal_mismatch_result(
-                                &snapshot,
-                                &error,
+                                &snapshot, &error,
                             ));
                             None
                         }
                         Err(error) => return Err(error),
                     }
                 {
+                    let continuation_recovery =
+                        recover_parent_continuations(state, &delivery).await?;
                     recovered.push(json!({
                         "runtime_id": snapshot.runtime_id,
                         "session_id": snapshot.session_id,
@@ -112,6 +113,7 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                         "event_id": delivery.event_id,
                         "terminal": true,
                         "lease_active": false,
+                        "parent_continuation": continuation_recovery,
                     }));
                 }
                 continue;
@@ -186,6 +188,11 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                     } else {
                         None
                     };
+                    let continuation_recovery = if let Some(delivery) = delivery.as_ref() {
+                        recover_parent_continuations(state, delivery).await?
+                    } else {
+                        Vec::new()
+                    };
                     recovered.push(json!({
                                 "runtime_id": receipt.runtime_id,
                                 "session_id": receipt.session_id,
@@ -195,8 +202,10 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                                 "lease_active": receipt.lease_active,
                                 "callback_transaction_id": delivery.as_ref().map(|value| &value.transaction_id),
                                 "callback_event_id": delivery.as_ref().map(|value| &value.event_id),
+                                "parent_continuation": continuation_recovery,
                             }));
                 }
+
                 other => {
                     bail!(
                         "STARTUP_RUNTIME_RECOVERY_NOT_TERMINAL:{}:{other:?}",
@@ -213,6 +222,32 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
     }
 
     Ok((inspected, recovered))
+}
+
+async fn recover_parent_continuations(
+    state: &AppState,
+    delivery: &crate::services::execution::TerminalDeliveryIdentity,
+) -> Result<Vec<Value>> {
+    match state
+        .execution
+        .recover_callback_continuations(state, &delivery.commander_session_id)
+        .await
+    {
+        Ok(recovered) => Ok(recovered),
+        Err(error)
+            if error
+                .to_string()
+                .starts_with("CONTINUATION_UNSETTLED_EFFECT_BLOCKED:") =>
+        {
+            Ok(vec![json!({
+                "status": "withheld_unsettled_effect",
+                "transaction_id": delivery.transaction_id,
+                "event_id": delivery.event_id,
+                "acknowledged": false,
+            })])
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn read_runtime_snapshot(
@@ -451,7 +486,10 @@ mod tests {
                 "RUNTIME_CALLBACK_SESSION_STATE_MISMATCH:runtime=runtime-old,snapshot=Completed,projection=Interrupted"
             ),
         );
-        assert_eq!(result["recovery_action"], "quarantined_historical_terminal_mismatch");
+        assert_eq!(
+            result["recovery_action"],
+            "quarantined_historical_terminal_mismatch"
+        );
         assert_eq!(result["effect_authorized"], false);
         assert_eq!(result["terminal"], true);
         assert_eq!(result["lease_active"], false);

@@ -11,14 +11,16 @@ use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{Notify, RwLock};
 
+use crate::ipc_handlers::enqueue_turn_identity;
 use crate::services::runtime_workers::{MAX_QUEUED_RUNTIME_TURNS, runtime_worker_limit};
 use crate::{AppState, dispatch_run_agent_with_runtime_slot};
-use router_contract::{CancelRuntimeRequest, EnqueueTurnRequest, ProbeSessionsRequest};
+use router_contract::{CancelRuntimeRequest, EnqueueTurnRequest, IpcRequest, ProbeSessionsRequest};
 use runtime_contract::{LifecycleExecutionContext, RunAgentRequest};
 use session_lifecycle::{
-    CallbackEffectIdentity, DurableCallbackRecord, IntakeOutcome, LifecycleConfig,
-    LiveEffectEvidence, ReclaimOutcome, SessionLifecycleStore, TerminalReceipt,
-    TerminalReceiptIdentity, TerminalState, commander_store_path,
+    CallbackEffectIdentity, ContinuationDispatchRecord, ContinuationWriteOutcome,
+    DurableCallbackRecord, IntakeOutcome, LifecycleConfig, LiveEffectEvidence, ReclaimOutcome,
+    SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity, TerminalState,
+    commander_store_path,
 };
 use session_log_contract::{
     ActivateRuntimeLeaseRequest, GetRuntimeLeaseRequest, GetSessionRequest,
@@ -107,12 +109,24 @@ impl ExecutionService {
         input: Value,
         request_id: &str,
     ) -> Result<Value> {
+        let lease_id = format!("lease-{}", uuid::Uuid::new_v4());
+        self.enqueue_turn_request_with_identity(state, input, request_id, lease_id, None)
+            .await
+    }
+
+    async fn enqueue_turn_request_with_identity(
+        &self,
+        state: &AppState,
+        input: Value,
+        request_id: &str,
+        lease_id: String,
+        continuation: Option<ContinuationDispatchRecord>,
+    ) -> Result<Value> {
         let _admission = self.admission.read().await;
         let request: EnqueueTurnRequest = serde_json::from_value(input)?;
         if let Some(active) = self.sessions.lock().get(&request.session_id) {
             return Ok(active_turn_conflict(&request.session_id, active));
         }
-        let lease_id = format!("lease-{}", uuid::Uuid::new_v4());
         state.session_db.start()?;
         let mut run_request = payload_to_run_agent_request(&request, &lease_id, None)?;
         let requested_prompt = run_request.effective_prompt();
@@ -128,10 +142,7 @@ impl ExecutionService {
             .parent_session_id
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty());
-        validate_delegated_input_digest(
-            &mut run_request,
-            delegated,
-        )?;
+        validate_delegated_input_digest(&mut run_request, delegated)?;
         run_request
             .validate_delegated_identity()
             .map_err(anyhow::Error::msg)?;
@@ -232,6 +243,10 @@ impl ExecutionService {
             fallback_from_id,
             Some(durable_lifecycle),
         )?;
+        if let Some(record) = continuation.as_ref() {
+            let store = lifecycle_store(&record.commander_session_id)?;
+            commit_and_ack_callback_continuation(&store, record)?;
+        }
         if debug_runtime_enabled() {
             eprintln!(
                 "router debug: enqueue_turn dispatch session_id={}",
@@ -953,6 +968,134 @@ impl ExecutionService {
         Ok(())
     }
 
+    pub(crate) async fn continue_terminal_delivery(
+        &self,
+        state: &AppState,
+        delivery: &TerminalDeliveryIdentity,
+    ) -> Result<Value> {
+        let store = lifecycle_store(&delivery.commander_session_id)?;
+        let persisted = store
+            .callback_continuations_for_replay()?
+            .into_iter()
+            .find(|record| {
+                record.child_transaction_id == delivery.transaction_id
+                    && record.child_event_id == delivery.event_id
+            });
+        let continuation = if let Some(record) = persisted {
+            record
+        } else {
+            let callback = store
+                .callbacks_for_replay()?
+                .into_iter()
+                .find(|record| {
+                    record.transaction_id == delivery.transaction_id
+                        && record.event_id == delivery.event_id
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "PERSISTED_CALLBACK_FOR_CONTINUATION_NOT_FOUND:{}:{}",
+                        delivery.transaction_id,
+                        delivery.event_id
+                    )
+                })?;
+            ContinuationDispatchRecord::from_callback(&callback)?
+        };
+        match store.prepare_callback_continuation(&continuation)? {
+            ContinuationWriteOutcome::AlreadyAcknowledged => {
+                return Ok(continuation_result(&continuation, "already_acknowledged"));
+            }
+            ContinuationWriteOutcome::AlreadyCommitted => {
+                commit_and_ack_callback_continuation(&store, &continuation)?;
+                return Ok(continuation_result(
+                    &continuation,
+                    "acknowledged_after_restart",
+                ));
+            }
+            ContinuationWriteOutcome::Prepared | ContinuationWriteOutcome::AlreadyPrepared => {}
+        }
+        let prompt = serde_json::to_string(&continuation.parent_input)?;
+        let input = json!({
+            "runtime_id": continuation.runtime_id,
+            "session_id": continuation.commander_session_id,
+            "payload": {
+                "prompt": prompt,
+                "operator_override": false
+            }
+        });
+        let request_id = continuation.request_id.clone();
+        let internal_request = IpcRequest {
+            request_id: request_id.clone(),
+            kind: "call".to_string(),
+            method: "execution.enqueue_turn".to_string(),
+            payload: input,
+            deadline_ms: None,
+        };
+        let identity = enqueue_turn_identity(&internal_request)
+            .ok_or_else(|| anyhow!("CONTINUATION_ENQUEUE_IDENTITY_MISSING:{request_id}"))?;
+        if identity.commander_session_id != continuation.commander_session_id
+            || identity.child_session_id != continuation.commander_session_id
+            || identity.runtime_id != continuation.runtime_id
+            || identity.transaction_id != continuation.request_id
+        {
+            return Err(anyhow!(
+                "CONTINUATION_ENQUEUE_IDENTITY_MISMATCH:{}",
+                continuation.request_id
+            ));
+        }
+        self.enqueue_turn_request_with_identity(
+            state,
+            internal_request.payload,
+            &request_id,
+            continuation.lease_id.clone(),
+            Some(continuation),
+        )
+        .await
+    }
+
+    pub(crate) async fn recover_callback_continuations(
+        &self,
+        state: &AppState,
+        commander_session_id: &str,
+    ) -> Result<Vec<Value>> {
+        let Some(store) = lifecycle_store_if_exists(commander_session_id)? else {
+            return Ok(Vec::new());
+        };
+        let callbacks = store.callbacks_for_replay()?;
+        let continuations = store.callback_continuations_for_replay()?;
+        let mut deliveries = Vec::new();
+        for callback in callbacks {
+            deliveries.push(TerminalDeliveryIdentity {
+                commander_session_id: callback.commander_session_id.clone(),
+                transaction_id: callback.transaction_id.clone(),
+                event_id: callback.event_id.clone(),
+                runtime_id: callback.runtime_id.clone(),
+                callback_payload_sha256: Some(callback.callback_payload_sha256.clone()),
+                callback_effect_identity: Some(callback.effect_identity.clone()),
+            });
+        }
+        for continuation in continuations {
+            if deliveries.iter().any(|delivery| {
+                delivery.transaction_id == continuation.child_transaction_id
+                    && delivery.event_id == continuation.child_event_id
+            }) {
+                continue;
+            }
+            deliveries.push(TerminalDeliveryIdentity {
+                commander_session_id: continuation.commander_session_id.clone(),
+                transaction_id: continuation.child_transaction_id.clone(),
+                event_id: continuation.child_event_id.clone(),
+                runtime_id: continuation.child_runtime_id.clone(),
+                callback_payload_sha256: Some(continuation.callback_payload_sha256.clone()),
+                callback_effect_identity: Some(continuation.effect_identity.clone()),
+            });
+        }
+        let mut recovered = Vec::new();
+        for delivery in deliveries {
+            recovered.push(self.continue_terminal_delivery(state, &delivery).await?);
+        }
+        Ok(recovered)
+    }
+
     pub(crate) fn publish_terminal_callback(
         &self,
         mut delivery: TerminalDeliveryIdentity,
@@ -1629,6 +1772,36 @@ impl ExecutionService {
             notified.await;
         }
     }
+}
+
+fn continuation_result(record: &ContinuationDispatchRecord, status: &str) -> Value {
+    json!({
+        "status": status,
+        "request_id": record.request_id,
+        "runtime_id": record.runtime_id,
+        "lease_id": record.lease_id,
+        "session_id": record.commander_session_id,
+    })
+}
+
+fn commit_and_ack_callback_continuation(
+    store: &SessionLifecycleStore,
+    record: &ContinuationDispatchRecord,
+) -> Result<()> {
+    store.mark_callback_continuation_committed(record)?;
+    store.acknowledge_callback(
+        &record.child_transaction_id,
+        &record.child_event_id,
+        &record.callback_payload_sha256,
+        &record.effect_identity,
+    )?;
+    store.acknowledge(
+        &record.child_transaction_id,
+        &record.child_event_id,
+        &record.request_id,
+    )?;
+    store.mark_callback_continuation_acknowledged(record)?;
+    Ok(())
 }
 
 fn replay_terminal_callbacks_from_store(
@@ -2435,21 +2608,21 @@ mod tests {
     use super::{
         EnqueueTurnRequest, ExecutionService, RetryRuntimeIdentity,
         RouterRecoveryCloseRuntimeRequest, RuntimeLease, TerminalDeliveryIdentity,
-        failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
-        is_historical_terminal_runtime, payload_to_run_agent_request,
-        publish_terminal_failure_callback_from_store, replay_terminal_callbacks_from_store,
-        runtime_lease_from_snapshot, runtime_terminal_state_from_snapshot,
-        terminal_runtime_is_current, validate_delegated_input_digest,
-        validate_terminalization_identity,
+        commit_and_ack_callback_continuation, failed_session_retry_root,
+        failed_session_runtime_fallback, intake_terminal_receipt, is_historical_terminal_runtime,
+        payload_to_run_agent_request, publish_terminal_failure_callback_from_store,
+        replay_terminal_callbacks_from_store, runtime_lease_from_snapshot,
+        runtime_terminal_state_from_snapshot, terminal_runtime_is_current,
+        validate_delegated_input_digest, validate_terminalization_identity,
     };
     use crate::{build_state, services::manager::ServiceManager};
     use lifecycle::{RuntimeState, SessionProjection, SessionState, TaskPlan};
+    use runtime_contract::RunAgentRequest;
     use serde_json::json;
     use session_lifecycle::{
-        CallbackEffectIdentity, DurableCallbackRecord, LifecycleConfig, SessionLifecycleStore,
-        TerminalReceipt, TerminalReceiptIdentity, TerminalState,
+        CallbackEffectIdentity, ContinuationDispatchRecord, DurableCallbackRecord, LifecycleConfig,
+        SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity, TerminalState,
     };
-    use runtime_contract::RunAgentRequest;
     use session_log_contract::{
         RuntimeLeaseSnapshot, RuntimeLifecycleIdentity, SessionFeedEntry, SessionFeedEvent,
     };
@@ -3616,6 +3789,119 @@ mod tests {
         .expect("restart replay without lease");
         assert_eq!(duplicate, first);
         assert_eq!(store.readback().expect("readback").intaken_callbacks, 1);
+    }
+
+    #[test]
+    fn callback_continuation_commits_and_acks_exactly_once() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Completed);
+        let callback = DurableCallbackRecord::new(
+            &store
+                .terminal_receipt(&delivery.transaction_id, &delivery.event_id)
+                .expect("receipt"),
+            json!("child result"),
+            json!({"kind": "gateway.callback", "payload": {"body": {"item": {"id": "message-1", "text": "child result"}}}}),
+            "a".repeat(64),
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            CallbackEffectIdentity::Exact {
+                effect_id: "message-1".to_string(),
+            },
+        )
+        .expect("callback");
+        store.publish_callback(&callback).expect("publish callback");
+        store
+            .mark_callback_intaken(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+            )
+            .expect("intake callback");
+        let continuation =
+            ContinuationDispatchRecord::from_callback(&callback).expect("continuation");
+        store
+            .prepare_callback_continuation(&continuation)
+            .expect("prepare continuation");
+
+        commit_and_ack_callback_continuation(&store, &continuation).expect("first commitment");
+        commit_and_ack_callback_continuation(&store, &continuation).expect("duplicate replay");
+
+        let readback = store.readback().expect("readback");
+        assert_eq!(readback.acknowledged_callbacks, 1);
+        assert_eq!(readback.acknowledged_receipts, 1);
+        assert!(
+            store
+                .callbacks_for_replay()
+                .expect("callback replay")
+                .is_empty()
+        );
+        assert!(
+            store
+                .callback_continuations_for_replay()
+                .expect("continuation replay")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn callback_continuation_restart_finishes_ack_without_second_commitment() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Completed);
+        let callback = DurableCallbackRecord::new(
+            &store
+                .terminal_receipt(&delivery.transaction_id, &delivery.event_id)
+                .expect("receipt"),
+            json!("child result"),
+            json!({"kind": "gateway.callback", "payload": {"body": {"item": {"id": "message-1", "text": "child result"}}}}),
+            "a".repeat(64),
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            CallbackEffectIdentity::Exact {
+                effect_id: "message-1".to_string(),
+            },
+        )
+        .expect("callback");
+        store.publish_callback(&callback).expect("publish callback");
+        store
+            .mark_callback_intaken(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+            )
+            .expect("intake callback");
+        let continuation =
+            ContinuationDispatchRecord::from_callback(&callback).expect("continuation");
+        store
+            .prepare_callback_continuation(&continuation)
+            .expect("prepare continuation");
+        store
+            .mark_callback_continuation_committed(&continuation)
+            .expect("durable parent commitment before crash");
+        drop(store);
+
+        let reopened = SessionLifecycleStore::open(
+            root.path(),
+            "commander-callback",
+            LifecycleConfig::default(),
+        )
+        .expect("reopen after restart");
+        commit_and_ack_callback_continuation(&reopened, &continuation)
+            .expect("restart finishes ack");
+        assert_eq!(
+            reopened
+                .readback()
+                .expect("readback")
+                .acknowledged_callbacks,
+            1
+        );
+        assert_eq!(
+            reopened.readback().expect("readback").acknowledged_receipts,
+            1
+        );
+        assert!(
+            reopened
+                .callback_continuations_for_replay()
+                .expect("continuation replay")
+                .is_empty()
+        );
     }
 
     #[test]

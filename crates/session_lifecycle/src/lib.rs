@@ -24,6 +24,7 @@ const STORED_RECEIPT_SCHEMA: &str = "tura_stored_terminal_receipt_v1";
 const ACK_SCHEMA: &str = "tura_terminal_receipt_ack_v1";
 const CALLBACK_SCHEMA: &str = "tura_durable_terminal_callback_v1";
 const CALLBACK_ACK_SCHEMA: &str = "tura_durable_terminal_callback_ack_v1";
+const CONTINUATION_SCHEMA: &str = "tura_callback_continuation_dispatch_v1";
 const RELEASE_SCHEMA: &str = "tura_terminal_slot_release_v1";
 const BLOCKER_SCHEMA: &str = "tura_session_lifecycle_blocker_v1";
 const RECONCILE_SCHEMA: &str = "tura_session_lifecycle_reconcile_v1";
@@ -268,6 +269,95 @@ pub enum CallbackWriteOutcome {
 pub enum CallbackIntakeOutcome {
     Intaken,
     AlreadyIntaken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationDispatchState {
+    Prepared,
+    Committed,
+    Acknowledged,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContinuationDispatchRecord {
+    pub schema_version: String,
+    pub request_id: String,
+    pub runtime_id: String,
+    pub lease_id: String,
+    pub commander_session_id: String,
+    pub child_session_id: String,
+    pub child_transaction_id: String,
+    pub child_event_id: String,
+    pub child_runtime_id: String,
+    pub callback_payload_sha256: String,
+    pub parent_mission_revision_sha256: String,
+    pub delegated_input_sha256: String,
+    pub effect_identity: CallbackEffectIdentity,
+    pub parent_input: Value,
+    pub state: ContinuationDispatchState,
+}
+
+impl ContinuationDispatchRecord {
+    pub fn from_callback(callback: &DurableCallbackRecord) -> LifecycleResult<Self> {
+        if matches!(
+            callback.effect_identity,
+            CallbackEffectIdentity::UnsettledEffect { .. }
+        ) {
+            return Err(LifecycleBlocker::new(
+                "CONTINUATION_UNSETTLED_EFFECT_BLOCKED",
+                &callback.event_id,
+            ));
+        }
+        let digest = continuation_identity_sha256(callback)?;
+        let requested_action = if callback.terminal_state == TerminalState::Completed {
+            "MISSION_VERIFICATION"
+        } else {
+            "ROUTE_SELECTION"
+        };
+        let parent_input = serde_json::json!({
+            "schema_version": "tura_internal_callback_continuation_v1",
+            "authority": "none",
+            "requested_action": requested_action,
+            "callback": {
+                "child_session_id": &callback.child_session_id,
+                "transaction_id": &callback.transaction_id,
+                "event_id": &callback.event_id,
+                "runtime_id": &callback.runtime_id,
+                "terminal_state": callback.terminal_state,
+                "callback_payload_sha256": &callback.callback_payload_sha256,
+                "parent_mission_revision_sha256": &callback.parent_mission_revision_sha256,
+                "delegated_input_sha256": &callback.delegated_input_sha256,
+                "effect_identity": &callback.effect_identity,
+            }
+        });
+        Ok(Self {
+            schema_version: CONTINUATION_SCHEMA.to_string(),
+            request_id: format!("callback-continuation-request-{digest}"),
+            runtime_id: format!("callback-continuation-runtime-{digest}"),
+            lease_id: format!("callback-continuation-lease-{digest}"),
+            commander_session_id: callback.commander_session_id.clone(),
+            child_session_id: callback.child_session_id.clone(),
+            child_transaction_id: callback.transaction_id.clone(),
+            child_event_id: callback.event_id.clone(),
+            child_runtime_id: callback.runtime_id.clone(),
+            callback_payload_sha256: callback.callback_payload_sha256.clone(),
+            parent_mission_revision_sha256: callback.parent_mission_revision_sha256.clone(),
+            delegated_input_sha256: callback.delegated_input_sha256.clone(),
+            effect_identity: callback.effect_identity.clone(),
+            parent_input,
+            state: ContinuationDispatchState::Prepared,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationWriteOutcome {
+    Prepared,
+    AlreadyPrepared,
+    AlreadyCommitted,
+    AlreadyAcknowledged,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -752,6 +842,116 @@ impl SessionLifecycleStore {
         })
     }
 
+    pub fn prepare_callback_continuation(
+        &self,
+        record: &ContinuationDispatchRecord,
+    ) -> LifecycleResult<ContinuationWriteOutcome> {
+        self.validate_continuation(record)?;
+        self.with_lock(|| {
+            let path = self.continuation_path(&record.child_transaction_id, &record.child_event_id);
+            if path.exists() {
+                let existing: ContinuationDispatchRecord = read_json(&path)?;
+                if !continuation_bound_fields_match(&existing, record) {
+                    return Err(LifecycleBlocker::new(
+                        "CONTINUATION_IDENTITY_CONFLICT",
+                        path.display().to_string(),
+                    ));
+                }
+                return Ok(match existing.state {
+                    ContinuationDispatchState::Prepared => {
+                        ContinuationWriteOutcome::AlreadyPrepared
+                    }
+                    ContinuationDispatchState::Committed => {
+                        ContinuationWriteOutcome::AlreadyCommitted
+                    }
+                    ContinuationDispatchState::Acknowledged => {
+                        ContinuationWriteOutcome::AlreadyAcknowledged
+                    }
+                });
+            }
+            durable_write_json(&path, record)?;
+            Ok(ContinuationWriteOutcome::Prepared)
+        })
+    }
+
+    pub fn mark_callback_continuation_committed(
+        &self,
+        expected: &ContinuationDispatchRecord,
+    ) -> LifecycleResult<ContinuationWriteOutcome> {
+        self.transition_callback_continuation(expected, ContinuationDispatchState::Committed)
+    }
+
+    pub fn mark_callback_continuation_acknowledged(
+        &self,
+        expected: &ContinuationDispatchRecord,
+    ) -> LifecycleResult<ContinuationWriteOutcome> {
+        self.transition_callback_continuation(expected, ContinuationDispatchState::Acknowledged)
+    }
+
+    pub fn callback_continuations_for_replay(
+        &self,
+    ) -> LifecycleResult<Vec<ContinuationDispatchRecord>> {
+        let mut records = Vec::new();
+        for path in json_files(&self.root.join("continuations"))? {
+            let record: ContinuationDispatchRecord = read_json(&path)?;
+            self.validate_continuation(&record)?;
+            if record.state != ContinuationDispatchState::Acknowledged {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    fn transition_callback_continuation(
+        &self,
+        expected: &ContinuationDispatchRecord,
+        target: ContinuationDispatchState,
+    ) -> LifecycleResult<ContinuationWriteOutcome> {
+        self.validate_continuation(expected)?;
+        self.with_lock(|| {
+            let path =
+                self.continuation_path(&expected.child_transaction_id, &expected.child_event_id);
+            let mut existing: ContinuationDispatchRecord = read_json(&path)?;
+            if !continuation_bound_fields_match(&existing, expected) {
+                return Err(LifecycleBlocker::new(
+                    "CONTINUATION_IDENTITY_CONFLICT",
+                    path.display().to_string(),
+                ));
+            }
+            if existing.state == ContinuationDispatchState::Acknowledged {
+                return Ok(ContinuationWriteOutcome::AlreadyAcknowledged);
+            }
+            if target == ContinuationDispatchState::Acknowledged
+                && existing.state != ContinuationDispatchState::Committed
+            {
+                return Err(LifecycleBlocker::new(
+                    "CONTINUATION_ACK_BEFORE_COMMIT_BLOCKED",
+                    &existing.request_id,
+                ));
+            }
+            if target == ContinuationDispatchState::Committed
+                && existing.state == ContinuationDispatchState::Committed
+            {
+                return Ok(ContinuationWriteOutcome::AlreadyCommitted);
+            }
+            existing.state = target;
+            durable_write_json(&path, &existing)?;
+            Ok(match target {
+                ContinuationDispatchState::Prepared => ContinuationWriteOutcome::AlreadyPrepared,
+                ContinuationDispatchState::Committed => ContinuationWriteOutcome::AlreadyCommitted,
+                ContinuationDispatchState::Acknowledged => {
+                    ContinuationWriteOutcome::AlreadyAcknowledged
+                }
+            })
+        })
+    }
+
+    fn continuation_path(&self, transaction_id: &str, event_id: &str) -> PathBuf {
+        self.root
+            .join("continuations")
+            .join(receipt_key(transaction_id, event_id))
+    }
+
     pub fn record_identity_failure(&self, failure: PendingIdentityFailure) -> LifecycleResult<()> {
         if failure.commander_session_id != self.commander_session_id {
             return Err(LifecycleBlocker::new(
@@ -907,6 +1107,7 @@ impl SessionLifecycleStore {
             "callbacks/pending",
             "callbacks/intaken",
             "callbacks/acknowledged",
+            "continuations",
             "identity_pending",
             "checkpoints",
             "slots/released",
@@ -1042,6 +1243,84 @@ impl SessionLifecycleStore {
                 "CALLBACK_TERMINAL_RECEIPT_IDENTITY_CONFLICT",
                 &record.event_id,
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_continuation(&self, record: &ContinuationDispatchRecord) -> LifecycleResult<()> {
+        if record.schema_version != CONTINUATION_SCHEMA {
+            return Err(LifecycleBlocker::new(
+                "CONTINUATION_SCHEMA_UNSUPPORTED",
+                &record.schema_version,
+            ));
+        }
+        for (name, value) in [
+            ("request_id", record.request_id.as_str()),
+            ("runtime_id", record.runtime_id.as_str()),
+            ("lease_id", record.lease_id.as_str()),
+            ("commander_session_id", record.commander_session_id.as_str()),
+            ("child_session_id", record.child_session_id.as_str()),
+            ("child_transaction_id", record.child_transaction_id.as_str()),
+            ("child_event_id", record.child_event_id.as_str()),
+            ("child_runtime_id", record.child_runtime_id.as_str()),
+        ] {
+            require_identifier(name, value)?;
+        }
+        for (name, value) in [
+            (
+                "callback_payload_sha256",
+                record.callback_payload_sha256.as_str(),
+            ),
+            (
+                "parent_mission_revision_sha256",
+                record.parent_mission_revision_sha256.as_str(),
+            ),
+            (
+                "delegated_input_sha256",
+                record.delegated_input_sha256.as_str(),
+            ),
+        ] {
+            require_sha256(name, value)?;
+        }
+        if record.commander_session_id != self.commander_session_id {
+            return Err(LifecycleBlocker::new(
+                "COMMANDER_IDENTITY_MISMATCH",
+                &record.commander_session_id,
+            ));
+        }
+        if matches!(
+            record.effect_identity,
+            CallbackEffectIdentity::UnsettledEffect { .. }
+        ) {
+            return Err(LifecycleBlocker::new(
+                "CONTINUATION_UNSETTLED_EFFECT_BLOCKED",
+                &record.child_event_id,
+            ));
+        }
+        let digest = continuation_bound_identity_sha256(record)?;
+        for (name, actual, expected) in [
+            (
+                "request_id",
+                record.request_id.as_str(),
+                format!("callback-continuation-request-{digest}"),
+            ),
+            (
+                "runtime_id",
+                record.runtime_id.as_str(),
+                format!("callback-continuation-runtime-{digest}"),
+            ),
+            (
+                "lease_id",
+                record.lease_id.as_str(),
+                format!("callback-continuation-lease-{digest}"),
+            ),
+        ] {
+            if actual != expected {
+                return Err(LifecycleBlocker::new(
+                    "CONTINUATION_DERIVED_IDENTITY_MISMATCH",
+                    name,
+                ));
+            }
         }
         Ok(())
     }
@@ -1266,6 +1545,79 @@ pub fn checkpoint_identity_from_path(
         complete_write: true,
         event_kind,
     })
+}
+
+fn continuation_identity_sha256(callback: &DurableCallbackRecord) -> LifecycleResult<String> {
+    continuation_identity_sha256_from_fields(
+        &callback.commander_session_id,
+        &callback.child_session_id,
+        &callback.transaction_id,
+        &callback.event_id,
+        &callback.runtime_id,
+        &callback.callback_payload_sha256,
+        &callback.parent_mission_revision_sha256,
+        &callback.delegated_input_sha256,
+        &callback.effect_identity,
+    )
+}
+
+fn continuation_bound_identity_sha256(
+    record: &ContinuationDispatchRecord,
+) -> LifecycleResult<String> {
+    continuation_identity_sha256_from_fields(
+        &record.commander_session_id,
+        &record.child_session_id,
+        &record.child_transaction_id,
+        &record.child_event_id,
+        &record.child_runtime_id,
+        &record.callback_payload_sha256,
+        &record.parent_mission_revision_sha256,
+        &record.delegated_input_sha256,
+        &record.effect_identity,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn continuation_identity_sha256_from_fields(
+    commander_session_id: &str,
+    child_session_id: &str,
+    transaction_id: &str,
+    event_id: &str,
+    child_runtime_id: &str,
+    callback_payload_sha256: &str,
+    parent_mission_revision_sha256: &str,
+    delegated_input_sha256: &str,
+    effect_identity: &CallbackEffectIdentity,
+) -> LifecycleResult<String> {
+    let effect = serde_json::to_value(effect_identity).map_err(json_blocker)?;
+    let effect_sha256 = canonical_value_sha256(&effect);
+    let mut hasher = Sha256::new();
+    for value in [
+        commander_session_id,
+        child_session_id,
+        transaction_id,
+        event_id,
+        child_runtime_id,
+        callback_payload_sha256,
+        parent_mission_revision_sha256,
+        delegated_input_sha256,
+        effect_sha256.as_str(),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn continuation_bound_fields_match(
+    existing: &ContinuationDispatchRecord,
+    expected: &ContinuationDispatchRecord,
+) -> bool {
+    let mut existing = existing.clone();
+    let mut expected = expected.clone();
+    existing.state = ContinuationDispatchState::Prepared;
+    expected.state = ContinuationDispatchState::Prepared;
+    existing == expected
 }
 
 fn checkpoint_evidence_id(
@@ -1633,6 +1985,78 @@ mod tests {
             },
         )
         .expect("callback record")
+    }
+
+    #[test]
+    fn callback_continuation_identity_is_deterministic_and_restart_safe() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let lifecycle = store(root.path());
+        let callback = callback(&receipt("continuation-event", 0), "child result");
+        let first = ContinuationDispatchRecord::from_callback(&callback)
+            .expect("derive continuation identity");
+        let second = ContinuationDispatchRecord::from_callback(&callback)
+            .expect("rederive continuation identity");
+        assert_eq!(first, second);
+        assert_ne!(first.runtime_id, callback.runtime_id);
+        assert_eq!(first.parent_input["authority"], "none");
+        assert_eq!(
+            first.parent_input["requested_action"],
+            "MISSION_VERIFICATION"
+        );
+        assert!(!first.parent_input.to_string().contains("child result"));
+        assert_eq!(
+            lifecycle
+                .prepare_callback_continuation(&first)
+                .expect("prepare continuation"),
+            ContinuationWriteOutcome::Prepared
+        );
+
+        let reopened = store(root.path());
+        assert_eq!(
+            reopened
+                .prepare_callback_continuation(&second)
+                .expect("restart replay"),
+            ContinuationWriteOutcome::AlreadyPrepared
+        );
+        assert_eq!(
+            reopened
+                .callback_continuations_for_replay()
+                .expect("continuation replay readback"),
+            vec![first]
+        );
+    }
+
+    #[test]
+    fn callback_continuation_cas_conflicts_and_unsettled_effect_stays_unacked() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let callback = callback(&receipt("continuation-conflict", 0), "child result");
+        let record = ContinuationDispatchRecord::from_callback(&callback)
+            .expect("derive continuation identity");
+        store
+            .prepare_callback_continuation(&record)
+            .expect("prepare continuation");
+        let mut changed = record.clone();
+        changed.parent_input["requested_action"] = Value::String("ROUTE_SELECTION".to_string());
+        assert_eq!(
+            store
+                .prepare_callback_continuation(&changed)
+                .expect_err("changed binding must conflict")
+                .code,
+            "CONTINUATION_IDENTITY_CONFLICT"
+        );
+
+        let mut unsettled = callback;
+        unsettled.effect_identity = CallbackEffectIdentity::UnsettledEffect {
+            classification: "ambiguous".to_string(),
+            evidence_sha256: "b".repeat(64),
+        };
+        assert_eq!(
+            ContinuationDispatchRecord::from_callback(&unsettled)
+                .expect_err("unsettled effect must not dispatch")
+                .code,
+            "CONTINUATION_UNSETTLED_EFFECT_BLOCKED"
+        );
     }
 
     #[test]

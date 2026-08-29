@@ -221,7 +221,7 @@ async fn handle_socket_connection(
                 identity.commander_session_id.clone(),
                 identity.child_session_id.clone(),
                 identity.transaction_id.clone(),
-                state.execution.clone(),
+                state.clone(),
                 Arc::clone(&write),
             )
             .await
@@ -367,7 +367,7 @@ async fn start_session_round_forwarder(
     commander_session_id: String,
     session_id: String,
     request_id: String,
-    execution: crate::services::execution::ExecutionService,
+    state: crate::app::AppState,
     write: SocketWriter,
 ) -> anyhow::Result<SessionRoundForwarder> {
     let subscription = tokio::task::spawn_blocking(open_session_feed_subscription)
@@ -375,6 +375,9 @@ async fn start_session_round_forwarder(
         .map_err(|error| anyhow::anyhow!("session feed subscriber task failed: {error}"))??;
     let cancellation = subscription.cancellation_handle()?;
     let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+    let execution = state.execution.clone();
+    let continuation_execution = execution.clone();
+    let continuation_state = state.clone();
     let reader = tokio::task::spawn_blocking(move || {
         let mut subscription = subscription;
         let mut terminal_gate = TerminalCallbackGate::default();
@@ -489,7 +492,24 @@ async fn start_session_round_forwarder(
         }
     });
     let writer = tokio::spawn(async move {
-        while let Some((callbacks, _delivery)) = receiver.recv().await {
+        while let Some((callbacks, delivery)) = receiver.recv().await {
+            if let Some(delivery) = delivery
+                && delivery.callback_payload_sha256.is_some()
+                && delivery.callback_effect_identity.is_some()
+                && let Err(error) = continuation_execution
+                    .continue_terminal_delivery(&continuation_state, &delivery)
+                    .await
+            {
+                if error
+                    .to_string()
+                    .starts_with("CONTINUATION_UNSETTLED_EFFECT_BLOCKED:")
+                {
+                    eprintln!("router parent continuation withheld: {error:#}");
+                } else {
+                    eprintln!("router parent continuation blocked: {error:#}");
+                    break;
+                }
+            }
             let mut writer = write.lock().await;
             if write_callback_batch(&mut *writer, callbacks).await.is_err() {
                 break;
