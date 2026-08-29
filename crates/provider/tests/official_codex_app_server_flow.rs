@@ -532,6 +532,75 @@ async fn run_interrupted_effect_recovery() {
                 .contains("reconstructed_from_durable_terminal_receipt")
         }));
 
+    let durable_batch_directory = root.path().join("durable-batch-session");
+    fs::create_dir_all(&durable_batch_directory).expect("durable batch session directory");
+    let durable_batch_count = root.path().join("durable-batch-execution-count");
+    let mut durable_batch_handler =
+        ReceiptHandler::durable_batch_response_lost(&durable_batch_directory, &durable_batch_count);
+    run_official_codex_turn(
+        effect_request(
+            &durable_batch_directory,
+            &root.path().join("durable-batch-effect-interrupt.jsonl"),
+            "recover six durably completed command results",
+        ),
+        Some(&mut durable_batch_handler),
+    )
+    .await
+    .expect_err("provider transport must lose the durable batch response");
+    assert_eq!(execution_count(&durable_batch_count), 1);
+    let interrupted_batch = load_only_execution_ledger(&durable_batch_directory);
+    assert_eq!(interrupted_batch.effects.len(), 1);
+    assert_eq!(
+        interrupted_batch.effects[0].state,
+        CodexObservedToolEffectState::Observed
+    );
+    assert!(interrupted_batch.effects[0].response.is_none());
+
+    let durable_batch_recovery_capture = root.path().join("durable-batch-effect-recover.jsonl");
+    let durable_batch_recovered = run_official_codex_turn(
+        effect_request(
+            &durable_batch_directory,
+            &durable_batch_recovery_capture,
+            "recover six durably completed command results",
+        ),
+        Some(&mut durable_batch_handler),
+    )
+    .await
+    .expect("complete durable batch receipts must recover without replay");
+    assert_eq!(
+        durable_batch_recovered.content,
+        Value::String("recovered after provider loss".to_string())
+    );
+    assert_eq!(
+        execution_count(&durable_batch_count),
+        1,
+        "durable command batch executed twice"
+    );
+    let durable_batch_messages = captured_messages(&durable_batch_recovery_capture);
+    let injected_batch = durable_batch_messages
+        .iter()
+        .find(|message| {
+            message.get("method").and_then(Value::as_str) == Some("thread/inject_items")
+        })
+        .expect("durable batch recovery history");
+    let recovered_output = injected_batch["params"]["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["type"] == "function_call_output")
+        })
+        .and_then(|item| item["output"].as_str())
+        .expect("durable batch function output");
+    assert_eq!(
+        recovered_output
+            .matches("reconstructed_from_durable_terminal_receipt")
+            .count(),
+        6
+    );
+    assert!(recovered_output.contains("\"exit_code\":2"));
+    assert!(recovered_output.contains("\"success\":false"));
+
     let unclaimed_directory = root.path().join("unclaimed-read-only-session");
     fs::create_dir_all(&unclaimed_directory).expect("unclaimed read-only session directory");
     let unclaimed_count = root.path().join("unclaimed-read-only-observation-count");
@@ -755,6 +824,7 @@ struct ReceiptHandler {
     observe_read_only: bool,
     drop_response_after_receipt: bool,
     policy_denial: bool,
+    durable_batch: bool,
 }
 
 impl ReceiptHandler {
@@ -768,6 +838,7 @@ impl ReceiptHandler {
             observe_read_only: false,
             drop_response_after_receipt: false,
             policy_denial: false,
+            durable_batch: false,
         }
     }
 
@@ -781,6 +852,7 @@ impl ReceiptHandler {
             observe_read_only: false,
             drop_response_after_receipt: false,
             policy_denial: false,
+            durable_batch: false,
         }
     }
 
@@ -794,6 +866,7 @@ impl ReceiptHandler {
             observe_read_only: true,
             drop_response_after_receipt: false,
             policy_denial: false,
+            durable_batch: false,
         }
     }
 
@@ -807,6 +880,7 @@ impl ReceiptHandler {
             observe_read_only: true,
             drop_response_after_receipt: true,
             policy_denial: false,
+            durable_batch: false,
         }
     }
 
@@ -820,6 +894,21 @@ impl ReceiptHandler {
             observe_read_only: false,
             drop_response_after_receipt: false,
             policy_denial: true,
+            durable_batch: false,
+        }
+    }
+
+    fn durable_batch_response_lost(session_directory: &Path, execution_count_path: &Path) -> Self {
+        Self {
+            session_directory: session_directory.to_path_buf(),
+            execution_count_path: execution_count_path.to_path_buf(),
+            uncertain: false,
+            failed: false,
+            unclaimed: false,
+            observe_read_only: false,
+            drop_response_after_receipt: false,
+            policy_denial: false,
+            durable_batch: true,
         }
     }
 }
@@ -1056,6 +1145,45 @@ impl OfficialCodexServerRequestHandler for ReceiptHandler {
                 .join("run")
                 .join("command_receipts");
             fs::create_dir_all(&receipt_directory).expect("receipt directory");
+            if self.durable_batch {
+                for index in 0..6 {
+                    let call_id = format!("runtime-official-1:call-original:step:1:index:{index}");
+                    let failed = index == 5;
+                    let receipt = json!({
+                        "schema_version": "tura_command_terminal_receipt_v1",
+                        "call_id": call_id,
+                        "pid": 4242 + index,
+                        "terminal_state": if failed {"failed"} else {"completed"},
+                        "failure_class": if failed {"workload_exit_nonzero"} else {"none"},
+                        "termination_origin": "workload",
+                        "exit_code": if failed {2} else {0},
+                        "wall_time_ms": 10,
+                        "wall_timeout_ms": 300000,
+                        "stall_timeout_ms": null,
+                        "outcome": "known",
+                        "process_reaped": true,
+                        "process_group_empty": true,
+                        "termination_proven": true,
+                        "authority_effect": "none",
+                        "authoritative_publication": "unproven",
+                        "staging_authority": "none",
+                        "retry_safe": false,
+                        "auto_retry_allowed": false,
+                        "reconcile_required": failed,
+                        "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof"
+                    });
+                    fs::write(
+                        receipt_directory.join(format!(
+                            "{}.json",
+                            encode_read_only_receipt_identity_for_test(&call_id)
+                        )),
+                        serde_json::to_vec_pretty(&receipt).expect("batch receipt encode"),
+                    )
+                    .expect("batch receipt write");
+                }
+                self.durable_batch = false;
+                return Err("simulated response loss after durable command batch".to_string());
+            }
             let receipt_path = if self.observe_read_only {
                 receipt_directory.join(format!(
                     "{}.json",
@@ -1363,6 +1491,31 @@ fn fake_app_server(args: &[String]) {
                         );
                         continue;
                     }
+                    let commands = if mode.contains("durable-batch-") {
+                        (0..6)
+                            .map(|index| {
+                                json!({
+                                    "command_type": "zsh",
+                                    "command_line": format!("command-{index}"),
+                                    "step": 1
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![json!({
+                            "command_type": "zsh",
+                            "command_line": if mode == "conflict-recover" {
+                                "sleep 91"
+                            } else if mode.contains("unclaimed-")
+                                || mode.contains("completed-read-only-")
+                            {
+                                r#"rg -n -A18 -B6 "struct TurnRequestContext|TurnRequestContext \{" crates/provider/src/official_codex_app_server.rs"#
+                            } else {
+                                "sleep 90"
+                            },
+                            "step": 1
+                        })]
+                    };
                     server_request(
                         &mut stdout,
                         91,
@@ -1371,19 +1524,7 @@ fn fake_app_server(args: &[String]) {
                             "callId": if recovery {"call-recovered"} else {"call-original"},
                             "tool": "command_run",
                             "arguments": {
-                                "commands": [{
-                                    "command_type": "zsh",
-                                    "command_line": if mode == "conflict-recover" {
-                                        "sleep 91"
-                                    } else if mode.contains("unclaimed-")
-                                        || mode.contains("completed-read-only-")
-                                    {
-                                        r#"rg -n -A18 -B6 "struct TurnRequestContext|TurnRequestContext \{" crates/provider/src/official_codex_app_server.rs"#
-                                    } else {
-                                        "sleep 90"
-                                    },
-                                    "step": 1
-                                }]
+                                "commands": commands
                             }
                         }),
                     );

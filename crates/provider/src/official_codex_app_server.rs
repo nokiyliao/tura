@@ -843,6 +843,11 @@ async fn run_protocol(
             execution_ledger,
             request_handler,
         )?;
+        reconcile_durable_command_run_effects(
+            &request.session_directory,
+            execution_ledger,
+            request_handler,
+        )?;
         for (effect_index, effect) in execution_ledger.effects.iter().enumerate() {
             validate_reconciled_tool_effect(&request.session_directory, effect_index, effect)?;
         }
@@ -1912,6 +1917,155 @@ fn reconcile_never_claimed_read_only_effects(
     Ok(())
 }
 
+fn reconcile_durable_command_run_effects(
+    session_directory: &Path,
+    execution_ledger: &mut CodexExecutionLedger,
+    request_handler: &mut Option<&mut dyn OfficialCodexServerRequestHandler>,
+) -> Result<(), OfficialCodexAppServerError> {
+    let original_runtime_id = execution_ledger
+        .runtime_ids
+        .first()
+        .cloned()
+        .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index: 0,
+            reason: "execution ledger omitted its original runtime identity".to_string(),
+        })?;
+    for effect_index in 0..execution_ledger.effects.len() {
+        let (call_id, commands) = {
+            let effect = &execution_ledger.effects[effect_index];
+            if effect.read_only_observation.is_some()
+                || effect.state != CodexObservedToolEffectState::Observed
+                || effect.response.is_some()
+                || !effect.command_receipts.is_empty()
+                || effect.replay_request_id.is_some()
+            {
+                continue;
+            }
+            let Some(params) = effect.request_params.as_ref() else {
+                continue;
+            };
+            if params.get("tool").and_then(Value::as_str) != Some("command_run") {
+                continue;
+            }
+            let call_id = params
+                .get("callId")
+                .and_then(Value::as_str)
+                .filter(|call_id| !call_id.is_empty())
+                .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: "observed command_run omitted callId".to_string(),
+                })?;
+            let commands = params
+                .get("arguments")
+                .and_then(|arguments| arguments.get("commands"))
+                .and_then(Value::as_array)
+                .filter(|commands| {
+                    !commands.is_empty() && commands.len() <= MAX_SYNTHETIC_READ_ONLY_COMMANDS
+                })
+                .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: "observed command_run omitted a bounded command list".to_string(),
+                })?;
+            (call_id.to_string(), commands.clone())
+        };
+
+        let execution_id = format!("{original_runtime_id}:{call_id}");
+        let mut results = Vec::with_capacity(commands.len());
+        for (enumerated_index, command) in commands.iter().enumerate() {
+            let command_type = command
+                .get("command_type")
+                .and_then(Value::as_str)
+                .filter(|command_type| !command_type.is_empty())
+                .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: format!("command {enumerated_index} omitted command_type"),
+                })?;
+            let effective_step = command
+                .get("step")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .max(1);
+            let binding_id = command.get("id").and_then(Value::as_str);
+            let claim_identity =
+                command_claim_identity(&execution_id, binding_id, effective_step, enumerated_index);
+            let receipt_path = session_directory
+                .join(".tura")
+                .join("run")
+                .join("command_receipts")
+                .join(format!(
+                    "{}.json",
+                    encode_command_receipt_identity(&claim_identity)
+                ));
+            let bytes = std::fs::read(&receipt_path).map_err(|error| {
+                OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: format!(
+                        "terminal receipt for command {claim_identity} is unavailable: {error}"
+                    ),
+                }
+            })?;
+            let receipt: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: format!(
+                        "terminal receipt for command {claim_identity} is invalid: {error}"
+                    ),
+                }
+            })?;
+            if receipt.get("call_id").and_then(Value::as_str) != Some(claim_identity.as_str()) {
+                return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: format!(
+                        "terminal receipt identity changed for command {claim_identity}"
+                    ),
+                });
+            }
+            let command_succeeded = receipt.get("exit_code").and_then(Value::as_i64) == Some(0);
+            validate_terminal_receipt(effect_index, &receipt, command_succeeded)?;
+            let absolute_path = std::fs::canonicalize(&receipt_path).map_err(|error| {
+                OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: format!(
+                        "terminal receipt for command {claim_identity} cannot be canonicalized: {error}"
+                    ),
+                }
+            })?;
+            results.push(json!({
+                "command_type": command_type,
+                "command_id": claim_identity,
+                "step": effective_step,
+                "success": command_succeeded,
+                "output": {
+                    "exit_code": receipt.get("exit_code").cloned().unwrap_or(Value::Null),
+                    "terminal_receipt": receipt,
+                    "terminal_receipt_path": absolute_path,
+                    "delivery_state": "reconstructed_from_durable_terminal_receipt"
+                }
+            }));
+        }
+
+        let output = json!({"results": results});
+        let response = json!({
+            "contentItems": [{"type": "inputText", "text": output.to_string()}],
+            "success": true
+        });
+        let evidence =
+            extract_command_receipt_references(session_directory, effect_index, &response)?;
+        if !evidence.replayable || evidence.references.len() != commands.len() {
+            return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: "durable command_run result was incomplete or unsettled".to_string(),
+            });
+        }
+        let effect = &mut execution_ledger.effects[effect_index];
+        effect.response = Some(response);
+        effect.command_receipts = evidence.references;
+        effect.state = CodexObservedToolEffectState::Reconciled;
+        persist_execution_ledger(request_handler, execution_ledger, effect_index)?;
+    }
+    Ok(())
+}
+
 fn server_effect_identity(params: &Value, rpc_id: &Value) -> Value {
     params
         .get("callId")
@@ -2079,7 +2233,7 @@ fn extract_command_receipt_references(
             reason: "command_run response contained no command results".to_string(),
         })?;
     let mut references = Vec::with_capacity(results.len());
-    let mut replayable = true;
+    let replayable = true;
     let mut receipt_root = None;
     for command_result in results {
         let command_succeeded = command_result.get("success").and_then(Value::as_bool);
@@ -2113,7 +2267,6 @@ fn extract_command_receipt_references(
             });
         };
         validate_terminal_receipt(effect_index, receipt, command_succeeded)?;
-        replayable &= command_succeeded;
         let receipt_root = match receipt_root.as_ref() {
             Some(path) => path,
             None => {
@@ -2262,7 +2415,10 @@ fn validate_terminal_receipt(
                 .get("exit_code")
                 .and_then(Value::as_i64)
                 .is_some_and(|exit_code| exit_code != 0)
-            && receipt.get("reconcile_required").and_then(Value::as_bool) == Some(true)
+            && receipt
+                .get("reconcile_required")
+                .and_then(Value::as_bool)
+                .is_some()
     };
     let valid = common_valid && terminal_valid;
     if valid {
