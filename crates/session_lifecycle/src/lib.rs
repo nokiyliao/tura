@@ -1363,6 +1363,13 @@ impl SessionLifecycleStore {
                 &record.callback_request_id,
             ));
         }
+        let canonical_effect_id = format!("{}.message", record.child_runtime_id);
+        if record.effect_id != canonical_effect_id {
+            return Err(LifecycleBlocker::new(
+                "CHILD_ADMISSION_EFFECT_IDENTITY_CONFLICT",
+                format!("expected={canonical_effect_id},actual={}", record.effect_id),
+            ));
+        }
         if record.created_at_ms <= 0 {
             return Err(LifecycleBlocker::new(
                 "CHILD_ADMISSION_IDENTITY_INVALID",
@@ -2264,13 +2271,13 @@ mod tests {
                 "payload": {
                     "session_id": receipt.child_session_id,
                     "runtime_id": receipt.runtime_id,
-                    "body": {"item": {"id": "assistant-message-1", "text": text}}
+                    "body": {"item": {"id": "runtime-0.message", "text": text}}
                 }
             }),
             "69edd74f732aa5bed571d652e7f91874a16881116b454218a508f413a33fcd70",
             canonical_value_sha256(&Value::String("delegated prompt".to_string())),
             CallbackEffectIdentity::Exact {
-                effect_id: "assistant-message-1".to_string(),
+                effect_id: "runtime-0.message".to_string(),
             },
         )
         .expect("callback record")
@@ -2299,7 +2306,7 @@ mod tests {
             "transaction-1",
             "lease-0",
             "transaction-1",
-            "assistant-message-1",
+            "runtime-0.message",
             &canonical_value_sha256(&Value::String("delegated prompt".to_string())),
             &canonical_value_sha256(&serde_json::json!({"prompt": "delegated prompt"})),
             "/tmp/child-1",
@@ -2329,10 +2336,10 @@ mod tests {
         );
 
         let mut changed = admission.clone();
-        changed.effect_id = "assistant-message-2".to_string();
+        changed.effect_id = "foreign.message".to_string();
         assert_eq!(
             store.admit_child(&changed).unwrap_err().code,
-            "CHILD_ADMISSION_IDENTITY_CONFLICT"
+            "CHILD_ADMISSION_EFFECT_IDENTITY_CONFLICT"
         );
 
         let terminal = receipt("child-terminal", 0);

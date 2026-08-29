@@ -1229,9 +1229,17 @@ impl ExecutionService {
         transport_payload: Value,
     ) -> Result<(Value, TerminalDeliveryIdentity)> {
         let store = lifecycle_store(&delivery.commander_session_id)?;
+        Self::publish_terminal_callback_from_store(&store, &mut delivery, transport_payload)
+    }
+
+    fn publish_terminal_callback_from_store(
+        store: &SessionLifecycleStore,
+        delivery: &mut TerminalDeliveryIdentity,
+        transport_payload: Value,
+    ) -> Result<(Value, TerminalDeliveryIdentity)> {
         let receipt = store.terminal_receipt(&delivery.transaction_id, &delivery.event_id)?;
         if receipt.child_session_id == receipt.commander_session_id {
-            return Ok((transport_payload, delivery));
+            return Ok((transport_payload, delivery.clone()));
         }
         let parent_mission_revision_sha256 = receipt
             .audit_metadata
@@ -1262,7 +1270,15 @@ impl ExecutionService {
                 )
             })?
             .to_string();
-        if let Some(admission) = store.child_admission(&receipt.child_session_id)? {
+        let admission = store
+            .child_admission(&receipt.child_session_id)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "TERMINAL_CALLBACK_CHILD_ADMISSION_NOT_DURABLE:{}",
+                    receipt.child_session_id
+                )
+            })?;
+        {
             if admission.parent_session_id != receipt.commander_session_id
                 || admission.parent_mission_revision_sha256 != parent_mission_revision_sha256
                 || admission.child_runtime_id != receipt.runtime_id
@@ -1299,7 +1315,7 @@ impl ExecutionService {
         )?;
         delivery.callback_payload_sha256 = Some(record.callback_payload_sha256.clone());
         delivery.callback_effect_identity = Some(record.effect_identity.clone());
-        Ok((record.transport_payload, delivery))
+        Ok((record.transport_payload, delivery.clone()))
     }
 
     pub(crate) fn replay_terminal_callbacks(
@@ -2953,9 +2969,9 @@ mod tests {
     use runtime_contract::RunAgentRequest;
     use serde_json::json;
     use session_lifecycle::{
-        CallbackEffectIdentity, ContinuationDispatchRecord, DurableCallbackRecord, LifecycleConfig,
-        SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity, TerminalState,
-        commander_store_path,
+        CallbackEffectIdentity, ChildAdmissionRecord, ContinuationDispatchRecord,
+        DurableCallbackRecord, LifecycleConfig, SessionLifecycleStore, TerminalReceipt,
+        TerminalReceiptIdentity, TerminalState, commander_store_path,
     };
     use session_log_contract::{
         RuntimeLeaseSnapshot, RuntimeLifecycleIdentity, SessionFeedEntry, SessionFeedEvent,
@@ -3272,7 +3288,7 @@ mod tests {
             child_transaction_id: "transaction-exact".to_string(),
             child_lease_id: "lease-exact".to_string(),
             callback_request_id: "transaction-exact".to_string(),
-            effect_id: "effect-exact".to_string(),
+            effect_id: "runtime-exact.message".to_string(),
             delegated_input_sha256: "b".repeat(64),
             session_directory: "/tmp/child-exact".to_string(),
             session_name: "child exact".to_string(),
@@ -4133,6 +4149,111 @@ mod tests {
                 callback_effect_identity: None,
             },
         )
+    }
+
+    #[test]
+    fn public_child_terminal_callback_requires_admission_and_intakes_once() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Completed);
+        let transport_payload = json!({
+            "request_id": "transaction-callback",
+            "kind": "gateway.callback",
+            "method": "session.agent_message",
+            "payload": {
+                "session_id": "child-callback",
+                "runtime_id": "runtime-callback",
+                "body": {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "runtime-callback.message",
+                        "type": "agent_message",
+                        "text": "child result"
+                    }
+                }
+            }
+        });
+
+        let mut missing_admission_delivery = delivery.clone();
+        assert_eq!(
+            ExecutionService::publish_terminal_callback_from_store(
+                &store,
+                &mut missing_admission_delivery,
+                transport_payload.clone(),
+            )
+            .expect_err("unadmitted child callback must fail closed")
+            .to_string(),
+            "TERMINAL_CALLBACK_CHILD_ADMISSION_NOT_DURABLE:child-callback"
+        );
+        assert_eq!(
+            store
+                .readback()
+                .expect("pre-admission readback")
+                .pending_callbacks,
+            0
+        );
+
+        let admission = ChildAdmissionRecord::new(
+            "commander-callback",
+            "a".repeat(64),
+            "child-callback",
+            "runtime-callback",
+            "transaction-callback",
+            "lease-callback",
+            "transaction-callback",
+            "runtime-callback.message",
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            session_lifecycle::canonical_value_sha256(&json!({"prompt": "delegated prompt"})),
+            "/tmp/child-callback",
+            "delegated child callback",
+            1_786_845_600_000,
+        );
+        store
+            .admit_child(&admission)
+            .expect("durable child admission");
+
+        let mut first_delivery = delivery.clone();
+        let first = ExecutionService::publish_terminal_callback_from_store(
+            &store,
+            &mut first_delivery,
+            transport_payload.clone(),
+        )
+        .expect("first callback publication");
+        let mut replay_delivery = delivery;
+        let replay = ExecutionService::publish_terminal_callback_from_store(
+            &store,
+            &mut replay_delivery,
+            transport_payload,
+        )
+        .expect("identical callback replay");
+        assert_eq!(replay, first);
+        assert_eq!(
+            first_delivery.callback_effect_identity,
+            Some(CallbackEffectIdentity::Exact {
+                effect_id: "runtime-callback.message".to_string(),
+            })
+        );
+        let readback = store.readback().expect("callback intake readback");
+        assert_eq!(readback.pending_callbacks, 0);
+        assert_eq!(readback.intaken_callbacks, 1);
+        assert_eq!(readback.acknowledged_callbacks, 0);
+
+        let mut conflicting_delivery = first_delivery;
+        let conflict = json!({
+            "payload": {"body": {"item": {
+                "id": "foreign.message",
+                "text": "child result"
+            }}}
+        });
+        assert!(
+            ExecutionService::publish_terminal_callback_from_store(
+                &store,
+                &mut conflicting_delivery,
+                conflict,
+            )
+            .expect_err("changed effect identity must conflict")
+            .to_string()
+            .contains("TERMINAL_CALLBACK_EFFECT_IDENTITY_CONFLICT")
+        );
     }
 
     #[test]

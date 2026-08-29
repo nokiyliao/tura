@@ -624,7 +624,9 @@ fn agent_message_is_terminal(entry: &SessionFeedEntry) -> bool {
 fn should_abort_request_on_connection_close(request: &IpcRequest) -> bool {
     !matches!(
         request.method.as_str(),
-        "execution.command_run" | "execution.enqueue_turn"
+        "execution.command_run"
+            | router_contract::METHOD_ENQUEUE_TURN
+            | router_contract::METHOD_REGISTER_CHILD_SESSION
     )
 }
 
@@ -735,6 +737,12 @@ mod tests {
 
         let request = IpcRequest {
             method: "execution.enqueue_turn".to_string(),
+            ..request
+        };
+        assert!(!should_abort_request_on_connection_close(&request));
+
+        let request = IpcRequest {
+            method: router_contract::METHOD_REGISTER_CHILD_SESSION.to_string(),
             ..request
         };
         assert!(!should_abort_request_on_connection_close(&request));

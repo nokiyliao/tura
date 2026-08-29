@@ -187,6 +187,17 @@ pub(crate) struct EnqueueTurnIdentity {
 }
 
 pub(crate) fn enqueue_turn_identity(request: &IpcRequest) -> Option<EnqueueTurnIdentity> {
+    if request.method == METHOD_REGISTER_CHILD_SESSION {
+        let child: router_contract::RegisterChildSessionRequest =
+            serde_json::from_value(request.payload.clone()).ok()?;
+        child.validate().ok()?;
+        return Some(EnqueueTurnIdentity {
+            commander_session_id: child.parent_session_id,
+            child_session_id: child.child_session_id,
+            runtime_id: child.child_runtime_id,
+            transaction_id: child.child_transaction_id,
+        });
+    }
     if request.method != METHOD_ENQUEUE_TURN {
         return None;
     }
@@ -253,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_turn_session_id_tracks_only_turn_requests() {
+    fn terminal_forwarder_identity_tracks_turn_and_public_child_requests() {
         let turn = IpcRequest {
             request_id: "turn".to_string(),
             kind: "call".to_string(),
@@ -301,6 +312,39 @@ mod tests {
                 transaction_id: "delegated-turn".to_string(),
             })
         );
+
+        let public_child = IpcRequest {
+            request_id: "public-child-admission".to_string(),
+            method: METHOD_REGISTER_CHILD_SESSION.to_string(),
+            payload: json!({
+                "parent_session_id": "commander-1",
+                "parent_mission_revision_sha256": "a".repeat(64),
+                "child_session_id": "child-1",
+                "child_runtime_id": "runtime-child-1",
+                "child_transaction_id": "transaction-child-1",
+                "child_lease_id": "lease-child-1",
+                "callback_request_id": "transaction-child-1",
+                "effect_id": "runtime-child-1.message",
+                "delegated_input_sha256": "b".repeat(64),
+                "session_directory": "/tmp/child-1",
+                "session_name": "delegated child",
+                "created_at_ms": 1_788_000_000_000_i64,
+                "execution_payload": {"prompt": "delegated work"}
+            }),
+            ..delegated.clone()
+        };
+        assert_eq!(
+            enqueue_turn_identity(&public_child),
+            Some(EnqueueTurnIdentity {
+                commander_session_id: "commander-1".to_string(),
+                child_session_id: "child-1".to_string(),
+                runtime_id: "runtime-child-1".to_string(),
+                transaction_id: "transaction-child-1".to_string(),
+            })
+        );
+        let mut changed_effect = public_child;
+        changed_effect.payload["effect_id"] = json!("foreign.message");
+        assert_eq!(enqueue_turn_identity(&changed_effect), None);
 
         let blank_session = IpcRequest {
             method: "execution.enqueue_turn".to_string(),

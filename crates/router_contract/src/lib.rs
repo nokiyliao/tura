@@ -118,6 +118,10 @@ pub struct RegisterChildSessionRequest {
 }
 
 impl RegisterChildSessionRequest {
+    pub fn canonical_effect_id(&self) -> String {
+        format!("{}.message", self.child_runtime_id)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for (name, value) in [
             ("parent_session_id", self.parent_session_id.as_str()),
@@ -159,6 +163,13 @@ impl RegisterChildSessionRequest {
             return Err(
                 "CHILD_ADMISSION_CALLBACK_IDENTITY_CONFLICT:callback_request_id".to_string(),
             );
+        }
+        let canonical_effect_id = self.canonical_effect_id();
+        if self.effect_id != canonical_effect_id {
+            return Err(format!(
+                "CHILD_ADMISSION_EFFECT_IDENTITY_CONFLICT:expected={canonical_effect_id},actual={}",
+                self.effect_id
+            ));
         }
         if self.created_at_ms <= 0 {
             return Err("CHILD_ADMISSION_IDENTITY_INVALID:created_at_ms".to_string());
@@ -378,7 +389,7 @@ mod tests {
             child_transaction_id: "callback-1".to_string(),
             child_lease_id: "lease-1".to_string(),
             callback_request_id: "callback-1".to_string(),
-            effect_id: "effect-1".to_string(),
+            effect_id: "runtime-1.message".to_string(),
             delegated_input_sha256: "b".repeat(64),
             session_directory: "/tmp/child-1".to_string(),
             session_name: "delegated child".to_string(),
@@ -425,6 +436,13 @@ mod tests {
         assert_eq!(
             missing_effect.validate().unwrap_err(),
             "CHILD_ADMISSION_IDENTITY_MISSING:effect_id"
+        );
+
+        let mut changed_effect = child_request();
+        changed_effect.effect_id = "foreign.message".to_string();
+        assert_eq!(
+            changed_effect.validate().unwrap_err(),
+            "CHILD_ADMISSION_EFFECT_IDENTITY_CONFLICT:expected=runtime-1.message,actual=foreign.message"
         );
 
         let mut uppercase_revision = child_request();

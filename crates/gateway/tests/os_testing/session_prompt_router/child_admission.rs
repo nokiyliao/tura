@@ -12,7 +12,7 @@ fn admission_request() -> Value {
         "child_transaction_id": "callback-1",
         "child_lease_id": "lease-1",
         "callback_request_id": "callback-1",
-        "effect_id": "effect-1",
+        "effect_id": "runtime-1.message",
         "delegated_input_sha256": "b".repeat(64),
         "session_directory": "/tmp/child-1",
         "session_name": "delegated child",
@@ -48,7 +48,7 @@ async fn public_gateway_child_route_forwards_exact_contract_and_replay() -> Resu
         "child_runtime_id": "runtime-1",
         "child_transaction_id": "callback-1",
         "callback_request_id": "callback-1",
-        "effect_id": "effect-1"
+        "effect_id": "runtime-1.message"
     });
     let mut replay_response = response.clone();
     replay_response["outcome"] = Value::String("already_admitted".to_string());
