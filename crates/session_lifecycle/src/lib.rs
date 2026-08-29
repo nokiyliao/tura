@@ -275,7 +275,8 @@ pub enum CallbackIntakeOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum ContinuationDispatchState {
     Prepared,
-    Committed,
+    Dispatched,
+    Completed,
     Acknowledged,
 }
 
@@ -326,6 +327,7 @@ impl ContinuationDispatchRecord {
                 "event_id": &callback.event_id,
                 "runtime_id": &callback.runtime_id,
                 "terminal_state": callback.terminal_state,
+                "result": &callback.callback_payload,
                 "callback_payload_sha256": &callback.callback_payload_sha256,
                 "parent_mission_revision_sha256": &callback.parent_mission_revision_sha256,
                 "delegated_input_sha256": &callback.delegated_input_sha256,
@@ -356,7 +358,8 @@ impl ContinuationDispatchRecord {
 pub enum ContinuationWriteOutcome {
     Prepared,
     AlreadyPrepared,
-    AlreadyCommitted,
+    AlreadyDispatched,
+    AlreadyCompleted,
     AlreadyAcknowledged,
 }
 
@@ -861,8 +864,11 @@ impl SessionLifecycleStore {
                     ContinuationDispatchState::Prepared => {
                         ContinuationWriteOutcome::AlreadyPrepared
                     }
-                    ContinuationDispatchState::Committed => {
-                        ContinuationWriteOutcome::AlreadyCommitted
+                    ContinuationDispatchState::Dispatched => {
+                        ContinuationWriteOutcome::AlreadyDispatched
+                    }
+                    ContinuationDispatchState::Completed => {
+                        ContinuationWriteOutcome::AlreadyCompleted
                     }
                     ContinuationDispatchState::Acknowledged => {
                         ContinuationWriteOutcome::AlreadyAcknowledged
@@ -874,11 +880,18 @@ impl SessionLifecycleStore {
         })
     }
 
-    pub fn mark_callback_continuation_committed(
+    pub fn mark_callback_continuation_dispatched(
         &self,
         expected: &ContinuationDispatchRecord,
     ) -> LifecycleResult<ContinuationWriteOutcome> {
-        self.transition_callback_continuation(expected, ContinuationDispatchState::Committed)
+        self.transition_callback_continuation(expected, ContinuationDispatchState::Dispatched)
+    }
+
+    pub fn mark_callback_continuation_completed(
+        &self,
+        expected: &ContinuationDispatchRecord,
+    ) -> LifecycleResult<ContinuationWriteOutcome> {
+        self.transition_callback_continuation(expected, ContinuationDispatchState::Completed)
     }
 
     pub fn mark_callback_continuation_acknowledged(
@@ -902,6 +915,42 @@ impl SessionLifecycleStore {
         Ok(records)
     }
 
+    pub fn callback_continuation_completion_proven(
+        &self,
+        record: &ContinuationDispatchRecord,
+    ) -> LifecycleResult<bool> {
+        self.validate_continuation(record)?;
+        self.with_lock(|| {
+            for path in json_files(&self.root.join("receipts/applied"))? {
+                let stored = read_stored_receipt(&path)?;
+                let receipt = &stored.receipt;
+                if receipt.transaction_id != record.request_id
+                    || receipt.commander_session_id != record.commander_session_id
+                    || receipt.child_session_id != record.commander_session_id
+                    || receipt.runtime_id != record.runtime_id
+                    || receipt.lease_id != record.lease_id
+                    || receipt.terminal_state != TerminalState::Completed
+                {
+                    continue;
+                }
+                self.validate_receipt(receipt)?;
+                let key = receipt_key(&receipt.transaction_id, &receipt.event_id);
+                let released = self.root.join("slots/released").join(key);
+                if !released.exists() {
+                    return Ok(false);
+                }
+                let release: SlotReleaseReceipt = read_json(&released)?;
+                return Ok(release.transaction_id == receipt.transaction_id
+                    && release.event_id == receipt.event_id
+                    && release.commander_session_id == receipt.commander_session_id
+                    && release.child_session_id == receipt.child_session_id
+                    && release.runtime_id == receipt.runtime_id
+                    && release.lease_id == receipt.lease_id);
+            }
+            Ok(false)
+        })
+    }
+
     fn transition_callback_continuation(
         &self,
         expected: &ContinuationDispatchRecord,
@@ -922,23 +971,56 @@ impl SessionLifecycleStore {
                 return Ok(ContinuationWriteOutcome::AlreadyAcknowledged);
             }
             if target == ContinuationDispatchState::Acknowledged
-                && existing.state != ContinuationDispatchState::Committed
+                && existing.state != ContinuationDispatchState::Completed
             {
                 return Err(LifecycleBlocker::new(
-                    "CONTINUATION_ACK_BEFORE_COMMIT_BLOCKED",
+                    "CONTINUATION_ACK_BEFORE_COMPLETION_BLOCKED",
                     &existing.request_id,
                 ));
             }
-            if target == ContinuationDispatchState::Committed
-                && existing.state == ContinuationDispatchState::Committed
-            {
-                return Ok(ContinuationWriteOutcome::AlreadyCommitted);
+            let valid_transition = matches!(
+                (existing.state, target),
+                (
+                    ContinuationDispatchState::Prepared,
+                    ContinuationDispatchState::Dispatched
+                ) | (
+                    ContinuationDispatchState::Dispatched,
+                    ContinuationDispatchState::Completed
+                ) | (
+                    ContinuationDispatchState::Completed,
+                    ContinuationDispatchState::Acknowledged
+                )
+            );
+            if existing.state == target {
+                return Ok(match target {
+                    ContinuationDispatchState::Prepared => {
+                        ContinuationWriteOutcome::AlreadyPrepared
+                    }
+                    ContinuationDispatchState::Dispatched => {
+                        ContinuationWriteOutcome::AlreadyDispatched
+                    }
+                    ContinuationDispatchState::Completed => {
+                        ContinuationWriteOutcome::AlreadyCompleted
+                    }
+                    ContinuationDispatchState::Acknowledged => {
+                        ContinuationWriteOutcome::AlreadyAcknowledged
+                    }
+                });
+            }
+            if !valid_transition {
+                return Err(LifecycleBlocker::new(
+                    "CONTINUATION_STATE_TRANSITION_BLOCKED",
+                    format!("{}:{:?}:{target:?}", existing.request_id, existing.state),
+                ));
             }
             existing.state = target;
             durable_write_json(&path, &existing)?;
             Ok(match target {
                 ContinuationDispatchState::Prepared => ContinuationWriteOutcome::AlreadyPrepared,
-                ContinuationDispatchState::Committed => ContinuationWriteOutcome::AlreadyCommitted,
+                ContinuationDispatchState::Dispatched => {
+                    ContinuationWriteOutcome::AlreadyDispatched
+                }
+                ContinuationDispatchState::Completed => ContinuationWriteOutcome::AlreadyCompleted,
                 ContinuationDispatchState::Acknowledged => {
                     ContinuationWriteOutcome::AlreadyAcknowledged
                 }
@@ -2003,7 +2085,11 @@ mod tests {
             first.parent_input["requested_action"],
             "MISSION_VERIFICATION"
         );
-        assert!(!first.parent_input.to_string().contains("child result"));
+        assert_eq!(
+            first.parent_input["callback"]["result"],
+            callback.callback_payload
+        );
+        assert!(!first.parent_input.to_string().contains("delegated prompt"));
         assert_eq!(
             lifecycle
                 .prepare_callback_continuation(&first)
@@ -2045,6 +2131,26 @@ mod tests {
                 .code,
             "CONTINUATION_IDENTITY_CONFLICT"
         );
+        assert_eq!(
+            store
+                .mark_callback_continuation_dispatched(&record)
+                .expect("durable parent dispatch"),
+            ContinuationWriteOutcome::AlreadyDispatched
+        );
+        assert_eq!(
+            store
+                .mark_callback_continuation_acknowledged(&record)
+                .expect_err("dispatched continuation cannot be acknowledged")
+                .code,
+            "CONTINUATION_ACK_BEFORE_COMPLETION_BLOCKED"
+        );
+        assert_eq!(
+            store
+                .callback_continuations_for_replay()
+                .expect("dispatched continuation readback")[0]
+                .state,
+            ContinuationDispatchState::Dispatched
+        );
 
         let mut unsettled = callback;
         unsettled.effect_identity = CallbackEffectIdentity::UnsettledEffect {
@@ -2056,6 +2162,63 @@ mod tests {
                 .expect_err("unsettled effect must not dispatch")
                 .code,
             "CONTINUATION_UNSETTLED_EFFECT_BLOCKED"
+        );
+    }
+
+    #[test]
+    fn dispatched_continuation_requires_successful_terminal_and_reclaim_evidence() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let callback = callback(&receipt("child-terminal", 0), "child result");
+        let continuation = ContinuationDispatchRecord::from_callback(&callback)
+            .expect("derive continuation identity");
+        store
+            .prepare_callback_continuation(&continuation)
+            .expect("prepare continuation");
+        store
+            .mark_callback_continuation_dispatched(&continuation)
+            .expect("dispatch continuation");
+        assert!(
+            !store
+                .callback_continuation_completion_proven(&continuation)
+                .expect("no terminal evidence")
+        );
+
+        let parent_receipt = TerminalReceipt::new(
+            TerminalReceiptIdentity::new(
+                &continuation.request_id,
+                "parent-terminal",
+                0,
+                &continuation.commander_session_id,
+                &continuation.commander_session_id,
+                &continuation.runtime_id,
+                &continuation.lease_id,
+            ),
+            TerminalState::Completed,
+            1_786_845_600_100,
+        );
+        store
+            .write_terminal_receipt(&parent_receipt)
+            .expect("durable parent terminal receipt");
+        store
+            .intake(&continuation.request_id, "parent-terminal")
+            .expect("apply parent terminal receipt");
+        assert!(
+            !store
+                .callback_continuation_completion_proven(&continuation)
+                .expect("terminal without reclaim")
+        );
+        store
+            .reclaim_terminal_slot(
+                &continuation.request_id,
+                "parent-terminal",
+                LiveEffectEvidence::default(),
+            )
+            .expect("reclaim parent runtime");
+        assert!(
+            store
+                .callback_continuation_completion_proven(&continuation)
+                .expect("terminal and reclaim prove completion")
         );
     }
 

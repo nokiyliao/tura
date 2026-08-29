@@ -493,13 +493,26 @@ async fn start_session_round_forwarder(
     });
     let writer = tokio::spawn(async move {
         while let Some((callbacks, delivery)) = receiver.recv().await {
-            if let Some(delivery) = delivery
-                && delivery.callback_payload_sha256.is_some()
-                && delivery.callback_effect_identity.is_some()
-                && let Err(error) = continuation_execution
-                    .continue_terminal_delivery(&continuation_state, &delivery)
-                    .await
-            {
+            let write_result = {
+                let mut writer = write.lock().await;
+                write_callback_batch(&mut *writer, callbacks).await
+            };
+            let (write_result, continuation_result) =
+                continue_after_callback_write(write_result, || async {
+                    if let Some(delivery) = delivery
+                        && delivery.callback_payload_sha256.is_some()
+                        && delivery.callback_effect_identity.is_some()
+                    {
+                        continuation_execution
+                            .continue_terminal_delivery(&continuation_state, &delivery)
+                            .await
+                            .map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await;
+            if let Err(error) = continuation_result {
                 if error
                     .to_string()
                     .starts_with("CONTINUATION_UNSETTLED_EFFECT_BLOCKED:")
@@ -510,8 +523,7 @@ async fn start_session_round_forwarder(
                     break;
                 }
             }
-            let mut writer = write.lock().await;
-            if write_callback_batch(&mut *writer, callbacks).await.is_err() {
+            if write_result.is_err() {
                 break;
             }
         }
@@ -521,6 +533,18 @@ async fn start_session_round_forwarder(
         reader: Some(reader),
         writer: Some(writer),
     })
+}
+
+async fn continue_after_callback_write<F, Fut>(
+    write_result: anyhow::Result<()>,
+    continuation: F,
+) -> (anyhow::Result<()>, anyhow::Result<()>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let continuation_result = continuation().await;
+    (write_result, continuation_result)
 }
 
 async fn write_callback_batch<W>(
@@ -893,6 +917,63 @@ mod tests {
             .await
             .expect("read callback");
         assert_eq!(encoded, "{\"callback\":\"durable\"}\n");
+    }
+
+    #[tokio::test]
+    async fn parent_continuation_is_attempted_after_callback_write_failure() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let attempted = Arc::new(AtomicBool::new(false));
+        let attempted_by_continuation = Arc::clone(&attempted);
+        let write_error = anyhow::anyhow!("socket closed");
+        let (write_result, continuation_result) =
+            continue_after_callback_write(Err(write_error), move || async move {
+                attempted_by_continuation.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(write_result.is_err());
+        assert!(continuation_result.is_ok());
+        assert!(attempted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn callback_is_readable_before_parent_continuation_finishes() {
+        use tokio::io::AsyncBufReadExt;
+
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_continuation = std::sync::Arc::clone(&release);
+        let delivery = tokio::spawn(async move {
+            let write_result =
+                write_callback_batch(&mut writer, vec![json!({"callback": "durable"})]).await;
+            continue_after_callback_write(write_result, move || async move {
+                release_continuation.notified().await;
+                Ok(())
+            })
+            .await
+        });
+
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut encoded = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_line(&mut encoded),
+        )
+        .await
+        .expect("callback must not wait on parent continuation")
+        .expect("read callback");
+        assert_eq!(encoded, "{\"callback\":\"durable\"}\n");
+        assert!(!delivery.is_finished());
+
+        release.notify_one();
+        let (write_result, continuation_result) = delivery.await.expect("delivery task");
+        assert!(write_result.is_ok());
+        assert!(continuation_result.is_ok());
     }
 
     fn terminal_delivery(runtime_id: &str) -> crate::services::execution::TerminalDeliveryIdentity {

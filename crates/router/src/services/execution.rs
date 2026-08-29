@@ -245,7 +245,7 @@ impl ExecutionService {
         )?;
         if let Some(record) = continuation.as_ref() {
             let store = lifecycle_store(&record.commander_session_id)?;
-            commit_and_ack_callback_continuation(&store, record)?;
+            store.mark_callback_continuation_dispatched(record)?;
         }
         if debug_runtime_enabled() {
             eprintln!(
@@ -377,14 +377,18 @@ impl ExecutionService {
                 request.session_id, status, body
             );
         }
-        if status >= 400 {
-            return Err(anyhow!(
-                "{}",
-                body.pointer("/result/error")
-                    .or_else(|| body.get("error"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("runtime worker failed")
-            ));
+        require_successful_runtime_dispatch(status, &body)?;
+        if let Some(record) = continuation.as_ref() {
+            let store = lifecycle_store(&record.commander_session_id)?;
+            if !store.callback_continuation_completion_proven(record)? {
+                return Err(anyhow!(
+                    "CONTINUATION_SUCCESS_EVIDENCE_NOT_DURABLE:{}:{}:{}",
+                    record.request_id,
+                    record.runtime_id,
+                    record.lease_id
+                ));
+            }
+            complete_and_ack_callback_continuation(&store, record)?;
         }
         Ok(json!({
             "status": "finished",
@@ -1004,11 +1008,26 @@ impl ExecutionService {
             ContinuationWriteOutcome::AlreadyAcknowledged => {
                 return Ok(continuation_result(&continuation, "already_acknowledged"));
             }
-            ContinuationWriteOutcome::AlreadyCommitted => {
-                commit_and_ack_callback_continuation(&store, &continuation)?;
+            ContinuationWriteOutcome::AlreadyCompleted => {
+                complete_and_ack_callback_continuation(&store, &continuation)?;
                 return Ok(continuation_result(
                     &continuation,
                     "acknowledged_after_restart",
+                ));
+            }
+            ContinuationWriteOutcome::AlreadyDispatched => {
+                if store.callback_continuation_completion_proven(&continuation)? {
+                    complete_and_ack_callback_continuation(&store, &continuation)?;
+                    return Ok(continuation_result(
+                        &continuation,
+                        "reconciled_and_acknowledged_after_restart",
+                    ));
+                }
+                return Err(anyhow!(
+                    "CONTINUATION_DISPATCHED_RECONCILIATION_REQUIRED:{}:{}:{}",
+                    continuation.request_id,
+                    continuation.runtime_id,
+                    continuation.lease_id
                 ));
             }
             ContinuationWriteOutcome::Prepared | ContinuationWriteOutcome::AlreadyPrepared => {}
@@ -1784,11 +1803,24 @@ fn continuation_result(record: &ContinuationDispatchRecord, status: &str) -> Val
     })
 }
 
-fn commit_and_ack_callback_continuation(
+fn require_successful_runtime_dispatch(status: u16, body: &Value) -> Result<()> {
+    if status < 400 {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{}",
+        body.pointer("/result/error")
+            .or_else(|| body.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("runtime worker failed")
+    ))
+}
+
+fn complete_and_ack_callback_continuation(
     store: &SessionLifecycleStore,
     record: &ContinuationDispatchRecord,
 ) -> Result<()> {
-    store.mark_callback_continuation_committed(record)?;
+    store.mark_callback_continuation_completed(record)?;
     store.acknowledge_callback(
         &record.child_transaction_id,
         &record.child_event_id,
@@ -2608,12 +2640,13 @@ mod tests {
     use super::{
         EnqueueTurnRequest, ExecutionService, RetryRuntimeIdentity,
         RouterRecoveryCloseRuntimeRequest, RuntimeLease, TerminalDeliveryIdentity,
-        commit_and_ack_callback_continuation, failed_session_retry_root,
+        complete_and_ack_callback_continuation, failed_session_retry_root,
         failed_session_runtime_fallback, intake_terminal_receipt, is_historical_terminal_runtime,
         payload_to_run_agent_request, publish_terminal_failure_callback_from_store,
-        replay_terminal_callbacks_from_store, runtime_lease_from_snapshot,
-        runtime_terminal_state_from_snapshot, terminal_runtime_is_current,
-        validate_delegated_input_digest, validate_terminalization_identity,
+        replay_terminal_callbacks_from_store, require_successful_runtime_dispatch,
+        runtime_lease_from_snapshot, runtime_terminal_state_from_snapshot,
+        terminal_runtime_is_current, validate_delegated_input_digest,
+        validate_terminalization_identity,
     };
     use crate::{build_state, services::manager::ServiceManager};
     use lifecycle::{RuntimeState, SessionProjection, SessionState, TaskPlan};
@@ -3792,7 +3825,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_continuation_commits_and_acks_exactly_once() {
+    fn callback_continuation_completes_and_acks_exactly_once() {
         let root = tempfile::tempdir().expect("temp lifecycle root");
         let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Completed);
         let callback = DurableCallbackRecord::new(
@@ -3822,8 +3855,11 @@ mod tests {
             .prepare_callback_continuation(&continuation)
             .expect("prepare continuation");
 
-        commit_and_ack_callback_continuation(&store, &continuation).expect("first commitment");
-        commit_and_ack_callback_continuation(&store, &continuation).expect("duplicate replay");
+        store
+            .mark_callback_continuation_dispatched(&continuation)
+            .expect("parent dispatch");
+        complete_and_ack_callback_continuation(&store, &continuation).expect("first completion");
+        complete_and_ack_callback_continuation(&store, &continuation).expect("duplicate replay");
 
         let readback = store.readback().expect("readback");
         assert_eq!(readback.acknowledged_callbacks, 1);
@@ -3840,10 +3876,85 @@ mod tests {
                 .expect("continuation replay")
                 .is_empty()
         );
+        assert_eq!(
+            store
+                .prepare_callback_continuation(&continuation)
+                .expect("duplicate successful replay"),
+            session_lifecycle::ContinuationWriteOutcome::AlreadyAcknowledged
+        );
     }
 
     #[test]
-    fn callback_continuation_restart_finishes_ack_without_second_commitment() {
+    fn registered_parent_failure_remains_dispatched_and_unacknowledged() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Completed);
+        let callback = DurableCallbackRecord::new(
+            &store
+                .terminal_receipt(&delivery.transaction_id, &delivery.event_id)
+                .expect("receipt"),
+            json!("child result"),
+            json!({"kind": "gateway.callback", "payload": {"body": {"item": {"id": "message-1", "text": "child result"}}}}),
+            "a".repeat(64),
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            CallbackEffectIdentity::Exact {
+                effect_id: "message-1".to_string(),
+            },
+        )
+        .expect("callback");
+        store.publish_callback(&callback).expect("publish callback");
+        store
+            .mark_callback_intaken(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+            )
+            .expect("intake callback");
+        let continuation =
+            ContinuationDispatchRecord::from_callback(&callback).expect("continuation");
+        store
+            .prepare_callback_continuation(&continuation)
+            .expect("prepare continuation");
+        assert_eq!(
+            store
+                .callback_continuations_for_replay()
+                .expect("pre-registration continuation")[0]
+                .state,
+            session_lifecycle::ContinuationDispatchState::Prepared
+        );
+        assert_eq!(
+            store
+                .readback()
+                .expect("registration failure readback")
+                .acknowledged_callbacks,
+            0
+        );
+        store
+            .mark_callback_continuation_dispatched(&continuation)
+            .expect("runtime registered and activated");
+        assert_eq!(
+            require_successful_runtime_dispatch(
+                500,
+                &json!({"result": {"error": "provider failed"}}),
+            )
+            .expect_err("provider failure must stop before completion")
+            .to_string(),
+            "provider failed"
+        );
+
+        let readback = store.readback().expect("failure readback");
+        assert_eq!(readback.acknowledged_callbacks, 0);
+        assert_eq!(readback.acknowledged_receipts, 0);
+        assert_eq!(
+            store
+                .callback_continuations_for_replay()
+                .expect("uncertain continuation")[0]
+                .state,
+            session_lifecycle::ContinuationDispatchState::Dispatched
+        );
+    }
+
+    #[test]
+    fn callback_continuation_completed_restart_finishes_ack_without_second_execution() {
         let root = tempfile::tempdir().expect("temp lifecycle root");
         let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Completed);
         let callback = DurableCallbackRecord::new(
@@ -3873,8 +3984,11 @@ mod tests {
             .prepare_callback_continuation(&continuation)
             .expect("prepare continuation");
         store
-            .mark_callback_continuation_committed(&continuation)
-            .expect("durable parent commitment before crash");
+            .mark_callback_continuation_dispatched(&continuation)
+            .expect("durable parent dispatch before completion");
+        store
+            .mark_callback_continuation_completed(&continuation)
+            .expect("durable parent completion before crash");
         drop(store);
 
         let reopened = SessionLifecycleStore::open(
@@ -3883,7 +3997,7 @@ mod tests {
             LifecycleConfig::default(),
         )
         .expect("reopen after restart");
-        commit_and_ack_callback_continuation(&reopened, &continuation)
+        complete_and_ack_callback_continuation(&reopened, &continuation)
             .expect("restart finishes ack");
         assert_eq!(
             reopened
