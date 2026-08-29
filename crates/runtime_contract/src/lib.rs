@@ -42,6 +42,10 @@ pub struct CallContext {
 pub struct LifecycleExecutionContext {
     pub transaction_id: String,
     pub commander_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_mission_revision_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_input_sha256: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
     #[serde(default)]
@@ -341,6 +345,10 @@ pub struct RunAgentRequest {
     #[serde(default)]
     pub parent_session_id: Option<String>,
     #[serde(default)]
+    pub parent_mission_revision_sha256: Option<String>,
+    #[serde(default)]
+    pub delegated_input_sha256: Option<String>,
+    #[serde(default)]
     pub depth: Option<usize>,
     #[serde(default)]
     pub runtime_context: Option<String>,
@@ -358,6 +366,33 @@ pub struct RunAgentRequest {
     pub maximum_parallel_runtime_workers: Option<usize>,
     #[serde(default)]
     pub worker_env: HashMap<String, String>,
+}
+
+impl RunAgentRequest {
+    pub fn validate_delegated_identity(&self) -> Result<(), String> {
+        let delegated = self
+            .parent_session_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        for (name, value) in [
+            (
+                "parent_mission_revision_sha256",
+                self.parent_mission_revision_sha256.as_deref(),
+            ),
+            (
+                "delegated_input_sha256",
+                self.delegated_input_sha256.as_deref(),
+            ),
+        ] {
+            if delegated && value.is_none_or(|value| value.trim().is_empty()) {
+                return Err(format!("DELEGATED_LIFECYCLE_IDENTITY_MISSING:{name}"));
+            }
+            if value.is_some_and(|value| !is_lower_sha256(value)) {
+                return Err(format!("DELEGATED_LIFECYCLE_IDENTITY_INVALID:{name}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -385,6 +420,7 @@ pub struct RuntimeWorkerResponse {
 #[cfg(test)]
 mod tests {
     use super::RunAgentRequest;
+    use serde_json::json;
 
     #[test]
     fn run_agent_request_preserves_optional_retry_lineage_on_the_wire() {
@@ -402,5 +438,39 @@ mod tests {
         }))
         .expect("first request should decode without retry lineage");
         assert_eq!(first.fallback_from_id, None);
+    }
+
+    #[test]
+    fn delegated_dispatch_requires_mission_revision_and_input_digest() {
+        let mut request: RunAgentRequest = serde_json::from_value(json!({
+            "runtime_id": "runtime-child",
+            "lease_id": "lease-child",
+            "session_id": "child-session",
+            "parent_session_id": "019fd83e-861a-7b62-a628-0e0ad2f88a27"
+        }))
+        .expect("delegated request");
+        assert_eq!(
+            request.validate_delegated_identity().unwrap_err(),
+            "DELEGATED_LIFECYCLE_IDENTITY_MISSING:parent_mission_revision_sha256"
+        );
+        request.parent_mission_revision_sha256 =
+            Some("69edd74f732aa5bed571d652e7f91874a16881116b454218a508f413a33fcd70".to_string());
+        assert_eq!(
+            request.validate_delegated_identity().unwrap_err(),
+            "DELEGATED_LIFECYCLE_IDENTITY_MISSING:delegated_input_sha256"
+        );
+    }
+
+    #[test]
+    fn top_level_dispatch_remains_compatible_without_delegated_digests() {
+        let request: RunAgentRequest = serde_json::from_value(json!({
+            "runtime_id": "runtime-top",
+            "lease_id": "lease-top",
+            "session_id": "top-session"
+        }))
+        .expect("top-level request");
+        request
+            .validate_delegated_identity()
+            .expect("top-level compatibility");
     }
 }

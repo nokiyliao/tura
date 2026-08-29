@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::app::AppState;
 use crate::process_info::current_process_start_time;
@@ -39,6 +39,16 @@ async fn dispatch_run_agent_inner(
     ipc_request_id: String,
     runtime_slot_acquired: bool,
 ) -> (u16, Value) {
+    if let Err(error) = req.validate_delegated_identity() {
+        return (
+            400,
+            json!({
+                "ok": false,
+                "code": error.split(':').next().unwrap_or("DELEGATED_LIFECYCLE_IDENTITY_INVALID"),
+                "error": error,
+            }),
+        );
+    }
     let Some(session_id) = req
         .session_id
         .clone()
@@ -67,6 +77,8 @@ async fn dispatch_run_agent_inner(
                 .clone()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| session_id.clone()),
+            parent_mission_revision_sha256: req.parent_mission_revision_sha256.clone(),
+            delegated_input_sha256: req.delegated_input_sha256.clone(),
             task_id: None,
             goal_id: None,
             operator_override: false,

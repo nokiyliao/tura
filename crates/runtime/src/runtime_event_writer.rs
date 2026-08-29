@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use lifecycle::{RuntimeAggregate, RuntimeEvent, RuntimeState};
 use runtime_contract::LifecycleExecutionContext;
 use session_lifecycle::{
-    commander_store_path, LifecycleConfig, SessionLifecycleStore, TerminalReceipt,
-    TerminalReceiptIdentity, TerminalState,
+    LifecycleConfig, SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity,
+    TerminalState, commander_store_path,
 };
 use session_log_contract::{
     ActivateRuntimeLeaseRequest, AppendSessionFeedEventRequest, CommitRuntimeEventRequest,
@@ -293,6 +293,18 @@ impl RuntimeEventWriter {
         receipt.task_id.clone_from(&lifecycle.task_id);
         receipt.goal_id.clone_from(&lifecycle.goal_id);
         receipt.operator_override = lifecycle.operator_override;
+        if let Some(value) = &lifecycle.parent_mission_revision_sha256 {
+            receipt.audit_metadata.insert(
+                "parent_mission_revision_sha256".to_string(),
+                serde_json::json!(value),
+            );
+        }
+        if let Some(value) = &lifecycle.delegated_input_sha256 {
+            receipt.audit_metadata.insert(
+                "delegated_input_sha256".to_string(),
+                serde_json::json!(value),
+            );
+        }
         receipt.audit_metadata.insert(
             "runtime_event_seq".to_string(),
             serde_json::json!(cursor.next_event_seq),
@@ -354,18 +366,23 @@ impl RuntimeEventWriter {
                     runtime_id: runtime_id.to_string(),
                     session_id: self.session_id.clone(),
                     fallback_from_id: runtime.fallback_from_id.clone(),
-                    lifecycle: self.lifecycle.as_ref().map(|lifecycle| {
-                        RuntimeLifecycleIdentity {
+                    lifecycle: self
+                        .lifecycle
+                        .as_ref()
+                        .map(|lifecycle| RuntimeLifecycleIdentity {
                             commander_session_id: lifecycle.commander_session_id.clone(),
                             transaction_id: lifecycle.transaction_id.clone(),
+                            parent_mission_revision_sha256: lifecycle
+                                .parent_mission_revision_sha256
+                                .clone(),
+                            delegated_input_sha256: lifecycle.delegated_input_sha256.clone(),
                             task_id: lifecycle.task_id.clone(),
                             goal_id: lifecycle.goal_id.clone(),
                             operator_override: lifecycle.operator_override,
                             dispatch_runtime_id: self.initial_runtime_id.clone(),
                             dispatch_lease_id: self.initial_lease_id.clone(),
                             receipt_event_seq: self.next_receipt_event_seq,
-                        }
-                    }),
+                        }),
                 }))?;
         let (revision, next_event_seq) = match response {
             SessionLogResponse::RuntimeRegistered {
@@ -587,8 +604,8 @@ mod tests {
         ProviderConfig, RuntimeError, RuntimeProviderConfig, SessionCommand, TaskPlan, ToolChoice,
     };
     use session_log_contract::{
-        CreateSessionRequest, GetRuntimeLeaseRequest, ReadSessionFeedRequest,
-        ReplayRuntimeRequest, SessionFeedEvent,
+        CreateSessionRequest, GetRuntimeLeaseRequest, ReadSessionFeedRequest, ReplayRuntimeRequest,
+        SessionFeedEvent,
     };
     use std::sync::Mutex;
 
@@ -648,15 +665,17 @@ mod tests {
             sender,
         };
 
-        assert!(publisher
-            .publish(SessionFeedEvent::AssistantTextDelta {
-                message_id: "runtime-closed-feed.message".to_string(),
-                part_id: "runtime-closed-feed.message".to_string(),
-                delta: " discarded".to_string(),
-                created_at: 1,
-                updated_at: 2,
-            })
-            .is_err());
+        assert!(
+            publisher
+                .publish(SessionFeedEvent::AssistantTextDelta {
+                    message_id: "runtime-closed-feed.message".to_string(),
+                    part_id: "runtime-closed-feed.message".to_string(),
+                    delta: " discarded".to_string(),
+                    created_at: 1,
+                    updated_at: 2,
+                })
+                .is_err()
+        );
 
         let state = state
             .lock()
@@ -682,6 +701,8 @@ mod tests {
         let lifecycle = LifecycleExecutionContext {
             transaction_id: "ordering-transaction".to_string(),
             commander_session_id: "ordering-commander".to_string(),
+            parent_mission_revision_sha256: None,
+            delegated_input_sha256: None,
             task_id: Some("ordering-task".to_string()),
             goal_id: Some("ordering-goal".to_string()),
             operator_override: true,
@@ -741,11 +762,13 @@ mod tests {
         let readback = store.readback().expect("receipt readback after crash");
         assert_eq!(readback.pending_receipts, 1);
         assert_eq!(readback.applied_receipts, 0);
-        assert!(writer
-            .cursors
-            .get("ordering-runtime")
-            .and_then(|cursor| cursor.pending_terminal.as_ref())
-            .is_some());
+        assert!(
+            writer
+                .cursors
+                .get("ordering-runtime")
+                .and_then(|cursor| cursor.pending_terminal.as_ref())
+                .is_some()
+        );
         assert_eq!(writer.next_receipt_event_seq, 0);
 
         writer
@@ -761,11 +784,13 @@ mod tests {
             .expect("same receipt remains durable");
         assert_eq!(receipt.event_seq, 0);
         assert_eq!(writer.next_receipt_event_seq, 1);
-        assert!(writer
-            .cursors
-            .get("ordering-runtime")
-            .and_then(|cursor| cursor.pending_terminal.as_ref())
-            .is_none());
+        assert!(
+            writer
+                .cursors
+                .get("ordering-runtime")
+                .and_then(|cursor| cursor.pending_terminal.as_ref())
+                .is_none()
+        );
 
         match previous_root {
             Some(value) => {
@@ -1094,11 +1119,11 @@ mod tests {
             .seal_runtime(&rejected_runtime_id)
             .expect_err("rejected feed remains observable after terminal commit");
         assert!(feed_error.contains("TargetSessionNotFound"));
-        let replay = session_log_contract::client::call_service(
-            &SessionLogCommand::ReplayRuntime(ReplayRuntimeRequest {
+        let replay = session_log_contract::client::call_service(&SessionLogCommand::ReplayRuntime(
+            ReplayRuntimeRequest {
                 runtime_id: rejected_runtime_id.clone(),
-            }),
-        )
+            },
+        ))
         .expect("replay rejected feed runtime after seal");
         let SessionLogResponse::RuntimeReplayed {
             runtime: Some(replay),

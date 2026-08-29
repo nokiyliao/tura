@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Request to dispatch a single child agent.
 pub struct ChildAgentRequest {
@@ -18,6 +18,8 @@ pub struct ChildAgentRequest {
     pub prompt: String,
     pub directory: Option<PathBuf>,
     pub parent_session_id: String,
+    pub parent_mission_revision_sha256: String,
+    pub delegated_input_sha256: String,
     pub depth: usize,
 }
 
@@ -111,6 +113,8 @@ pub fn dispatch_child_agent(req: &ChildAgentRequest) -> Result<ChildAgentSummary
         "prompt": req.prompt,
         "directory": req.directory.as_ref().map(|d| d.to_string_lossy().to_string()),
         "parent_session_id": req.parent_session_id,
+        "parent_mission_revision_sha256": req.parent_mission_revision_sha256,
+        "delegated_input_sha256": req.delegated_input_sha256,
         "depth": req.depth,
     });
     let body = serde_json::to_string(&payload)

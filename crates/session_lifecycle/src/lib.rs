@@ -5,8 +5,8 @@
 
 use fs2::FileExt;
 use notify::{
-    event::{AccessKind, AccessMode, ModifyKind},
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{AccessKind, AccessMode, ModifyKind},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,6 +22,8 @@ use std::time::Duration;
 const RECEIPT_SCHEMA: &str = "tura_terminal_receipt_v1";
 const STORED_RECEIPT_SCHEMA: &str = "tura_stored_terminal_receipt_v1";
 const ACK_SCHEMA: &str = "tura_terminal_receipt_ack_v1";
+const CALLBACK_SCHEMA: &str = "tura_durable_terminal_callback_v1";
+const CALLBACK_ACK_SCHEMA: &str = "tura_durable_terminal_callback_ack_v1";
 const RELEASE_SCHEMA: &str = "tura_terminal_slot_release_v1";
 const BLOCKER_SCHEMA: &str = "tura_session_lifecycle_blocker_v1";
 const RECONCILE_SCHEMA: &str = "tura_session_lifecycle_reconcile_v1";
@@ -189,6 +191,89 @@ pub enum AckOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CallbackEffectIdentity {
+    Exact {
+        effect_id: String,
+    },
+    ProvenZeroEffect {
+        classification: String,
+        evidence_sha256: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableCallbackRecord {
+    pub schema_version: String,
+    pub transaction_id: String,
+    pub event_id: String,
+    pub commander_session_id: String,
+    pub child_session_id: String,
+    pub runtime_id: String,
+    pub lease_id: String,
+    pub terminal_receipt_sha256: String,
+    pub terminal_state: TerminalState,
+    pub callback_payload: Value,
+    pub callback_payload_sha256: String,
+    pub transport_payload: Value,
+    pub transport_payload_sha256: String,
+    pub parent_mission_revision_sha256: String,
+    pub delegated_input_sha256: String,
+    pub effect_identity: CallbackEffectIdentity,
+}
+
+impl DurableCallbackRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        receipt: &TerminalReceipt,
+        callback_payload: Value,
+        transport_payload: Value,
+        parent_mission_revision_sha256: impl Into<String>,
+        delegated_input_sha256: impl Into<String>,
+        effect_identity: CallbackEffectIdentity,
+    ) -> LifecycleResult<Self> {
+        Ok(Self {
+            schema_version: CALLBACK_SCHEMA.to_string(),
+            transaction_id: receipt.transaction_id.clone(),
+            event_id: receipt.event_id.clone(),
+            commander_session_id: receipt.commander_session_id.clone(),
+            child_session_id: receipt.child_session_id.clone(),
+            runtime_id: receipt.runtime_id.clone(),
+            lease_id: receipt.lease_id.clone(),
+            terminal_receipt_sha256: terminal_receipt_sha256(receipt)?,
+            terminal_state: receipt.terminal_state,
+            callback_payload_sha256: canonical_value_sha256(&callback_payload),
+            callback_payload,
+            transport_payload_sha256: canonical_value_sha256(&transport_payload),
+            transport_payload,
+            parent_mission_revision_sha256: parent_mission_revision_sha256.into(),
+            delegated_input_sha256: delegated_input_sha256.into(),
+            effect_identity,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallbackWriteOutcome {
+    Written(PathBuf),
+    AlreadyDurable(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallbackIntakeOutcome {
+    Intaken,
+    AlreadyIntaken,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CallbackAcknowledgement {
+    schema_version: String,
+    record: DurableCallbackRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiptAcknowledgement {
     schema_version: String,
@@ -349,6 +434,9 @@ pub struct LifecycleReadback {
     pub pending_receipts: usize,
     pub applied_receipts: usize,
     pub acknowledged_receipts: usize,
+    pub pending_callbacks: usize,
+    pub intaken_callbacks: usize,
+    pub acknowledged_callbacks: usize,
     pub released_slots: usize,
     pub last_reconcile: Option<Value>,
     pub last_blocker: Option<Value>,
@@ -530,6 +618,120 @@ impl SessionLifecycleStore {
         })
     }
 
+    pub fn publish_callback(
+        &self,
+        record: &DurableCallbackRecord,
+    ) -> LifecycleResult<CallbackWriteOutcome> {
+        self.validate_callback(record)?;
+        self.with_lock(|| {
+            let key = receipt_key(&record.transaction_id, &record.event_id);
+            for directory in ["acknowledged", "intaken", "pending"] {
+                let path = self.root.join("callbacks").join(directory).join(&key);
+                if path.exists() {
+                    if directory == "acknowledged" {
+                        let acknowledgement: CallbackAcknowledgement = read_json(&path)?;
+                        if acknowledgement.record == *record {
+                            return Ok(CallbackWriteOutcome::AlreadyDurable(path));
+                        }
+                    } else {
+                        let existing: DurableCallbackRecord = read_json(&path)?;
+                        if existing == *record {
+                            return Ok(CallbackWriteOutcome::AlreadyDurable(path));
+                        }
+                    }
+                    return Err(LifecycleBlocker::new("CALLBACK_IDENTITY_CONFLICT", key));
+                }
+            }
+            let path = self.root.join("callbacks/pending").join(key);
+            durable_write_json(&path, record)?;
+            Ok(CallbackWriteOutcome::Written(path))
+        })
+    }
+
+    pub fn callbacks_for_replay(&self) -> LifecycleResult<Vec<DurableCallbackRecord>> {
+        let mut callbacks = Vec::new();
+        for directory in ["pending", "intaken"] {
+            for path in json_files(&self.root.join("callbacks").join(directory))? {
+                let callback: DurableCallbackRecord = read_json(&path)?;
+                let key = receipt_key(&callback.transaction_id, &callback.event_id);
+                if self.root.join("callbacks/acknowledged").join(key).exists() {
+                    continue;
+                }
+                self.validate_callback(&callback)?;
+                callbacks.push(callback);
+            }
+        }
+        callbacks.sort_by(|left, right| {
+            (&left.transaction_id, &left.event_id).cmp(&(&right.transaction_id, &right.event_id))
+        });
+        Ok(callbacks)
+    }
+
+    pub fn mark_callback_intaken(
+        &self,
+        transaction_id: &str,
+        event_id: &str,
+        callback_payload_sha256: &str,
+    ) -> LifecycleResult<CallbackIntakeOutcome> {
+        require_sha256("callback_payload_sha256", callback_payload_sha256)?;
+        self.with_lock(|| {
+            let key = receipt_key(transaction_id, event_id);
+            let intaken = self.root.join("callbacks/intaken").join(&key);
+            if intaken.exists() {
+                let record: DurableCallbackRecord = read_json(&intaken)?;
+                if record.callback_payload_sha256 == callback_payload_sha256 {
+                    return Ok(CallbackIntakeOutcome::AlreadyIntaken);
+                }
+                return Err(LifecycleBlocker::new("CALLBACK_INTAKE_CONFLICT", key));
+            }
+            let pending = self.root.join("callbacks/pending").join(&key);
+            let record: DurableCallbackRecord = read_json(&pending)?;
+            if record.callback_payload_sha256 != callback_payload_sha256 {
+                return Err(LifecycleBlocker::new("CALLBACK_INTAKE_CONFLICT", key));
+            }
+            durable_write_json(&intaken, &record)?;
+            remove_durable(&pending)?;
+            Ok(CallbackIntakeOutcome::Intaken)
+        })
+    }
+
+    pub fn acknowledge_callback(
+        &self,
+        transaction_id: &str,
+        event_id: &str,
+        callback_payload_sha256: &str,
+        effect_identity: &CallbackEffectIdentity,
+    ) -> LifecycleResult<AckOutcome> {
+        require_sha256("callback_payload_sha256", callback_payload_sha256)?;
+        self.with_lock(|| {
+            let key = receipt_key(transaction_id, event_id);
+            let acknowledgement = CallbackAcknowledgement {
+                schema_version: CALLBACK_ACK_SCHEMA.to_string(),
+                record: {
+                    let intaken = self.root.join("callbacks/intaken").join(&key);
+                    let record: DurableCallbackRecord = read_json(&intaken)?;
+                    if record.callback_payload_sha256 != callback_payload_sha256
+                        || record.effect_identity != *effect_identity
+                    {
+                        return Err(LifecycleBlocker::new("CALLBACK_ACK_CONFLICT", key));
+                    }
+                    record
+                },
+            };
+            let acknowledged = self.root.join("callbacks/acknowledged").join(&key);
+            if acknowledged.exists() {
+                let existing: CallbackAcknowledgement = read_json(&acknowledged)?;
+                return if existing == acknowledgement {
+                    Ok(AckOutcome::AlreadyAcknowledged)
+                } else {
+                    Err(LifecycleBlocker::new("CALLBACK_ACK_CONFLICT", key))
+                };
+            }
+            durable_write_json(&acknowledged, &acknowledgement)?;
+            Ok(AckOutcome::Acknowledged)
+        })
+    }
+
     pub fn record_identity_failure(&self, failure: PendingIdentityFailure) -> LifecycleResult<()> {
         if failure.commander_session_id != self.commander_session_id {
             return Err(LifecycleBlocker::new(
@@ -668,6 +870,9 @@ impl SessionLifecycleStore {
             pending_receipts: json_files(&self.root.join("receipts/pending"))?.len(),
             applied_receipts: json_files(&self.root.join("receipts/applied"))?.len(),
             acknowledged_receipts: json_files(&self.root.join("receipts/acknowledged"))?.len(),
+            pending_callbacks: json_files(&self.root.join("callbacks/pending"))?.len(),
+            intaken_callbacks: json_files(&self.root.join("callbacks/intaken"))?.len(),
+            acknowledged_callbacks: json_files(&self.root.join("callbacks/acknowledged"))?.len(),
             released_slots: json_files(&self.root.join("slots/released"))?.len(),
             last_reconcile: read_optional_value(&self.root.join("readback/last_reconcile.json"))?,
             last_blocker: read_optional_value(&self.root.join("readback/last_blocker.json"))?,
@@ -679,6 +884,9 @@ impl SessionLifecycleStore {
             "receipts/pending",
             "receipts/applied",
             "receipts/acknowledged",
+            "callbacks/pending",
+            "callbacks/intaken",
+            "callbacks/acknowledged",
             "identity_pending",
             "checkpoints",
             "slots/released",
@@ -720,6 +928,95 @@ impl SessionLifecycleStore {
             return Err(LifecycleBlocker::new(
                 "HISTORY_OR_FOLLOW_UP_NOT_PRESERVED",
                 &receipt.event_id,
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_callback(&self, record: &DurableCallbackRecord) -> LifecycleResult<()> {
+        if record.schema_version != CALLBACK_SCHEMA {
+            return Err(LifecycleBlocker::new(
+                "CALLBACK_SCHEMA_UNSUPPORTED",
+                &record.schema_version,
+            ));
+        }
+        for (name, value) in [
+            ("transaction_id", record.transaction_id.as_str()),
+            ("event_id", record.event_id.as_str()),
+            ("commander_session_id", record.commander_session_id.as_str()),
+            ("child_session_id", record.child_session_id.as_str()),
+            ("runtime_id", record.runtime_id.as_str()),
+            ("lease_id", record.lease_id.as_str()),
+        ] {
+            require_identifier(name, value)?;
+        }
+        for (name, value) in [
+            (
+                "terminal_receipt_sha256",
+                record.terminal_receipt_sha256.as_str(),
+            ),
+            (
+                "callback_payload_sha256",
+                record.callback_payload_sha256.as_str(),
+            ),
+            (
+                "transport_payload_sha256",
+                record.transport_payload_sha256.as_str(),
+            ),
+            (
+                "parent_mission_revision_sha256",
+                record.parent_mission_revision_sha256.as_str(),
+            ),
+            (
+                "delegated_input_sha256",
+                record.delegated_input_sha256.as_str(),
+            ),
+        ] {
+            require_sha256(name, value)?;
+        }
+        if record.commander_session_id != self.commander_session_id {
+            return Err(LifecycleBlocker::new(
+                "COMMANDER_IDENTITY_MISMATCH",
+                &record.commander_session_id,
+            ));
+        }
+        if canonical_value_sha256(&record.callback_payload) != record.callback_payload_sha256
+            || canonical_value_sha256(&record.transport_payload) != record.transport_payload_sha256
+        {
+            return Err(LifecycleBlocker::new(
+                "CALLBACK_PAYLOAD_DIGEST_MISMATCH",
+                &record.event_id,
+            ));
+        }
+        if record.callback_payload_sha256 == record.delegated_input_sha256 {
+            return Err(LifecycleBlocker::new(
+                "PROMPT_ECHO_REJECTED",
+                &record.event_id,
+            ));
+        }
+        match &record.effect_identity {
+            CallbackEffectIdentity::Exact { effect_id } => {
+                require_identifier("effect_id", effect_id)?
+            }
+            CallbackEffectIdentity::ProvenZeroEffect {
+                classification,
+                evidence_sha256,
+            } => {
+                require_identifier("zero_effect_classification", classification)?;
+                require_sha256("zero_effect_evidence_sha256", evidence_sha256)?;
+            }
+        }
+        let receipt = self.terminal_receipt(&record.transaction_id, &record.event_id)?;
+        if receipt.commander_session_id != record.commander_session_id
+            || receipt.child_session_id != record.child_session_id
+            || receipt.runtime_id != record.runtime_id
+            || receipt.lease_id != record.lease_id
+            || receipt.terminal_state != record.terminal_state
+            || terminal_receipt_sha256(&receipt)? != record.terminal_receipt_sha256
+        {
+            return Err(LifecycleBlocker::new(
+                "CALLBACK_TERMINAL_RECEIPT_IDENTITY_CONFLICT",
+                &record.event_id,
             ));
         }
         Ok(())
@@ -1089,6 +1386,18 @@ fn require_identifier(name: &str, value: &str) -> LifecycleResult<()> {
     }
 }
 
+fn require_sha256(name: &str, value: &str) -> LifecycleResult<()> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(LifecycleBlocker::new("LIFECYCLE_SHA256_INVALID", name))
+    }
+}
+
 fn receipt_key(transaction_id: &str, event_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(transaction_id.as_bytes());
@@ -1100,6 +1409,41 @@ fn receipt_key(transaction_id: &str, event_id: &str) -> String {
 fn payload_sha256(receipt: &TerminalReceipt) -> LifecycleResult<String> {
     let bytes = serde_json::to_vec(receipt).map_err(json_blocker)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub fn terminal_receipt_sha256(receipt: &TerminalReceipt) -> LifecycleResult<String> {
+    payload_sha256(receipt)
+}
+
+pub fn canonical_value_sha256(value: &Value) -> String {
+    fn canonical(value: &Value) -> String {
+        match value {
+            Value::Null => "null".to_string(),
+            Value::Bool(value) => value.to_string(),
+            Value::Number(value) => value.to_string(),
+            Value::String(value) => serde_json::to_string(value).expect("JSON string is encodable"),
+            Value::Array(values) => format!(
+                "[{}]",
+                values.iter().map(canonical).collect::<Vec<_>>().join(",")
+            ),
+            Value::Object(values) => {
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort();
+                let fields = keys
+                    .into_iter()
+                    .map(|key| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(key).expect("JSON key is encodable"),
+                            canonical(&values[key])
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                format!("{{{}}}", fields.join(","))
+            }
+        }
+    }
+    format!("{:x}", Sha256::digest(canonical(value).as_bytes()))
 }
 
 fn read_stored_receipt(path: &Path) -> LifecycleResult<StoredReceipt> {
@@ -1244,6 +1588,184 @@ mod tests {
         receipt.goal_id = Some("goal-1".to_string());
         receipt.operator_override = true;
         receipt
+    }
+
+    fn callback(receipt: &TerminalReceipt, text: &str) -> DurableCallbackRecord {
+        DurableCallbackRecord::new(
+            receipt,
+            Value::String(text.to_string()),
+            serde_json::json!({
+                "kind": "gateway.callback",
+                "payload": {
+                    "session_id": receipt.child_session_id,
+                    "runtime_id": receipt.runtime_id,
+                    "body": {"item": {"id": "assistant-message-1", "text": text}}
+                }
+            }),
+            "69edd74f732aa5bed571d652e7f91874a16881116b454218a508f413a33fcd70",
+            canonical_value_sha256(&Value::String("delegated prompt".to_string())),
+            CallbackEffectIdentity::Exact {
+                effect_id: "assistant-message-1".to_string(),
+            },
+        )
+        .expect("callback record")
+    }
+
+    #[test]
+    fn durable_callback_success_and_duplicate_replay_are_exactly_once() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let receipt = receipt("callback-success", 0);
+        store
+            .write_terminal_receipt(&receipt)
+            .expect("terminal receipt");
+        store
+            .intake("transaction-1", "callback-success")
+            .expect("receipt intake");
+        let record = callback(&receipt, "child result");
+
+        assert!(matches!(
+            store.publish_callback(&record).expect("publish callback"),
+            CallbackWriteOutcome::Written(_)
+        ));
+        assert!(matches!(
+            store
+                .publish_callback(&record)
+                .expect("duplicate publication"),
+            CallbackWriteOutcome::AlreadyDurable(_)
+        ));
+        assert_eq!(
+            store.callbacks_for_replay().expect("pending replay"),
+            vec![record.clone()]
+        );
+        assert_eq!(
+            store
+                .mark_callback_intaken(
+                    &record.transaction_id,
+                    &record.event_id,
+                    &record.callback_payload_sha256,
+                )
+                .expect("intake callback"),
+            CallbackIntakeOutcome::Intaken
+        );
+        assert_eq!(
+            store
+                .acknowledge_callback(
+                    &record.transaction_id,
+                    &record.event_id,
+                    &record.callback_payload_sha256,
+                    &record.effect_identity,
+                )
+                .expect("ack callback"),
+            AckOutcome::Acknowledged
+        );
+        assert_eq!(
+            store
+                .acknowledge_callback(
+                    &record.transaction_id,
+                    &record.event_id,
+                    &record.callback_payload_sha256,
+                    &record.effect_identity,
+                )
+                .expect("duplicate ack"),
+            AckOutcome::AlreadyAcknowledged
+        );
+        assert!(
+            store
+                .callbacks_for_replay()
+                .expect("acked replay")
+                .is_empty()
+        );
+        let readback = store.readback().expect("callback readback");
+        assert_eq!(readback.pending_callbacks, 0);
+        assert_eq!(readback.intaken_callbacks, 1);
+        assert_eq!(readback.acknowledged_callbacks, 1);
+    }
+
+    #[test]
+    fn durable_callback_changed_payload_or_revision_conflicts() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let receipt = receipt("callback-conflict", 0);
+        store
+            .write_terminal_receipt(&receipt)
+            .expect("terminal receipt");
+        store
+            .intake("transaction-1", "callback-conflict")
+            .expect("receipt intake");
+        let record = callback(&receipt, "original result");
+        store.publish_callback(&record).expect("original callback");
+
+        let changed_payload = callback(&receipt, "changed result");
+        assert_eq!(
+            store.publish_callback(&changed_payload).unwrap_err().code,
+            "CALLBACK_IDENTITY_CONFLICT"
+        );
+        let mut changed_revision = record;
+        changed_revision.parent_mission_revision_sha256 = "7".repeat(64);
+        assert_eq!(
+            store.publish_callback(&changed_revision).unwrap_err().code,
+            "CALLBACK_IDENTITY_CONFLICT"
+        );
+    }
+
+    #[test]
+    fn callback_transport_failure_remains_pending_and_restart_replays_same_record() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let first = store(root.path());
+        let receipt = receipt("callback-restart", 0);
+        first
+            .write_terminal_receipt(&receipt)
+            .expect("terminal receipt");
+        first
+            .intake("transaction-1", "callback-restart")
+            .expect("receipt intake");
+        let record = callback(&receipt, "restart result");
+        first
+            .publish_callback(&record)
+            .expect("durable before transport");
+        drop(first);
+
+        let restarted = store(root.path());
+        assert_eq!(
+            restarted.callbacks_for_replay().expect("restart replay"),
+            vec![record]
+        );
+        let readback = restarted.readback().expect("restart readback");
+        assert_eq!(readback.pending_callbacks, 1);
+        assert_eq!(readback.acknowledged_callbacks, 0);
+    }
+
+    #[test]
+    fn callback_prompt_echo_is_rejected_before_publication_or_ack() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let receipt = receipt("callback-echo", 0);
+        store
+            .write_terminal_receipt(&receipt)
+            .expect("terminal receipt");
+        store
+            .intake("transaction-1", "callback-echo")
+            .expect("receipt intake");
+        let echo = Value::String("delegated prompt".to_string());
+        let record = DurableCallbackRecord::new(
+            &receipt,
+            echo.clone(),
+            serde_json::json!({"payload": {"body": {"item": {"text": echo}}}}),
+            "69edd74f732aa5bed571d652e7f91874a16881116b454218a508f413a33fcd70",
+            canonical_value_sha256(&Value::String("delegated prompt".to_string())),
+            CallbackEffectIdentity::Exact {
+                effect_id: "assistant-message-echo".to_string(),
+            },
+        )
+        .expect("echo record");
+        assert_eq!(
+            store.publish_callback(&record).unwrap_err().code,
+            "PROMPT_ECHO_REJECTED"
+        );
+        let readback = store.readback().expect("echo readback");
+        assert_eq!(readback.pending_callbacks, 0);
+        assert_eq!(readback.acknowledged_callbacks, 0);
     }
 
     #[test]

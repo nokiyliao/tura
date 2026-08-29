@@ -311,6 +311,10 @@ pub struct RuntimeLifecycleIdentity {
     pub commander_session_id: String,
     pub transaction_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_mission_revision_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_input_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_id: Option<String>,
@@ -340,6 +344,25 @@ impl RuntimeLifecycleIdentity {
             {
                 return Err(format!("{name} must be null or non-empty"));
             }
+        }
+        for (name, value) in [
+            (
+                "parent_mission_revision_sha256",
+                &self.parent_mission_revision_sha256,
+            ),
+            ("delegated_input_sha256", &self.delegated_input_sha256),
+        ] {
+            if value.as_deref().is_some_and(|value| {
+                value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) {
+                return Err(format!("{name} must be null or lowercase SHA-256"));
+            }
+        }
+        if self.parent_mission_revision_sha256.is_some() != self.delegated_input_sha256.is_some() {
+            return Err("delegated lifecycle digests must be supplied together".to_string());
         }
         Ok(())
     }

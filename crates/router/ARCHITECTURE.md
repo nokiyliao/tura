@@ -165,7 +165,12 @@ as worker noise, logged, and skipped before parsing the JSON response; stderr is
 still redirected to the worker log path.
 
 The worker owns its own session state and reports progress back to the gateway
-through callbacks; the router does not replay or merge agent state.
+through callbacks; the router does not merge agent state. Delegated terminal
+callbacks are first published to the existing Session lifecycle store with the
+parent mission revision, delegated-input digest, terminal receipt digest, and
+exact agent-message effect identity. Socket failure leaves that same record
+pending for restart replay, and the router acknowledges it only after the
+Commander-facing socket write and flush complete.
 
 ## Session DB Data Path
 

@@ -270,6 +270,10 @@ struct TerminalCallbackGate {
 }
 
 impl TerminalCallbackGate {
+    fn mark_completed(&mut self, runtime_id: String) {
+        self.completed.insert(runtime_id);
+    }
+
     fn accept_callback(
         &mut self,
         runtime_id: String,
@@ -372,6 +376,23 @@ async fn start_session_round_forwarder(
     let reader = tokio::task::spawn_blocking(move || {
         let mut subscription = subscription;
         let mut terminal_gate = TerminalCallbackGate::default();
+        match execution.replay_terminal_callbacks(&session_id, &request_id) {
+            Ok(replays) => {
+                for (callback, delivery) in replays {
+                    terminal_gate.mark_completed(delivery.runtime_id.clone());
+                    if sender
+                        .blocking_send((vec![callback], Some(delivery)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("router durable terminal callback replay blocked: {error:#}");
+                return;
+            }
+        }
         while let Ok(Some(entry)) = subscription.next_entry() {
             let terminal_callback = agent_message_is_terminal(&entry);
             if let Some(callback) = session_round_callback(entry.clone(), &session_id, &request_id)
@@ -380,6 +401,17 @@ async fn start_session_round_forwarder(
                 if terminal_callback {
                     match terminal_gate.accept_callback(runtime_id.clone(), callback) {
                         Ok(Some((callback, delivery))) => {
+                            let (callback, delivery) = match execution
+                                .publish_terminal_callback(delivery, callback)
+                            {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    eprintln!(
+                                        "router durable terminal callback publication blocked: {error:#}"
+                                    );
+                                    return;
+                                }
+                            };
                             if sender
                                 .blocking_send((vec![callback], Some(delivery)))
                                 .is_err()
@@ -401,6 +433,17 @@ async fn start_session_round_forwarder(
                 match execution.intake_terminal_feed_entry(&entry, &request_id) {
                     Ok(Some(delivery)) => match terminal_gate.accept_delivery(delivery) {
                         Ok(Some((callback, delivery))) => {
+                            let (callback, delivery) = match execution
+                                .publish_terminal_callback(delivery, callback)
+                            {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    eprintln!(
+                                        "router durable terminal callback publication blocked: {error:#}"
+                                    );
+                                    return;
+                                }
+                            };
                             if sender
                                 .blocking_send((vec![callback], Some(delivery)))
                                 .is_err()
@@ -808,6 +851,8 @@ mod tests {
             transaction_id: "transaction-1".to_string(),
             event_id: format!("{runtime_id}:terminal"),
             runtime_id: runtime_id.to_string(),
+            callback_payload_sha256: None,
+            callback_effect_identity: None,
         }
     }
 

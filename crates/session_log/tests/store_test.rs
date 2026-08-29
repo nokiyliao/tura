@@ -3,19 +3,18 @@ use lifecycle::{
     SessionCommand, SessionEvent, SessionManagement, SessionState, SessionTaskPlanPatch,
     StartCondition, TaskPlan, TaskStep, ToolChoice,
 };
-use session_log::{file_queue, SessionLogStore};
+use session_log::{SessionLogStore, file_queue};
 use session_log_contract::client::enqueue_command;
 use session_log_contract::{
     ActivateRuntimeLeaseRequest, AppendSessionFeedEventRequest, CheckpointType, CommandCheckpoint,
     CommitRuntimeEventRequest, CreateSessionRequest, DeleteSessionRequest, DeleteWorkspaceRequest,
-    ExecuteSessionCommandRequest, GetRuntimeLeaseRequest, GetSessionRequest, ListSessionRecordsRequest,
-    ListSessionsRequest, MarkSessionInterruptedRequest, PersistSessionDeltaRequest,
-    ReadContextSliceRequest, ReadSessionFeedRequest, RegisterRuntimeRequest, ReplayRuntimeRequest,
-    RuntimeEventCommitOutcome, RuntimeLeaseOutcome, RuntimeLifecycleIdentity,
-    RuntimeRegistrationOutcome,
-    SessionContextRecord, SessionDeltaEntry, SessionFeedAppendOutcome, SessionFeedEvent,
-    SessionLogCommand, SessionMetadataPatch, SessionRecordProjection, UpdateSessionRequest,
-    UpdateSessionTodosRequest,
+    ExecuteSessionCommandRequest, GetRuntimeLeaseRequest, GetSessionRequest,
+    ListSessionRecordsRequest, ListSessionsRequest, MarkSessionInterruptedRequest,
+    PersistSessionDeltaRequest, ReadContextSliceRequest, ReadSessionFeedRequest,
+    RegisterRuntimeRequest, ReplayRuntimeRequest, RuntimeEventCommitOutcome, RuntimeLeaseOutcome,
+    RuntimeLifecycleIdentity, RuntimeRegistrationOutcome, SessionContextRecord, SessionDeltaEntry,
+    SessionFeedAppendOutcome, SessionFeedEvent, SessionLogCommand, SessionMetadataPatch,
+    SessionRecordProjection, UpdateSessionRequest, UpdateSessionTodosRequest,
 };
 use std::path::Path;
 use std::process::Command;
@@ -257,9 +256,11 @@ fn list_sessions_orders_by_last_user_message_at_only() {
     assert_eq!(sessions.len(), 2);
     assert!(sessions[0].session_id.starts_with("user-sent-later-"));
     assert_eq!(sessions[0].last_user_message_at, Some(200));
-    assert!(sessions[1]
-        .session_id
-        .starts_with("assistant-updated-later-"));
+    assert!(
+        sessions[1]
+            .session_id
+            .starts_with("assistant-updated-later-")
+    );
     assert_eq!(sessions[1].last_user_message_at, Some(10));
 }
 
@@ -346,11 +347,13 @@ fn mark_session_interrupted_targets_only_one_session() {
         execute_typed_command(&store, &session_id, SessionCommand::StartUserTurn);
     }
 
-    assert!(store
-        .mark_session_interrupted(MarkSessionInterruptedRequest {
-            session_id: target_id.clone()
-        })
-        .expect("mark target interrupted"));
+    assert!(
+        store
+            .mark_session_interrupted(MarkSessionInterruptedRequest {
+                session_id: target_id.clone()
+            })
+            .expect("mark target interrupted")
+    );
 
     let target = store
         .get_session(GetSessionRequest {
@@ -377,11 +380,13 @@ fn reads_authoritative_workspace_snapshot_when_index_is_stale() {
     let workspace = db.workspace("workspace-authority");
     create_typed_session(&store, &workspace, &session_id);
     execute_typed_command(&store, &session_id, SessionCommand::StartUserTurn);
-    assert!(store
-        .mark_session_interrupted(MarkSessionInterruptedRequest {
-            session_id: session_id.clone(),
-        })
-        .expect("interrupt authoritative workspace session"));
+    assert!(
+        store
+            .mark_session_interrupted(MarkSessionInterruptedRequest {
+                session_id: session_id.clone(),
+            })
+            .expect("interrupt authoritative workspace session")
+    );
     let authoritative_updated_at = store
         .get_session(GetSessionRequest {
             session_id: session_id.clone(),
@@ -486,12 +491,14 @@ fn delete_session_and_workspace_update_index_and_workspace_dbs() {
             session_id: first_session.clone(),
         })
         .expect("delete session");
-    assert!(store
-        .get_session(GetSessionRequest {
-            session_id: first_session.clone(),
-        })
-        .expect("get deleted session")
-        .is_none());
+    assert!(
+        store
+            .get_session(GetSessionRequest {
+                session_id: first_session.clone(),
+            })
+            .expect("get deleted session")
+            .is_none()
+    );
     let (_page, records) = store
         .list_session_records(ListSessionRecordsRequest {
             session_id: first_session,
@@ -506,12 +513,14 @@ fn delete_session_and_workspace_update_index_and_workspace_dbs() {
             workspace: second_workspace.clone(),
         })
         .expect("delete workspace");
-    assert!(store
-        .get_session(GetSessionRequest {
-            session_id: second_session,
-        })
-        .expect("get workspace-deleted session")
-        .is_none());
+    assert!(
+        store
+            .get_session(GetSessionRequest {
+                session_id: second_session,
+            })
+            .expect("get workspace-deleted session")
+            .is_none()
+    );
     assert!(
         !db.workspace_db(&second_workspace).exists(),
         "delete_workspace should remove the workspace session log DB"
@@ -581,14 +590,18 @@ fn missing_workspace_db_removes_index_snapshot() {
     std::fs::remove_dir_all(std::path::PathBuf::from(&workspace).join(".tura"))
         .expect("remove workspace db directory");
 
-    assert!(store
-        .get_session(GetSessionRequest { session_id })
-        .expect("get after missing workspace db")
-        .is_none());
+    assert!(
+        store
+            .get_session(GetSessionRequest { session_id })
+            .expect("get after missing workspace db")
+            .is_none()
+    );
     let workspaces = store.list_workspaces().expect("workspaces after sweep");
-    assert!(!workspaces
-        .iter()
-        .any(|item| item.directory == session_log::path::normalize_workspace(&workspace)));
+    assert!(
+        !workspaces
+            .iter()
+            .any(|item| item.directory == session_log::path::normalize_workspace(&workspace))
+    );
 }
 
 #[test]
@@ -1211,14 +1224,16 @@ fn update_session_todos_feed_failure_rolls_back_canonical_projection() {
         format!("{error:#}").contains("todo feed rejected"),
         "unexpected failure: {error:#}"
     );
-    assert!(store
-        .get_session(GetSessionRequest {
-            session_id: session_id.clone(),
-        })
-        .expect("read rolled back todo session")
-        .expect("rolled back todo session exists")
-        .todos
-        .is_empty());
+    assert!(
+        store
+            .get_session(GetSessionRequest {
+                session_id: session_id.clone(),
+            })
+            .expect("read rolled back todo session")
+            .expect("rolled back todo session exists")
+            .todos
+            .is_empty()
+    );
     let (_, cursor) = store
         .read_session_feed(ReadSessionFeedRequest {
             session_id,
@@ -1835,6 +1850,8 @@ fn runtime_registration_persists_exact_lifecycle_identity_and_rejects_drift() {
     let lifecycle = RuntimeLifecycleIdentity {
         commander_session_id: "commander-identity".to_string(),
         transaction_id: "transaction-identity".to_string(),
+        parent_mission_revision_sha256: None,
+        delegated_input_sha256: None,
         task_id: Some("task-identity".to_string()),
         goal_id: Some("goal-identity".to_string()),
         operator_override: true,
@@ -1908,6 +1925,8 @@ fn runtime_lifecycle_enrichment_rejects_active_terminal_and_identity_drift() {
     let lifecycle_for = |runtime_id: &str, transaction_id: &str| RuntimeLifecycleIdentity {
         commander_session_id: "commander-enrichment-guards".to_string(),
         transaction_id: transaction_id.to_string(),
+        parent_mission_revision_sha256: None,
+        delegated_input_sha256: None,
         task_id: Some("task-enrichment-guards".to_string()),
         goal_id: Some("goal-enrichment-guards".to_string()),
         operator_override: false,
@@ -2658,14 +2677,16 @@ fn runtime_retry_registration_requires_latest_failed_predecessor_and_matching_cr
         ));
     }
 
-    assert!(store
-        .register_runtime(RegisterRuntimeRequest {
-            runtime_id: retry_runtime_id.clone(),
-            session_id: session_id.clone(),
-            fallback_from_id: Some("runtime-stale".to_string()),
-            lifecycle: None,
-        })
-        .is_err());
+    assert!(
+        store
+            .register_runtime(RegisterRuntimeRequest {
+                runtime_id: retry_runtime_id.clone(),
+                session_id: session_id.clone(),
+                fallback_from_id: Some("runtime-stale".to_string()),
+                lifecycle: None,
+            })
+            .is_err()
+    );
     assert!(matches!(
         store
             .register_runtime(RegisterRuntimeRequest {
@@ -2829,9 +2850,11 @@ fn session_delta_is_idempotent_rejects_conflicts_and_merges_projection_parts() {
     let error = store
         .persist_session_delta(mixed_replay)
         .expect_err("historical management sequence must not append new context");
-    assert!(error
-        .to_string()
-        .contains("historical management delta cannot append new context"));
+    assert!(
+        error
+            .to_string()
+            .contains("historical management delta cannot append new context")
+    );
     let cursors = store
         .read_context_slice(ReadContextSliceRequest {
             session_id: session_id.clone(),
@@ -3709,10 +3732,12 @@ fn file_queue_recovers_orphaned_processing_items() {
         !processing.exists(),
         "orphaned processing item should be consumed"
     );
-    assert!(store
-        .get_session(GetSessionRequest { session_id })
-        .expect("get recovered session")
-        .is_some());
+    assert!(
+        store
+            .get_session(GetSessionRequest { session_id })
+            .expect("get recovered session")
+            .is_some()
+    );
 }
 
 #[test]
@@ -3759,11 +3784,12 @@ fn open_default_without_service_creates_sqlite_index() {
         .status()
         .expect("open default helper");
     assert!(status.success(), "open default helper exited with {status}");
-    assert!(temp
-        .path()
-        .join("session_log")
-        .join("index.sqlite3")
-        .exists());
+    assert!(
+        temp.path()
+            .join("session_log")
+            .join("index.sqlite3")
+            .exists()
+    );
 }
 
 #[test]
