@@ -1599,17 +1599,19 @@ fn runtime_terminal_state_from_snapshot(
     snapshot: &RuntimeLeaseSnapshot,
     projection: &lifecycle::SessionProjection,
 ) -> Result<TerminalState> {
-    if snapshot.session_state != projection.state {
-        return Err(anyhow!(
-            "RUNTIME_CALLBACK_SESSION_STATE_MISMATCH:runtime={},snapshot={:?},projection={:?}",
-            snapshot.runtime_id,
-            snapshot.session_state,
-            projection.state
-        ));
-    }
     match snapshot.runtime_state {
         Some(state) => runtime_terminal_state(state),
-        None => terminal_state(projection.state),
+        None => {
+            if snapshot.session_state != projection.state {
+                return Err(anyhow!(
+                    "RUNTIME_CALLBACK_SESSION_STATE_MISMATCH:runtime={},snapshot={:?},projection={:?}",
+                    snapshot.runtime_id,
+                    snapshot.session_state,
+                    projection.state
+                ));
+            }
+            terminal_state(projection.state)
+        }
     }
 }
 
@@ -2477,7 +2479,7 @@ mod tests {
             last_event_seq: 7,
             terminal: true,
             session_event_seq: 3,
-            session_state: SessionState::Interrupted,
+            session_state: SessionState::Running,
             runtime_state: Some(RuntimeState::Cancelled),
         };
         let projection = SessionProjection {
@@ -2498,9 +2500,17 @@ mod tests {
         assert_eq!(lease.receipt_event_seq, 2);
         assert_eq!(
             runtime_terminal_state_from_snapshot(&snapshot, &projection)
-                .expect("runtime terminal state should be authoritative"),
+                .expect("runtime terminal state must survive a later session continuation"),
             TerminalState::Cancelled
         );
+
+        let mut legacy_snapshot = snapshot.clone();
+        legacy_snapshot.runtime_state = None;
+        let error = runtime_terminal_state_from_snapshot(&legacy_snapshot, &projection)
+            .expect_err("legacy snapshots still require matching session projections");
+        assert!(error
+            .to_string()
+            .contains("RUNTIME_CALLBACK_SESSION_STATE_MISMATCH"));
     }
 
     #[test]
