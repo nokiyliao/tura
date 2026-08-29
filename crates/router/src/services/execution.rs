@@ -1207,8 +1207,30 @@ impl ExecutionService {
         entry: &SessionFeedEntry,
         terminal_state: TerminalState,
     ) -> Result<()> {
+        let store = lifecycle_store(&lease.commander_session_id)?;
+        Self::ensure_snapshot_terminal_receipt(
+            &store,
+            lease,
+            snapshot,
+            entry,
+            terminal_state,
+        )
+    }
+
+    fn ensure_snapshot_terminal_receipt(
+        store: &SessionLifecycleStore,
+        lease: &RuntimeLease,
+        snapshot: &RuntimeLeaseSnapshot,
+        entry: &SessionFeedEntry,
+        terminal_state: TerminalState,
+    ) -> Result<()> {
+        match store.terminal_receipt(&lease.transaction_id, &entry.event_id) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.code == "TERMINAL_RECEIPT_NOT_FOUND" => {}
+            Err(error) => return Err(anyhow!(error.to_string())),
+        }
         let receipt = Self::snapshot_terminal_receipt(lease, snapshot, entry, terminal_state)?;
-        lifecycle_store(&lease.commander_session_id)?
+        store
             .write_terminal_receipt(&receipt)
             .map_err(|error| anyhow!(error.to_string()))?;
         Ok(())
@@ -2482,7 +2504,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_terminal_receipt_replays_runtime_writer_shape_exactly() {
+    fn snapshot_terminal_receipt_replays_or_reuses_runtime_writer_receipt() {
         let lifecycle = RuntimeLifecycleIdentity {
             commander_session_id: "commander-replay".to_string(),
             transaction_id: "transaction-replay".to_string(),
@@ -2584,6 +2606,48 @@ mod tests {
         store
             .write_terminal_receipt(&replay)
             .expect("snapshot replay must be already durable, not conflicting");
+
+        let mut delayed_projection = entry.clone();
+        match &mut delayed_projection.event {
+            SessionFeedEvent::SessionProjectionUpdated { updated_at, .. } => {
+                *updated_at += 140;
+            }
+            _ => panic!("fixture must remain a projection event"),
+        }
+        let reconstructed = ExecutionService::snapshot_terminal_receipt(
+            &lease,
+            &snapshot,
+            &delayed_projection,
+            TerminalState::Failed,
+        )
+        .expect("delayed projection receipt");
+        assert_ne!(reconstructed, original);
+        ExecutionService::ensure_snapshot_terminal_receipt(
+            &store,
+            &lease,
+            &snapshot,
+            &delayed_projection,
+            TerminalState::Failed,
+        )
+        .expect("the durable runtime receipt must outrank a later projection timestamp");
+        assert_eq!(
+            store
+                .terminal_receipt("transaction-replay", event_id)
+                .expect("durable runtime receipt"),
+            original
+        );
+        let delivery = intake_terminal_receipt(
+            &store,
+            &delayed_projection,
+            "runtime-replay",
+            "transaction-replay",
+            &lease,
+            TerminalState::Failed,
+        )
+        .expect("existing durable receipt must remain intake-compatible")
+        .expect("terminal delivery identity");
+        assert_eq!(delivery.runtime_id, "runtime-replay");
+        assert_eq!(store.readback().expect("readback").applied_receipts, 1);
     }
 
     #[test]
