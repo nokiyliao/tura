@@ -173,7 +173,10 @@ pub(crate) async fn call_runtime_with_writer(
             .or(configured_route)
             .ok_or_else(|| format!("unknown provider route: {}", input.provider_name))
     );
-    let override_route = session_model_override_route(tura_settings.as_ref(), route_config_base);
+    let override_route = pre_provider_or_failed_runtime!(
+        "session_model_override_resolution",
+        session_model_override_route(tura_settings.as_ref(), route_config_base)
+    );
     let route_config = override_route.as_ref().unwrap_or(route_config_base);
     let context_window = active_model_context_window(tura_settings.as_ref(), route_config);
 

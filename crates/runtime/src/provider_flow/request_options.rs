@@ -332,21 +332,34 @@ pub(crate) fn route_for_provider_name(
 pub(crate) fn session_model_override_route(
     settings: &tura_llm_rust::Settings,
     fallback: &tura_llm_rust::RouteConfig,
-) -> Option<tura_llm_rust::RouteConfig> {
-    let value = std::env::var("TURA_SESSION_MODEL_OVERRIDE").ok()?;
-    let (provider, model) = value.trim().split_once('/')?;
+) -> Result<Option<tura_llm_rust::RouteConfig>, String> {
+    let Some(value) = std::env::var("TURA_SESSION_MODEL_OVERRIDE").ok() else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    let Some((provider, model)) = value.split_once('/') else {
+        return Err(format!(
+            "invalid TURA_SESSION_MODEL_OVERRIDE `{value}`: expected provider/model"
+        ));
+    };
     let provider = provider.trim();
     let model = model.trim();
     if provider.is_empty() || model.is_empty() {
-        return None;
+        return Err(format!(
+            "invalid TURA_SESSION_MODEL_OVERRIDE `{value}`: expected provider/model"
+        ));
     }
-    let base_url = provider_base_url(settings, provider)?;
+    let Some(base_url) = provider_base_url(settings, provider) else {
+        return Err(format!(
+            "unknown provider in explicit model selection: {value}"
+        ));
+    };
     let temperature = fallback
         .providers
         .first()
         .map(|item| item.temperature)
         .unwrap_or(fallback.default_temperature);
-    Some(tura_llm_rust::RouteConfig {
+    Ok(Some(tura_llm_rust::RouteConfig {
         default_temperature: fallback.default_temperature,
         providers: vec![tura_llm_rust::ProviderConfig {
             provider: provider.to_string(),
@@ -354,7 +367,7 @@ pub(crate) fn session_model_override_route(
             model: tura_llm_rust::Settings::normalize_model_name(provider, model),
             temperature,
         }],
-    })
+    }))
 }
 
 fn provider_model_pair(value: &str) -> Option<(&str, &str)> {
@@ -501,6 +514,7 @@ mod tests {
             Some("mistral/mistral-medium-3.5"),
             || {
                 let route = session_model_override_route(&settings, &fallback)
+                    .expect("model override should parse")
                     .expect("configured Mistral provider should resolve");
                 let provider = &route.providers[0];
                 assert_eq!(provider.provider, "mistral");
@@ -513,6 +527,7 @@ mod tests {
             Some("gemini-api/gemini-3.5-flash"),
             || {
                 let route = session_model_override_route(&settings, &fallback)
+                    .expect("model override should parse")
                     .expect("Gemini alias should resolve through Google runtime config");
                 let provider = &route.providers[0];
                 assert_eq!(provider.provider, "gemini-api");
