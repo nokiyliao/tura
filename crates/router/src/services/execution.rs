@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{Notify, RwLock};
+use tura_llm_rust::official_codex_app_server::load_terminal_commander_convergence_ledger;
 
 use crate::ipc_handlers::enqueue_turn_identity;
 use crate::services::runtime_workers::{MAX_QUEUED_RUNTIME_TURNS, runtime_worker_limit};
@@ -18,12 +19,16 @@ use router_contract::{
     CancelRuntimeRequest, EnqueueTurnRequest, IpcRequest, ProbeSessionsRequest,
     RegisterChildSessionOutcome, RegisterChildSessionRequest, RegisterChildSessionResponse,
 };
-use runtime_contract::{LifecycleExecutionContext, RunAgentRequest};
+use runtime_contract::{
+    CommanderContinuationBinding, CommanderConvergenceProof, LifecycleExecutionContext,
+    RunAgentRequest,
+};
 use session_lifecycle::{
     CallbackEffectIdentity, ChildAdmissionOutcome, ChildAdmissionRecord,
-    ContinuationDispatchRecord, ContinuationWriteOutcome, DurableCallbackRecord, IntakeOutcome,
-    LifecycleConfig, LiveEffectEvidence, ReclaimOutcome, SessionLifecycleStore, TerminalReceipt,
-    TerminalReceiptIdentity, TerminalState, canonical_value_sha256, commander_store_path,
+    ContinuationDispatchRecord, ContinuationDispatchState, ContinuationWriteOutcome,
+    DurableCallbackRecord, IntakeOutcome, LifecycleConfig, LiveEffectEvidence, ReclaimOutcome,
+    SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity, TerminalState,
+    canonical_value_sha256, commander_store_path,
 };
 use session_log_contract::{
     ActivateRuntimeLeaseRequest, CreateSessionRequest, GetRuntimeLeaseRequest, GetSessionRequest,
@@ -58,6 +63,11 @@ struct RuntimeLease {
     receipt_event_seq: u64,
     slot_acquired: bool,
     terminalizing: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommanderConvergenceRecoveryEvidence {
+    proof_sha256: String,
 }
 
 fn active_turn_conflict(session_id: &str, active: &RuntimeLease) -> Value {
@@ -143,16 +153,20 @@ impl ExecutionService {
                         );
                     }
                 }
-                ChildAdmissionOutcome::Admitted => unreachable!(
-                    "an existing durable child admission cannot be newly admitted"
-                ),
+                ChildAdmissionOutcome::Admitted => {
+                    unreachable!("an existing durable child admission cannot be newly admitted")
+                }
             }
         }
 
         let _admission = self.child_admission.lock().await;
 
-        let parent = read_session_snapshot(&request.parent_session_id)?
-            .ok_or_else(|| anyhow!("CHILD_ADMISSION_PARENT_SESSION_NOT_FOUND:{}", request.parent_session_id))?;
+        let parent = read_session_snapshot(&request.parent_session_id)?.ok_or_else(|| {
+            anyhow!(
+                "CHILD_ADMISSION_PARENT_SESSION_NOT_FOUND:{}",
+                request.parent_session_id
+            )
+        })?;
         let existing_child = read_session_snapshot(&request.child_session_id)?;
         let store = lifecycle_store(&request.parent_session_id)?;
         if existing_child.is_some() && store.child_admission(&request.child_session_id)?.is_none() {
@@ -259,6 +273,9 @@ impl ExecutionService {
             task_id: task_id.clone(),
             goal_id: goal_id.clone(),
             operator_override,
+            commander_continuation: supplied_lifecycle
+                .as_ref()
+                .and_then(|context| context.commander_continuation.clone()),
         });
         let durable_lifecycle = RuntimeLifecycleIdentity {
             commander_session_id: commander_session_id.clone(),
@@ -358,11 +375,30 @@ impl ExecutionService {
                     .to_string()
                     .starts_with("TERMINAL_FEED_EVENT_NOT_FOUND:");
                 if missing_terminal_feed {
+                    let convergence_recovery = continuation
+                        .as_ref()
+                        .and_then(|record| commander_continuation_binding(record).ok())
+                        .and_then(|binding| {
+                            read_session_snapshot(&request.session_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|snapshot| {
+                                    terminal_commander_convergence_recovery_evidence(
+                                        std::path::Path::new(&snapshot.metadata.session_directory),
+                                        &request.session_id,
+                                        &request.runtime_id,
+                                        &binding,
+                                    )
+                                    .ok()
+                                    .flatten()
+                                })
+                        });
                     match self
                         .terminalize_registered_runtime(
                             state,
                             &request.session_id,
                             &request.runtime_id,
+                            convergence_recovery.as_ref(),
                         )
                         .await
                     {
@@ -472,7 +508,9 @@ impl ExecutionService {
         require_successful_runtime_dispatch(status, &body)?;
         if let Some(record) = continuation.as_ref() {
             let store = lifecycle_store(&record.commander_session_id)?;
-            if !store.callback_continuation_completion_proven(record)? {
+            let bound =
+                bind_commander_convergence_proof_from_runtime(&store, record, &request.runtime_id)?;
+            if !store.callback_continuation_completion_proven(&bound)? {
                 return Err(anyhow!(
                     "CONTINUATION_SUCCESS_EVIDENCE_NOT_DURABLE:{}:{}:{}",
                     record.request_id,
@@ -480,7 +518,7 @@ impl ExecutionService {
                     record.lease_id
                 ));
             }
-            complete_and_ack_callback_continuation(&store, record)?;
+            complete_and_ack_callback_continuation(&store, &bound)?;
         }
         Ok(json!({
             "status": "finished",
@@ -657,6 +695,41 @@ impl ExecutionService {
         }
 
         state.session_db.start()?;
+        let convergence_recovery = if request.reason
+            == RecoveryCloseRuntimeReason::OrphanedRuntime
+        {
+            let matching = lifecycle_store_if_exists(&request.session_id)?
+                .map(|store| store.callback_continuations_for_replay())
+                .transpose()?
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|record| {
+                    record.runtime_id == request.runtime_id
+                        && record.state == ContinuationDispatchState::Dispatched
+                        && record.commander_thread_id.is_some()
+                })
+                .collect::<Vec<_>>();
+            if matching.len() > 1 {
+                return Err(anyhow!(
+                    "COMMANDER_CONVERGENCE_STARTUP_BINDING_CONFLICT:{}",
+                    request.runtime_id
+                ));
+            }
+            matching.first().and_then(|record| {
+                let binding = commander_continuation_binding(record).ok()?;
+                let snapshot = read_session_snapshot(&request.session_id).ok().flatten()?;
+                terminal_commander_convergence_recovery_evidence(
+                    std::path::Path::new(&snapshot.metadata.session_directory),
+                    &request.session_id,
+                    &request.runtime_id,
+                    &binding,
+                )
+                .ok()
+                .flatten()
+            })
+        } else {
+            None
+        };
         let recovery = RecoveryCloseRuntimeRequest {
             receipt_id: request.receipt_id,
             database_path: request.database_path,
@@ -668,7 +741,13 @@ impl ExecutionService {
             expected_last_event_seq: request.expected_last_event_seq,
             expected_session_event_seq: request.expected_session_event_seq,
             expected_session_state: request.expected_session_state,
-            reason: request.reason,
+            reason: if convergence_recovery.is_some() {
+                RecoveryCloseRuntimeReason::CommanderConvergenceProven
+            } else {
+                request.reason
+            },
+            convergence_proof_sha256: convergence_recovery
+                .map(|evidence| evidence.proof_sha256),
             quiescence: proof,
         };
         match session_log_contract::client::call_service(&SessionLogCommand::RecoveryCloseRuntime(
@@ -1140,12 +1219,32 @@ impl ExecutionService {
                 ));
             }
             ContinuationWriteOutcome::AlreadyDispatched => {
-                if store.callback_continuation_completion_proven(&continuation)? {
-                    complete_and_ack_callback_continuation(store, &continuation)?;
-                    return Ok(continuation_result(
-                        &continuation,
-                        "reconciled_and_acknowledged_after_restart",
-                    ));
+                if let Ok(bound) = bind_commander_convergence_proof_from_runtime(
+                    store,
+                    &continuation,
+                    &continuation.runtime_id,
+                ) {
+                    if store.callback_continuation_completion_proven(&bound)? {
+                        complete_and_ack_callback_continuation(store, &bound)?;
+                        return Ok(continuation_result(
+                            &continuation,
+                            "reconciled_and_acknowledged_after_restart",
+                        ));
+                    }
+                }
+                if let Some((request, lease_id)) =
+                    commander_convergence_fallback_request(&continuation)?
+                {
+                    let request_id = request.request_id.clone();
+                    return self
+                        .enqueue_turn_request_with_identity(
+                            state,
+                            request.payload,
+                            &request_id,
+                            lease_id,
+                            Some(continuation),
+                        )
+                        .await;
                 }
                 return Err(anyhow!(
                     "CONTINUATION_DISPATCHED_RECONCILIATION_REQUIRED:{}:{}:{}",
@@ -1157,12 +1256,29 @@ impl ExecutionService {
             ContinuationWriteOutcome::Prepared | ContinuationWriteOutcome::AlreadyPrepared => {}
         }
         let prompt = serde_json::to_string(&continuation.parent_input)?;
+        let commander_continuation = continuation
+            .commander_thread_id
+            .as_ref()
+            .map(|_| commander_continuation_binding(&continuation))
+            .transpose()?;
         let input = json!({
             "runtime_id": continuation.runtime_id,
             "session_id": continuation.commander_session_id,
             "payload": {
                 "prompt": prompt,
-                "operator_override": false
+                "parent_mission_revision_sha256": continuation.parent_mission_revision_sha256,
+                "delegated_input_sha256": continuation.delegated_input_sha256,
+                "lifecycle": {
+                    "transaction_id": continuation.request_id,
+                    "commander_session_id": continuation.commander_session_id,
+                    "parent_mission_revision_sha256": continuation.parent_mission_revision_sha256,
+                    "delegated_input_sha256": continuation.delegated_input_sha256,
+                    "task_id": null,
+                    "goal_id": null,
+                    "operator_override": false,
+                    "commander_continuation": commander_continuation,
+                },
+                "operator_override": false,
             }
         });
         let request_id = continuation.request_id.clone();
@@ -1286,14 +1402,14 @@ impl ExecutionService {
                 )
             })?
             .to_string();
-        require_terminal_callback_admission(
+        let admission = require_terminal_callback_admission(
             store,
             &receipt,
             parent_mission_revision_sha256,
             delegated_input_sha256,
             Some(&effect_id),
         )?;
-        let record = DurableCallbackRecord::new(
+        let mut record = DurableCallbackRecord::new(
             &receipt,
             callback_payload,
             transport_payload,
@@ -1301,6 +1417,7 @@ impl ExecutionService {
             delegated_input_sha256,
             CallbackEffectIdentity::Exact { effect_id },
         )?;
+        record.commander_thread_id = admission.commander_thread_id;
         store.publish_callback(&record)?;
         store.mark_callback_intaken(
             &record.transaction_id,
@@ -1456,6 +1573,7 @@ impl ExecutionService {
         state: &AppState,
         session_id: &str,
         runtime_id: &str,
+        convergence_recovery: Option<&CommanderConvergenceRecoveryEvidence>,
     ) -> Result<()> {
         let lease = self.mark_terminalizing(session_id, runtime_id)?;
         tokio::time::timeout(
@@ -1507,7 +1625,9 @@ impl ExecutionService {
                 "RUNTIME_TERMINALIZATION_DURABLE_STATE_CONFLICT:runtime={runtime_id},terminal=false,lease_active=false"
             ));
         }
-        let reason = if snapshot.revision == 0 && snapshot.last_event_seq == 0 {
+        let reason = if convergence_recovery.is_some() {
+            RecoveryCloseRuntimeReason::CommanderConvergenceProven
+        } else if snapshot.revision == 0 && snapshot.last_event_seq == 0 {
             RecoveryCloseRuntimeReason::UnbornRuntime
         } else {
             RecoveryCloseRuntimeReason::OrphanedRuntime
@@ -1527,6 +1647,8 @@ impl ExecutionService {
             expected_session_event_seq: snapshot.session_event_seq,
             expected_session_state: snapshot.session_state,
             reason,
+            convergence_proof_sha256: convergence_recovery
+                .map(|evidence| evidence.proof_sha256.clone()),
             quiescence: proof,
         };
         let result = match session_log_contract::client::call_service(
@@ -1566,7 +1688,7 @@ impl ExecutionService {
         lease: &RuntimeLease,
     ) -> Result<()> {
         let terminalization = self
-            .terminalize_registered_runtime(state, session_id, runtime_id)
+            .terminalize_registered_runtime(state, session_id, runtime_id, None)
             .await;
         if let Err(error) = terminalization {
             if !error
@@ -1942,6 +2064,154 @@ fn continuation_result(record: &ContinuationDispatchRecord, status: &str) -> Val
     })
 }
 
+fn commander_continuation_binding(
+    record: &ContinuationDispatchRecord,
+) -> Result<CommanderContinuationBinding> {
+    let target_thread_id = record.commander_thread_id.clone().ok_or_else(|| {
+        anyhow!(
+            "COMMANDER_CONTINUATION_TARGET_MISSING:{}",
+            record.request_id
+        )
+    })?;
+    let effect = serde_json::to_value(&record.effect_identity)?;
+    let binding = CommanderContinuationBinding {
+        target_thread_id,
+        requested_action: record.requested_action.clone(),
+        continuation_request_id: record.request_id.clone(),
+        child_session_id: record.child_session_id.clone(),
+        child_transaction_id: record.child_transaction_id.clone(),
+        child_runtime_id: record.child_runtime_id.clone(),
+        callback_payload_sha256: record.callback_payload_sha256.clone(),
+        effect_identity_sha256: canonical_value_sha256(&effect),
+        pre_revision_sha256: record.parent_mission_revision_sha256.clone(),
+    };
+    binding.validate().map_err(anyhow::Error::msg)?;
+    Ok(binding)
+}
+
+fn terminal_commander_convergence_recovery_evidence(
+    session_directory: &std::path::Path,
+    session_id: &str,
+    runtime_id: &str,
+    binding: &CommanderContinuationBinding,
+) -> Result<Option<CommanderConvergenceRecoveryEvidence>> {
+    let Some(ledger) = load_terminal_commander_convergence_ledger(
+        session_directory,
+        session_id,
+        runtime_id,
+        binding,
+    )
+    .map_err(anyhow::Error::msg)?
+    else {
+        return Ok(None);
+    };
+    let proof = ledger
+        .commander_convergence_proof
+        .as_ref()
+        .ok_or_else(|| anyhow!("COMMANDER_CONVERGENCE_LEDGER_PROOF_MISSING:{runtime_id}"))?;
+    Ok(Some(CommanderConvergenceRecoveryEvidence {
+        proof_sha256: canonical_value_sha256(&serde_json::to_value(proof)?),
+    }))
+}
+
+fn commander_convergence_fallback_request(
+    record: &ContinuationDispatchRecord,
+) -> Result<Option<(IpcRequest, String)>> {
+    if record.commander_thread_id.is_none() {
+        return Ok(None);
+    }
+    let Some(snapshot) = read_session_snapshot(&record.commander_session_id)? else {
+        return Ok(None);
+    };
+    if snapshot.lifecycle_projection.state != SessionState::Failed
+        || snapshot.lifecycle_projection.active_runtime_id.is_some()
+        || snapshot.lifecycle_projection.runtime_ids.last() != Some(&record.runtime_id)
+    {
+        return Ok(None);
+    }
+    let response = session_log_contract::client::call_service(&SessionLogCommand::ReplayRuntime(
+        ReplayRuntimeRequest {
+            runtime_id: record.runtime_id.clone(),
+        },
+    ))?;
+    let original = match response {
+        SessionLogResponse::RuntimeReplayed {
+            runtime: Some(runtime),
+        } => runtime.aggregate,
+        SessionLogResponse::RuntimeReplayed { runtime: None } => return Ok(None),
+        SessionLogResponse::Error { error } => return Err(anyhow!(error)),
+        other => return Err(anyhow!("unexpected runtime replay response: {other:?}")),
+    };
+    if original.runtime_id != record.runtime_id
+        || original.session_id != record.commander_session_id
+        || original.state != RuntimeState::Failed
+        || original.output.is_some()
+        || original
+            .error
+            .as_ref()
+            .and_then(|error| error.error_code.as_deref())
+            != Some("commander_convergence_proven_before_runtime_output")
+    {
+        return Ok(None);
+    }
+    let binding = commander_continuation_binding(record)?;
+    let Some(ledger) = load_terminal_commander_convergence_ledger(
+        std::path::Path::new(&snapshot.metadata.session_directory),
+        &record.commander_session_id,
+        &record.runtime_id,
+        &binding,
+    )
+    .map_err(anyhow::Error::msg)?
+    else {
+        return Ok(None);
+    };
+    let proof = ledger.commander_convergence_proof.as_ref().ok_or_else(|| {
+        anyhow!(
+            "COMMANDER_CONVERGENCE_LEDGER_PROOF_MISSING:{}",
+            record.runtime_id
+        )
+    })?;
+    let proof_sha256 = canonical_value_sha256(&serde_json::to_value(proof)?);
+    let recovery_digest = canonical_value_sha256(&json!({
+        "request_id": record.request_id,
+        "original_runtime_id": record.runtime_id,
+        "proof_sha256": proof_sha256,
+    }));
+    let runtime_id = format!("callback-continuation-recovery-runtime-{recovery_digest}");
+    let lease_id = format!("callback-continuation-recovery-lease-{recovery_digest}");
+    let prompt = serde_json::to_string(&record.parent_input)?;
+    let input = json!({
+        "runtime_id": runtime_id,
+        "session_id": record.commander_session_id,
+        "payload": {
+            "prompt": prompt,
+            "parent_mission_revision_sha256": record.parent_mission_revision_sha256,
+            "delegated_input_sha256": record.delegated_input_sha256,
+            "lifecycle": {
+                "transaction_id": record.request_id,
+                "commander_session_id": record.commander_session_id,
+                "parent_mission_revision_sha256": record.parent_mission_revision_sha256,
+                "delegated_input_sha256": record.delegated_input_sha256,
+                "task_id": null,
+                "goal_id": null,
+                "operator_override": false,
+                "commander_continuation": binding,
+            },
+            "operator_override": false,
+        }
+    });
+    Ok(Some((
+        IpcRequest {
+            request_id: record.request_id.clone(),
+            kind: "call".to_string(),
+            method: "execution.enqueue_turn".to_string(),
+            payload: input,
+            deadline_ms: None,
+        },
+        lease_id,
+    )))
+}
+
 fn require_successful_runtime_dispatch(status: u16, body: &Value) -> Result<()> {
     if status < 400 {
         return Ok(());
@@ -1953,6 +2223,98 @@ fn require_successful_runtime_dispatch(status: u16, body: &Value) -> Result<()> 
             .and_then(Value::as_str)
             .unwrap_or("runtime worker failed")
     ))
+}
+
+fn bind_commander_convergence_proof_from_runtime(
+    store: &SessionLifecycleStore,
+    record: &ContinuationDispatchRecord,
+    completion_runtime_id: &str,
+) -> Result<ContinuationDispatchRecord> {
+    if record.commander_thread_id.is_none() {
+        return Ok(record.clone());
+    }
+    let response = session_log_contract::client::call_service(&SessionLogCommand::ReplayRuntime(
+        ReplayRuntimeRequest {
+            runtime_id: completion_runtime_id.to_string(),
+        },
+    ))?;
+    let runtime = match response {
+        SessionLogResponse::RuntimeReplayed {
+            runtime: Some(runtime),
+        } => runtime.aggregate,
+        SessionLogResponse::RuntimeReplayed { runtime: None } => {
+            return Err(anyhow!(
+                "COMMANDER_CONVERGENCE_RUNTIME_NOT_FOUND:{}",
+                completion_runtime_id
+            ));
+        }
+        SessionLogResponse::Error { error } => {
+            return Err(anyhow!(
+                "COMMANDER_CONVERGENCE_RUNTIME_REPLAY_FAILED:{}:{error}",
+                completion_runtime_id
+            ));
+        }
+        other => {
+            return Err(anyhow!(
+                "COMMANDER_CONVERGENCE_RUNTIME_REPLAY_UNEXPECTED:{}:{other:?}",
+                completion_runtime_id
+            ));
+        }
+    };
+    let proof = commander_convergence_proof_from_runtime(record, &runtime)?;
+    store.bind_callback_continuation_convergence_proof(record, &proof)?;
+    let mut bound = record.clone();
+    bound.convergence_proof = Some(proof);
+    Ok(bound)
+}
+
+fn commander_convergence_proof_from_runtime(
+    record: &ContinuationDispatchRecord,
+    runtime: &RuntimeAggregate,
+) -> Result<CommanderConvergenceProof> {
+    let original_or_bound_fallback = runtime.runtime_id == record.runtime_id
+        || runtime.fallback_from_id.as_deref() == Some(record.runtime_id.as_str());
+    if !original_or_bound_fallback
+        || runtime.session_id != record.commander_session_id
+        || runtime.state != RuntimeState::Finished
+    {
+        return Err(anyhow!(
+            "COMMANDER_CONVERGENCE_RUNTIME_IDENTITY_MISMATCH:{}",
+            record.runtime_id
+        ));
+    }
+    let output = runtime.output.as_ref().ok_or_else(|| {
+        anyhow!(
+            "COMMANDER_CONVERGENCE_RUNTIME_OUTPUT_MISSING:{}",
+            record.runtime_id
+        )
+    })?;
+    let proof: CommanderConvergenceProof = serde_json::from_value(
+        output
+            .get("commander_convergence_proof")
+            .cloned()
+            .ok_or_else(|| anyhow!("COMMANDER_CONVERGENCE_PROOF_MISSING:{}", record.runtime_id))?,
+    )
+    .map_err(|error| {
+        anyhow!(
+            "COMMANDER_CONVERGENCE_PROOF_MALFORMED:{}:{error}",
+            record.runtime_id
+        )
+    })?;
+    let final_content = output.get("content").ok_or_else(|| {
+        anyhow!(
+            "COMMANDER_CONVERGENCE_FINAL_ASSISTANT_MISSING:{}",
+            record.runtime_id
+        )
+    })?;
+    if canonical_value_sha256(final_content) != proof.final_assistant_sha256 {
+        return Err(anyhow!(
+            "COMMANDER_CONVERGENCE_FINAL_ASSISTANT_HASH_MISMATCH:{}",
+            record.runtime_id
+        ));
+    }
+    proof.validate_shape().map_err(anyhow::Error::msg)?;
+    Ok(proof)
 }
 
 fn complete_and_ack_callback_continuation(
@@ -2038,7 +2400,7 @@ fn publish_terminal_failure_callback_from_store(
         .get("delegated_input_sha256")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("DELEGATED_LIFECYCLE_IDENTITY_MISSING:delegated_input_sha256"))?;
-    require_terminal_callback_admission(
+    let admission = require_terminal_callback_admission(
         store,
         &receipt,
         parent_mission_revision_sha256,
@@ -2065,7 +2427,7 @@ fn publish_terminal_failure_callback_from_store(
             "body": { "item": callback_payload }
         }
     });
-    let record = DurableCallbackRecord::new(
+    let mut record = DurableCallbackRecord::new(
         &receipt,
         callback_payload,
         transport_payload,
@@ -2076,6 +2438,7 @@ fn publish_terminal_failure_callback_from_store(
             evidence_sha256: receipt_sha256,
         },
     )?;
+    record.commander_thread_id = admission.commander_thread_id;
     store.publish_callback(&record)?;
     store.mark_callback_intaken(
         &record.transaction_id,
@@ -2649,6 +3012,7 @@ fn child_admission_record(request: &RegisterChildSessionRequest) -> ChildAdmissi
     ChildAdmissionRecord::new(
         &request.parent_session_id,
         &request.parent_mission_revision_sha256,
+        request.commander_thread_id.clone(),
         &request.child_session_id,
         &request.child_runtime_id,
         &request.child_transaction_id,
@@ -2767,6 +3131,7 @@ fn recovery_terminal_state(recovery: &RuntimeRecoveryReceipt) -> TerminalState {
     match recovery.reason {
         RecoveryCloseRuntimeReason::OrphanedRuntime => TerminalState::Cancelled,
         RecoveryCloseRuntimeReason::UnbornRuntime => TerminalState::Interrupted,
+        RecoveryCloseRuntimeReason::CommanderConvergenceProven => TerminalState::Failed,
     }
 }
 
@@ -2774,6 +3139,7 @@ fn recovery_runtime_state(recovery: &RuntimeRecoveryReceipt) -> Value {
     match recovery.reason {
         RecoveryCloseRuntimeReason::OrphanedRuntime => json!(RuntimeState::Cancelled),
         RecoveryCloseRuntimeReason::UnbornRuntime => Value::Null,
+        RecoveryCloseRuntimeReason::CommanderConvergenceProven => json!(RuntimeState::Failed),
     }
 }
 
@@ -3036,17 +3402,22 @@ mod tests {
     use super::{
         EnqueueTurnRequest, ExecutionService, RetryRuntimeIdentity,
         RouterRecoveryCloseRuntimeRequest, RuntimeLease, TerminalDeliveryIdentity,
-        complete_and_ack_callback_continuation, failed_session_retry_root,
-        failed_session_runtime_fallback, intake_terminal_receipt, is_historical_terminal_runtime,
-        payload_to_run_agent_request, publish_terminal_failure_callback_from_store,
-        replay_terminal_callbacks_from_store, require_successful_runtime_dispatch,
-        runtime_lease_from_snapshot, runtime_terminal_state_from_snapshot,
-        terminal_runtime_is_current, validate_delegated_input_digest,
-        validate_child_runtime_identity, validate_terminalization_identity,
+        commander_convergence_proof_from_runtime, complete_and_ack_callback_continuation,
+        failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
+        is_historical_terminal_runtime, payload_to_run_agent_request,
+        publish_terminal_failure_callback_from_store, replay_terminal_callbacks_from_store,
+        require_successful_runtime_dispatch, runtime_lease_from_snapshot,
+        runtime_terminal_state_from_snapshot, terminal_runtime_is_current,
+        validate_child_runtime_identity, validate_delegated_input_digest,
+        validate_terminalization_identity,
     };
     use crate::{build_state, services::manager::ServiceManager};
-    use lifecycle::{RuntimeState, SessionProjection, SessionState, TaskPlan};
-    use runtime_contract::RunAgentRequest;
+    use chrono::Utc;
+    use lifecycle::{
+        ProviderConfig, RuntimeAggregate, RuntimeProviderConfig, RuntimeState, SessionProjection,
+        SessionState, TaskPlan, ToolChoice,
+    };
+    use runtime_contract::{CommanderConvergenceProof, RunAgentRequest};
     use serde_json::json;
     use session_lifecycle::{
         CallbackEffectIdentity, ChildAdmissionRecord, ContinuationDispatchRecord,
@@ -3363,6 +3734,7 @@ mod tests {
         let request = router_contract::RegisterChildSessionRequest {
             parent_session_id: "commander-exact".to_string(),
             parent_mission_revision_sha256: "a".repeat(64),
+            commander_thread_id: None,
             child_session_id: "child-exact".to_string(),
             child_runtime_id: "runtime-exact".to_string(),
             child_transaction_id: "transaction-exact".to_string(),
@@ -3378,9 +3750,7 @@ mod tests {
         let lifecycle = RuntimeLifecycleIdentity {
             commander_session_id: request.parent_session_id.clone(),
             transaction_id: request.child_transaction_id.clone(),
-            parent_mission_revision_sha256: Some(
-                request.parent_mission_revision_sha256.clone(),
-            ),
+            parent_mission_revision_sha256: Some(request.parent_mission_revision_sha256.clone()),
             delegated_input_sha256: Some(request.delegated_input_sha256.clone()),
             task_id: None,
             goal_id: None,
@@ -4244,6 +4614,7 @@ mod tests {
         let admission = ChildAdmissionRecord::new(
             "commander-callback",
             parent_mission_revision_sha256,
+            None,
             "child-callback",
             "runtime-callback",
             "transaction-callback",
@@ -4360,7 +4731,12 @@ mod tests {
         )
         .expect("callback store");
         admit_callback_child(&store, &"a".repeat(64));
-        assert!(store.callbacks_for_replay().expect("active child callbacks").is_empty());
+        assert!(
+            store
+                .callbacks_for_replay()
+                .expect("active child callbacks")
+                .is_empty()
+        );
 
         let original_router = ExecutionService::new();
         assert!(original_router.sessions.lock().is_empty());
@@ -4397,7 +4773,9 @@ mod tests {
         )
         .expect("identical forwarder replay");
 
-        let callbacks = store.callbacks_for_replay().expect("single callback replay");
+        let callbacks = store
+            .callbacks_for_replay()
+            .expect("single callback replay");
         assert_eq!(callbacks.len(), 1);
         let continuation =
             ContinuationDispatchRecord::from_callback(&callbacks[0]).expect("continuation");
@@ -4419,7 +4797,12 @@ mod tests {
         assert_eq!(readback.intaken_callbacks, 1);
         assert_eq!(readback.acknowledged_callbacks, 1);
         assert_eq!(readback.acknowledged_receipts, 1);
-        assert!(store.callbacks_for_replay().expect("post-ack callbacks").is_empty());
+        assert!(
+            store
+                .callbacks_for_replay()
+                .expect("post-ack callbacks")
+                .is_empty()
+        );
         assert!(
             store
                 .callback_continuations_for_replay()
@@ -4532,6 +4915,123 @@ mod tests {
                 .prepare_callback_continuation(&continuation)
                 .expect("duplicate successful replay"),
             session_lifecycle::ContinuationWriteOutcome::AlreadyAcknowledged
+        );
+    }
+
+    #[test]
+    fn commander_convergence_runtime_output_must_bind_exact_continuation() {
+        let receipt = callback_receipt(TerminalState::Completed);
+        let mut callback = DurableCallbackRecord::new(
+            &receipt,
+            json!("child result"),
+            json!({"kind": "gateway.callback", "payload": {"body": {"item": {"id": "message-1", "text": "child result"}}}}),
+            "a".repeat(64),
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            CallbackEffectIdentity::Exact {
+                effect_id: "message-1".to_string(),
+            },
+        )
+        .expect("callback");
+        callback.commander_thread_id = Some("commander-thread-1".to_string());
+        let record =
+            ContinuationDispatchRecord::from_callback(&callback).expect("target continuation");
+        let final_content = json!("commander converged");
+        let effect = serde_json::to_value(&record.effect_identity).expect("effect value");
+        let proof = CommanderConvergenceProof {
+            schema_version: runtime_contract::COMMANDER_CONVERGENCE_PROOF_SCHEMA_VERSION
+                .to_string(),
+            request_id: record.request_id.clone(),
+            callback_payload_sha256: record.callback_payload_sha256.clone(),
+            effect_identity_sha256: session_lifecycle::canonical_value_sha256(&effect),
+            child_session_id: record.child_session_id.clone(),
+            child_transaction_id: record.child_transaction_id.clone(),
+            child_runtime_id: record.child_runtime_id.clone(),
+            requested_action: record.requested_action.clone(),
+            target_thread_id: record
+                .commander_thread_id
+                .clone()
+                .expect("commander target"),
+            pre_revision_sha256: record.parent_mission_revision_sha256.clone(),
+            post_revision_sha256: "b".repeat(64),
+            target_turn_id: "turn-commander-1".to_string(),
+            final_assistant_sha256: session_lifecycle::canonical_value_sha256(&final_content),
+        };
+        let mut runtime = RuntimeAggregate::new(
+            record.runtime_id.clone(),
+            record.commander_session_id.clone(),
+            "continuation-agent".to_string(),
+            RuntimeProviderConfig {
+                base: ProviderConfig {
+                    tura_llm_name: "official_codex_app_server".to_string(),
+                    default_model_tier: None,
+                    current_model: Some("test-model".to_string()),
+                    stream: true,
+                    temperature: 0.0,
+                    max_tokens: 256,
+                    tool_choice: ToolChoice::Auto,
+                    time_out_ms: 1_000,
+                },
+                thinking: false,
+                provider_name: "official_codex_app_server".to_string(),
+                model_name: "test-model".to_string(),
+                provider_url_name: "local".to_string(),
+                llm_provider_name: "openai".to_string(),
+            },
+            Utc::now(),
+        );
+        runtime
+            .mark_called(runtime.created_at)
+            .expect("runtime called");
+        runtime
+            .mark_waiting_first_token()
+            .expect("runtime waiting first token");
+        runtime
+            .mark_first_token(runtime.created_at)
+            .expect("runtime first token");
+        runtime
+            .set_output(json!({
+                "content": final_content,
+                "commander_convergence_proof": proof,
+            }))
+            .expect("capture provider output");
+        runtime
+            .finish_success(runtime.created_at, None)
+            .expect("finish runtime");
+
+        assert_eq!(
+            commander_convergence_proof_from_runtime(&record, &runtime)
+                .expect("exact proof replay"),
+            proof
+        );
+
+        let mut fallback = runtime.clone();
+        fallback.runtime_id = "callback-continuation-recovery-runtime-test".to_string();
+        fallback.fallback_from_id = Some(record.runtime_id.clone());
+        assert_eq!(
+            commander_convergence_proof_from_runtime(&record, &fallback)
+                .expect("exact fallback proof replay"),
+            proof
+        );
+        fallback.fallback_from_id = Some("unrelated-runtime".to_string());
+        assert!(
+            commander_convergence_proof_from_runtime(&record, &fallback)
+                .expect_err("unbound fallback must fail")
+                .to_string()
+                .contains("COMMANDER_CONVERGENCE_RUNTIME_IDENTITY_MISMATCH")
+        );
+
+        let mut wrong_final = runtime;
+        wrong_final
+            .output
+            .as_mut()
+            .and_then(|output| output.get_mut("content"))
+            .expect("final content")
+            .clone_from(&json!("different final"));
+        assert!(
+            commander_convergence_proof_from_runtime(&record, &wrong_final)
+                .expect_err("final answer hash mismatch must fail at Router replay")
+                .to_string()
+                .contains("COMMANDER_CONVERGENCE_FINAL_ASSISTANT_HASH_MISMATCH")
         );
     }
 
@@ -4911,7 +5411,13 @@ mod tests {
                     .to_string(),
                 "TERMINAL_CALLBACK_CHILD_ADMISSION_NOT_DURABLE:child-callback"
             );
-            assert_eq!(store.readback().expect("missing admission readback").intaken_callbacks, 0);
+            assert_eq!(
+                store
+                    .readback()
+                    .expect("missing admission readback")
+                    .intaken_callbacks,
+                0
+            );
 
             admit_callback_child(&store, &"a".repeat(64));
             let (transport, delivery) =
@@ -4944,6 +5450,12 @@ mod tests {
                 .to_string(),
             "TERMINAL_CALLBACK_ADMISSION_IDENTITY_MISMATCH:child-callback"
         );
-        assert_eq!(store.readback().expect("mismatch readback").intaken_callbacks, 0);
+        assert_eq!(
+            store
+                .readback()
+                .expect("mismatch readback")
+                .intaken_callbacks,
+            0
+        );
     }
 }

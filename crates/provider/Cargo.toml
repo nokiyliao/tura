@@ -81,6 +81,7 @@ futures-util.workspace = true
 regex.workspace = true
 tura_path.workspace = true
 sha2 = "0.10"
+runtime_contract.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

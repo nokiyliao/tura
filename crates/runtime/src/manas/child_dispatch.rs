@@ -19,6 +19,7 @@ pub struct ChildAgentRequest {
     pub directory: Option<PathBuf>,
     pub parent_session_id: String,
     pub parent_mission_revision_sha256: String,
+    pub commander_thread_id: Option<String>,
     pub delegated_input_sha256: String,
     pub depth: usize,
 }
@@ -114,6 +115,7 @@ pub fn dispatch_child_agent(req: &ChildAgentRequest) -> Result<ChildAgentSummary
         "directory": req.directory.as_ref().map(|d| d.to_string_lossy().to_string()),
         "parent_session_id": req.parent_session_id,
         "parent_mission_revision_sha256": req.parent_mission_revision_sha256,
+        "commander_thread_id": req.commander_thread_id,
         "delegated_input_sha256": req.delegated_input_sha256,
         "depth": req.depth,
     });

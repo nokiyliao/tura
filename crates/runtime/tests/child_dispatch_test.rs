@@ -91,6 +91,7 @@ fn single_child_dispatch_returns_summary() {
         directory: None,
         parent_session_id: "parent-A".to_string(),
         parent_mission_revision_sha256: "6".repeat(64),
+        commander_thread_id: None,
         delegated_input_sha256: "a".repeat(64),
         depth: 1,
     })
@@ -117,6 +118,7 @@ fn concurrent_dispatch_returns_both_summaries() {
             directory: None,
             parent_session_id: "parent-root".to_string(),
             parent_mission_revision_sha256: "6".repeat(64),
+            commander_thread_id: None,
             delegated_input_sha256: "a".repeat(64),
             depth: 1,
         },
@@ -126,6 +128,7 @@ fn concurrent_dispatch_returns_both_summaries() {
             directory: None,
             parent_session_id: "parent-root".to_string(),
             parent_mission_revision_sha256: "6".repeat(64),
+            commander_thread_id: None,
             delegated_input_sha256: "b".repeat(64),
             depth: 1,
         },
@@ -170,6 +173,7 @@ fn recursive_dispatch_2_levels_returns_one_summary() {
         directory: None,
         parent_session_id: "parent-recurse".to_string(),
         parent_mission_revision_sha256: "6".repeat(64),
+        commander_thread_id: None,
         delegated_input_sha256: "c".repeat(64),
         depth: 1,
     })

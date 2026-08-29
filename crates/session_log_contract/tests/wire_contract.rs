@@ -134,6 +134,7 @@ fn runtime_recovery_wire_contract_binds_exact_ledger_identity() {
         expected_session_event_seq: 5,
         expected_session_state: SessionState::Interrupted,
         reason: RecoveryCloseRuntimeReason::OrphanedRuntime,
+        convergence_proof_sha256: None,
         quiescence: RuntimeRecoveryQuiescenceProof {
             active_turn: false,
             queued_turn: false,

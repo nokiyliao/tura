@@ -1,14 +1,15 @@
-use serde_json::{json, Value};
+use runtime_contract::CommanderContinuationBinding;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use tura_llm_rust::official_codex_app_server::{
-    load_thread_association, run_official_codex_turn, CodexAppServerExecutable,
-    CodexCommandRunCommandObservation, CodexCommandRunEffectObservation, CodexExecutionLedger,
-    CodexObservedCommandAccess, CodexObservedToolEffectState, CodexReadOnlyCommandObservation,
-    CodexReadOnlyEffectObservation, OfficialCodexServerRequest, OfficialCodexServerRequestFuture,
-    OfficialCodexServerRequestHandler, OfficialCodexTurnRequest,
+    CodexAppServerExecutable, CodexCommandRunCommandObservation, CodexCommandRunEffectObservation,
+    CodexExecutionLedger, CodexObservedCommandAccess, CodexObservedToolEffectState,
+    CodexReadOnlyCommandObservation, CodexReadOnlyEffectObservation, OfficialCodexServerRequest,
+    OfficialCodexServerRequestFuture, OfficialCodexServerRequestHandler, OfficialCodexTurnRequest,
+    canonical_thread_revision_sha256, load_thread_association, run_official_codex_turn,
 };
 
 const UNCLAIMED_READ_ONLY_COMMAND_LINE: &str = r#"rg -n -A18 -B6 "struct TurnRequestContext|TurnRequestContext \{" crates/provider/src/official_codex_app_server.rs"#;
@@ -79,7 +80,150 @@ fn main() {
     runtime.block_on(async {
         run_hostile_flow().await;
         run_interrupted_effect_recovery().await;
+        run_commander_target_convergence().await;
     });
+}
+
+async fn run_commander_target_convergence() {
+    let root = tempfile::tempdir().expect("commander target tempdir");
+    let session_directory = root.path().join("session");
+    fs::create_dir_all(&session_directory).expect("commander target session directory");
+    let pre_turns = vec![
+        json!({"id": "turn-commander-0", "status": "completed", "items": []}),
+        json!({"id": "turn-commander-1", "status": "completed", "items": []}),
+    ];
+    let pre_revision = canonical_thread_revision_sha256("commander-thread-1", &pre_turns)
+        .expect("commander pre revision");
+    let digest = "c".repeat(64);
+    let target_capture = root.path().join("commander-target.jsonl");
+    let mut target = request(
+        &session_directory,
+        &target_capture,
+        vec![json!({"role": "user", "content": "commander callback input"})],
+    );
+    target.runtime_id = format!("callback-continuation-runtime-{digest}");
+    target.commander_continuation = Some(CommanderContinuationBinding {
+        target_thread_id: "commander-thread-1".to_string(),
+        requested_action: "MISSION_VERIFICATION".to_string(),
+        continuation_request_id: format!("callback-continuation-request-{digest}"),
+        child_session_id: "child-session-1".to_string(),
+        child_transaction_id: "child-transaction-1".to_string(),
+        child_runtime_id: "child-runtime-1".to_string(),
+        callback_payload_sha256: "a".repeat(64),
+        effect_identity_sha256: "b".repeat(64),
+        pre_revision_sha256: pre_revision.clone(),
+    });
+    let mut target_handler = ReceiptHandler::new(
+        &session_directory,
+        &root.path().join("commander-target-count"),
+        false,
+    );
+    let response = run_official_codex_turn(target.clone(), Some(&mut target_handler))
+        .await
+        .expect("commander target convergence");
+    let proof = response
+        .commander_convergence_proof
+        .expect("machine convergence proof");
+    assert_eq!(proof.target_thread_id, "commander-thread-1");
+    assert_eq!(proof.pre_revision_sha256, pre_revision);
+    assert_eq!(proof.target_turn_id, "turn-commander-new");
+    assert_ne!(proof.post_revision_sha256, proof.pre_revision_sha256);
+    assert_eq!(
+        response.content,
+        Value::String("commander converged".to_string())
+    );
+    assert!(
+        load_thread_association(&session_directory, "tura-session-1")
+            .expect("private association read")
+            .is_none(),
+        "target continuation must not overwrite the private association"
+    );
+    let first_protocol_message_count = captured_messages(&target_capture).len();
+    let original_runtime_id = target.runtime_id.clone();
+    target.runtime_id = "callback-continuation-recovery-runtime-test".to_string();
+    target.fallback_from_id = Some(original_runtime_id.clone());
+    let replay = run_official_codex_turn(target.clone(), Some(&mut target_handler))
+        .await
+        .expect("durable convergence proof replay");
+    assert_eq!(replay.commander_convergence_proof, Some(proof));
+    assert_eq!(replay.content, json!("commander converged"));
+    assert_eq!(
+        captured_messages(&target_capture).len(),
+        first_protocol_message_count,
+        "durable proof replay must not submit or read another target turn"
+    );
+    let mut wrong_fallback = target;
+    wrong_fallback.runtime_id = "callback-continuation-recovery-runtime-wrong".to_string();
+    wrong_fallback.fallback_from_id = Some("unrelated-runtime".to_string());
+    let wrong_fallback_error = run_official_codex_turn(wrong_fallback, Some(&mut target_handler))
+        .await
+        .expect_err("unbound convergence fallback must fail before app-server protocol");
+    assert!(
+        wrong_fallback_error
+            .to_string()
+            .contains("runtime/request identity mismatch")
+    );
+    assert_eq!(
+        captured_messages(&target_capture).len(),
+        first_protocol_message_count
+    );
+
+    let stale_directory = root.path().join("stale-session");
+    fs::create_dir_all(&stale_directory).expect("stale session directory");
+    let stale_capture = root.path().join("commander-stale.jsonl");
+    let mut stale = request(
+        &stale_directory,
+        &stale_capture,
+        vec![json!({"role": "user", "content": "stale commander callback"})],
+    );
+    stale.runtime_id = format!("callback-continuation-runtime-{digest}");
+    stale.commander_continuation = response_binding(&digest, "f".repeat(64));
+    let error = run_official_codex_turn(stale, None)
+        .await
+        .expect_err("stale target preimage must fail before turn/start");
+    assert!(
+        error
+            .to_string()
+            .contains("COMMANDER_TARGET_PREIMAGE_MISMATCH")
+    );
+    let captured = captured_messages(&stale_capture);
+    let methods = methods(&captured);
+    assert!(!methods.iter().any(|method| *method == "turn/start"));
+
+    let mismatch_directory = root.path().join("mismatch-session");
+    fs::create_dir_all(&mismatch_directory).expect("mismatch session directory");
+    let mut mismatch = request(
+        &mismatch_directory,
+        &root.path().join("commander-target-mismatch.jsonl"),
+        vec![json!({"role": "user", "content": "mismatch commander callback"})],
+    );
+    mismatch.runtime_id = format!("callback-continuation-runtime-{digest}");
+    mismatch.commander_continuation = response_binding(&digest, pre_revision);
+    let mismatch_error = run_official_codex_turn(mismatch, None)
+        .await
+        .expect_err("target thread mismatch must fail closed");
+    assert!(
+        mismatch_error
+            .to_string()
+            .contains("thread/resume returned")
+    );
+}
+
+fn response_binding(
+    digest: &str,
+    pre_revision_sha256: String,
+) -> Option<CommanderContinuationBinding> {
+    Some(CommanderContinuationBinding {
+        target_thread_id: "commander-thread-1".to_string(),
+        requested_action: "MISSION_VERIFICATION".to_string(),
+        continuation_request_id: format!("callback-continuation-request-{digest}"),
+        child_session_id: "child-session-1".to_string(),
+        child_transaction_id: "child-transaction-1".to_string(),
+        child_runtime_id: "child-runtime-1".to_string(),
+        callback_payload_sha256: "a".repeat(64),
+        effect_identity_sha256: "b".repeat(64),
+        pre_revision_sha256,
+    })
 }
 
 async fn run_hostile_flow() {
@@ -105,8 +249,8 @@ async fn run_hostile_flow() {
     );
     first_request.turn_context = Some("bounded runtime context".to_string());
     let first = run_official_codex_turn(first_request, None)
-    .await
-    .expect("first official turn");
+        .await
+        .expect("first official turn");
 
     assert_eq!(first.content, Value::String("official reply".to_string()));
     assert_eq!(first.association.thread_id, "thread-official-1");
@@ -381,10 +525,12 @@ async fn run_interrupted_effect_recovery() {
     );
     assert_eq!(execution_count(&policy_count), 0);
     assert!(!policy_directory.join(".tura/run/command_receipts").exists());
-    assert!(delivered_policy_denial
-        .association
-        .observed_tool_effects
-        .is_empty());
+    assert!(
+        delivered_policy_denial
+            .association
+            .observed_tool_effects
+            .is_empty()
+    );
 
     let failed_directory = root.path().join("delivered-failure-session");
     fs::create_dir_all(&failed_directory).expect("delivered-failure session directory");
@@ -405,10 +551,12 @@ async fn run_interrupted_effect_recovery() {
         Value::String("failed command observed".to_string())
     );
     assert_eq!(execution_count(&failed_count), 1);
-    assert!(delivered_failure
-        .association
-        .observed_tool_effects
-        .is_empty());
+    assert!(
+        delivered_failure
+            .association
+            .observed_tool_effects
+            .is_empty()
+    );
 
     let same_directory = root.path().join("same-input-session");
     fs::create_dir_all(&same_directory).expect("same-input session directory");
@@ -434,6 +582,7 @@ async fn run_interrupted_effect_recovery() {
         "recover interrupted mission",
     );
     recovery_request.runtime_id = "runtime-official-restarted".to_string();
+    recovery_request.fallback_from_id = Some("runtime-official-1".to_string());
     let recovered = run_official_codex_turn(recovery_request, Some(&mut same_handler))
         .await
         .expect("same-input interrupted recovery");
@@ -453,23 +602,23 @@ async fn run_interrupted_effect_recovery() {
     assert!(recovery_messages.iter().any(|message| {
         message.get("method").and_then(Value::as_str) == Some("thread/inject_items")
             && message["params"]["threadId"] == "thread-recovered-1"
-            && message["params"]["items"]
-                .as_array()
-                .is_some_and(|items| {
-                    items.iter().any(|item| item["type"] == "function_call")
-                        && items
-                            .iter()
-                            .any(|item| item["type"] == "function_call_output")
-                })
+            && message["params"]["items"].as_array().is_some_and(|items| {
+                items.iter().any(|item| item["type"] == "function_call")
+                    && items
+                        .iter()
+                        .any(|item| item["type"] == "function_call_output")
+            })
     }));
     assert!(recovery_messages.iter().any(|message| {
         message.get("method").and_then(Value::as_str) == Some("turn/start")
             && message["params"]["threadId"] == "thread-recovered-1"
             && message["params"]["input"] == json!([])
     }));
-    assert!(!recovery_messages
-        .iter()
-        .any(|message| message.to_string().contains("previous_response_id")));
+    assert!(
+        !recovery_messages
+            .iter()
+            .any(|message| message.to_string().contains("previous_response_id"))
+    );
 
     let completed_directory = root.path().join("completed-read-only-session");
     fs::create_dir_all(&completed_directory).expect("completed read-only session directory");
@@ -521,17 +670,21 @@ async fn run_interrupted_effect_recovery() {
         1,
         "command executed twice"
     );
-    assert!(completed_recovered
-        .association
-        .observed_tool_effects
-        .is_empty());
-    assert!(captured_messages(&completed_recovery_capture)
-        .iter()
-        .any(|message| {
-            message
-                .to_string()
-                .contains("reconstructed_from_durable_terminal_receipt")
-        }));
+    assert!(
+        completed_recovered
+            .association
+            .observed_tool_effects
+            .is_empty()
+    );
+    assert!(
+        captured_messages(&completed_recovery_capture)
+            .iter()
+            .any(|message| {
+                message
+                    .to_string()
+                    .contains("reconstructed_from_durable_terminal_receipt")
+            })
+    );
 
     let durable_batch_directory = root.path().join("durable-batch-session");
     fs::create_dir_all(&durable_batch_directory).expect("durable batch session directory");
@@ -685,10 +838,12 @@ async fn run_interrupted_effect_recovery() {
         1,
         "unclaimed read-only command was replayed"
     );
-    assert!(unclaimed_recovered
-        .association
-        .observed_tool_effects
-        .is_empty());
+    assert!(
+        unclaimed_recovered
+            .association
+            .observed_tool_effects
+            .is_empty()
+    );
 
     for (case_name, receipt_suffix) in [("claim", ".claim.json"), ("terminal", ".json")] {
         let blocked_directory = root
@@ -734,9 +889,11 @@ async fn run_interrupted_effect_recovery() {
         )
         .await
         .expect_err("claimed unclaimed observation must fail closed");
-        assert!(blocked_error
-            .to_string()
-            .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT"));
+        assert!(
+            blocked_error
+                .to_string()
+                .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT")
+        );
         assert_eq!(execution_count(&blocked_count), 1);
     }
 
@@ -755,9 +912,11 @@ async fn run_interrupted_effect_recovery() {
     .await
     .expect_err("conflicting-effect provider loss");
     let mut conflicting_ledger = load_only_execution_ledger(&conflict_directory);
-    conflicting_ledger.effects[0].request_params.as_mut().expect(
-        "interrupted effect must preserve its canonical request",
-    )["arguments"]["commands"][0]["command_line"] = json!("sleep 91");
+    conflicting_ledger.effects[0]
+        .request_params
+        .as_mut()
+        .expect("interrupted effect must preserve its canonical request")["arguments"]["commands"]
+        [0]["command_line"] = json!("sleep 91");
     persist_only_execution_ledger(&conflict_directory, &conflicting_ledger);
     let conflict_error = run_official_codex_turn(
         effect_request(
@@ -769,9 +928,11 @@ async fn run_interrupted_effect_recovery() {
     )
     .await
     .expect_err("conflicting recovery effect must fail closed");
-    assert!(conflict_error
-        .to_string()
-        .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_CONFLICTING_EFFECT"));
+    assert!(
+        conflict_error
+            .to_string()
+            .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_CONFLICTING_EFFECT")
+    );
     assert_eq!(execution_count(&conflict_count), 1);
 
     let changed_directory = root.path().join("changed-input-session");
@@ -815,9 +976,11 @@ async fn run_interrupted_effect_recovery() {
     )
     .await
     .expect_err("uncertain effect must not be delivered");
-    assert!(uncertain_initial
-        .to_string()
-        .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT"));
+    assert!(
+        uncertain_initial
+            .to_string()
+            .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT")
+    );
     let uncertain_recovery = run_official_codex_turn(
         effect_request(
             &uncertain_directory,
@@ -828,9 +991,11 @@ async fn run_interrupted_effect_recovery() {
     )
     .await
     .expect_err("uncertain effect recovery must fail closed");
-    assert!(uncertain_recovery
-        .to_string()
-        .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT"));
+    assert!(
+        uncertain_recovery
+            .to_string()
+            .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT")
+    );
     assert_eq!(execution_count(&uncertain_count), 1);
 
     println!(
@@ -1412,6 +1577,7 @@ fn request(
     OfficialCodexTurnRequest {
         tura_session_id: "tura-session-1".to_string(),
         runtime_id: "runtime-official-1".to_string(),
+        fallback_from_id: None,
         session_directory: session_directory.to_path_buf(),
         model: "gpt-5.6-sol".to_string(),
         messages,
@@ -1426,6 +1592,7 @@ fn request(
         dynamic_tools: Vec::new(),
         allowed_command_run_commands: None,
         disable_permission_restrictions: false,
+        commander_continuation: None,
     }
 }
 
@@ -1447,6 +1614,7 @@ fn fake_app_server(args: &[String]) {
     let mut stdout = std::io::stdout();
     let mut lines = stdin.lock().lines();
     let mut recovery_history_injected = false;
+    let mut commander_turn_completed = false;
     while let Some(line) = lines.next() {
         let line = line.expect("fake app-server input");
         let message: Value = serde_json::from_str(&line).expect("JSON-RPC input");
@@ -1490,17 +1658,45 @@ fn fake_app_server(args: &[String]) {
                 id,
                 json!({
                     "thread": {
-                        "id": message["params"]["threadId"],
-                        "sessionId": "session-official-1"
+                        "id": if mode == "commander-target-mismatch" {
+                            json!("wrong-commander-thread")
+                        } else {
+                            message["params"]["threadId"].clone()
+                        },
+                        "sessionId": if mode.starts_with("commander-") {
+                            "session-commander-1"
+                        } else {
+                            "session-official-1"
+                        }
                     }
                 }),
             ),
             "thread/read" => {
-                let turns = if mode == "recover" {
-                    vec![serde_json::from_slice::<Value>(
-                        &fs::read(&authority).expect("authoritative turn"),
-                    )
-                    .expect("authoritative turn JSON")]
+                let turns = if mode.starts_with("commander-") {
+                    let mut turns = vec![
+                        json!({"id": "turn-commander-0", "status": "completed", "items": []}),
+                        json!({"id": "turn-commander-1", "status": "completed", "items": []}),
+                    ];
+                    if commander_turn_completed {
+                        turns.push(json!({
+                            "id": "turn-commander-new",
+                            "status": "completed",
+                            "items": [{
+                                "type": "agentMessage",
+                                "id": "item-commander-new",
+                                "text": "commander converged",
+                                "phase": "final_answer"
+                            }]
+                        }));
+                    }
+                    turns
+                } else if mode == "recover" {
+                    vec![
+                        serde_json::from_slice::<Value>(
+                            &fs::read(&authority).expect("authoritative turn"),
+                        )
+                        .expect("authoritative turn JSON"),
+                    ]
                 } else if mode.ends_with("-recover") {
                     vec![json!({
                         "id": "turn-effect-interrupted-1",
@@ -1513,7 +1709,14 @@ fn fake_app_server(args: &[String]) {
                 respond(
                     &mut stdout,
                     id,
-                    json!({"thread": {"id": "thread-official-1", "turns": turns}}),
+                    json!({"thread": {
+                        "id": if mode.starts_with("commander-") {
+                            "commander-thread-1"
+                        } else {
+                            "thread-official-1"
+                        },
+                        "turns": turns
+                    }}),
                 );
             }
             "thread/inject_items" => {
@@ -1522,7 +1725,10 @@ fn fake_app_server(args: &[String]) {
                 let items = message["params"]["items"]
                     .as_array()
                     .expect("recovery items");
-                assert_eq!(items.first().and_then(|item| item["type"].as_str()), Some("message"));
+                assert_eq!(
+                    items.first().and_then(|item| item["type"].as_str()),
+                    Some("message")
+                );
                 assert!(items.windows(2).any(|pair| {
                     pair[0]["type"] == "function_call"
                         && pair[1]["type"] == "function_call_output"
@@ -1532,6 +1738,51 @@ fn fake_app_server(args: &[String]) {
                 respond(&mut stdout, id, json!({}));
             }
             "turn/start" => {
+                if mode.starts_with("commander-") {
+                    assert_eq!(message["params"]["threadId"], "commander-thread-1");
+                    respond(
+                        &mut stdout,
+                        id,
+                        json!({"turn": {
+                            "id": "turn-commander-new",
+                            "status": "inProgress",
+                            "items": []
+                        }}),
+                    );
+                    commander_turn_completed = true;
+                    notify(
+                        &mut stdout,
+                        "item/completed",
+                        json!({
+                            "threadId": "commander-thread-1",
+                            "turnId": "turn-commander-new",
+                            "item": {
+                                "type": "agentMessage",
+                                "id": "item-commander-new",
+                                "text": "commander converged",
+                                "phase": "final_answer"
+                            }
+                        }),
+                    );
+                    notify(
+                        &mut stdout,
+                        "turn/completed",
+                        json!({
+                            "threadId": "commander-thread-1",
+                            "turn": {
+                                "id": "turn-commander-new",
+                                "status": "completed",
+                                "items": [{
+                                    "type": "agentMessage",
+                                    "id": "item-commander-new",
+                                    "text": "commander converged",
+                                    "phase": "final_answer"
+                                }]
+                            }
+                        }),
+                    );
+                    continue;
+                }
                 if mode.contains("effect-")
                     || mode == "delivered-failure"
                     || mode.contains("changed-")

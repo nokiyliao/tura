@@ -595,6 +595,7 @@ pub struct RuntimeLeaseSnapshot {
 pub enum RecoveryCloseRuntimeReason {
     OrphanedRuntime,
     UnbornRuntime,
+    CommanderConvergenceProven,
 }
 
 pub fn recovery_terminal_projection_event_id(receipt_id: &str) -> String {
@@ -643,6 +644,8 @@ pub struct RecoveryCloseRuntimeRequest {
     pub expected_session_event_seq: u64,
     pub expected_session_state: SessionState,
     pub reason: RecoveryCloseRuntimeReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_proof_sha256: Option<String>,
     pub quiescence: RuntimeRecoveryQuiescenceProof,
 }
 
@@ -659,6 +662,8 @@ pub struct RuntimeRecoveryReceipt {
     pub last_event_seq: u64,
     pub session_event_seq: u64,
     pub reason: RecoveryCloseRuntimeReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_proof_sha256: Option<String>,
     pub lease_active: bool,
     pub terminal: bool,
     pub session_state: SessionState,

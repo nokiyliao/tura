@@ -104,6 +104,8 @@ pub struct EnqueueTurnRequest {
 pub struct RegisterChildSessionRequest {
     pub parent_session_id: String,
     pub parent_mission_revision_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander_thread_id: Option<String>,
     pub child_session_id: String,
     pub child_runtime_id: String,
     pub child_transaction_id: String,
@@ -137,6 +139,13 @@ impl RegisterChildSessionRequest {
             if value.trim().is_empty() {
                 return Err(format!("CHILD_ADMISSION_IDENTITY_MISSING:{name}"));
             }
+        }
+        if self
+            .commander_thread_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("CHILD_ADMISSION_IDENTITY_INVALID:commander_thread_id".to_string());
         }
         for (name, value) in [
             (
@@ -384,6 +393,7 @@ mod tests {
         RegisterChildSessionRequest {
             parent_session_id: "parent-1".to_string(),
             parent_mission_revision_sha256: "a".repeat(64),
+            commander_thread_id: None,
             child_session_id: "child-1".to_string(),
             child_runtime_id: "runtime-1".to_string(),
             child_transaction_id: "callback-1".to_string(),

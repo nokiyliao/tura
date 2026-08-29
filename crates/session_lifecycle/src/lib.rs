@@ -8,6 +8,7 @@ use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{AccessKind, AccessMode, ModifyKind},
 };
+use runtime_contract::CommanderConvergenceProof;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -214,6 +215,8 @@ pub struct ChildAdmissionRecord {
     pub schema_version: String,
     pub parent_session_id: String,
     pub parent_mission_revision_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander_thread_id: Option<String>,
     pub child_session_id: String,
     pub child_runtime_id: String,
     pub child_transaction_id: String,
@@ -232,6 +235,7 @@ impl ChildAdmissionRecord {
     pub fn new(
         parent_session_id: impl Into<String>,
         parent_mission_revision_sha256: impl Into<String>,
+        commander_thread_id: Option<String>,
         child_session_id: impl Into<String>,
         child_runtime_id: impl Into<String>,
         child_transaction_id: impl Into<String>,
@@ -248,6 +252,7 @@ impl ChildAdmissionRecord {
             schema_version: CHILD_ADMISSION_SCHEMA.to_string(),
             parent_session_id: parent_session_id.into(),
             parent_mission_revision_sha256: parent_mission_revision_sha256.into(),
+            commander_thread_id,
             child_session_id: child_session_id.into(),
             child_runtime_id: child_runtime_id.into(),
             child_transaction_id: child_transaction_id.into(),
@@ -286,6 +291,8 @@ pub struct DurableCallbackRecord {
     pub transport_payload: Value,
     pub transport_payload_sha256: String,
     pub parent_mission_revision_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander_thread_id: Option<String>,
     pub delegated_input_sha256: String,
     pub effect_identity: CallbackEffectIdentity,
 }
@@ -315,6 +322,7 @@ impl DurableCallbackRecord {
             transport_payload_sha256: canonical_value_sha256(&transport_payload),
             transport_payload,
             parent_mission_revision_sha256: parent_mission_revision_sha256.into(),
+            commander_thread_id: None,
             delegated_input_sha256: delegated_input_sha256.into(),
             effect_identity,
         })
@@ -356,9 +364,14 @@ pub struct ContinuationDispatchRecord {
     pub child_runtime_id: String,
     pub callback_payload_sha256: String,
     pub parent_mission_revision_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander_thread_id: Option<String>,
     pub delegated_input_sha256: String,
     pub effect_identity: CallbackEffectIdentity,
     pub parent_input: Value,
+    pub requested_action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_proof: Option<CommanderConvergenceProof>,
     pub state: ContinuationDispatchState,
 }
 
@@ -408,9 +421,12 @@ impl ContinuationDispatchRecord {
             child_runtime_id: callback.runtime_id.clone(),
             callback_payload_sha256: callback.callback_payload_sha256.clone(),
             parent_mission_revision_sha256: callback.parent_mission_revision_sha256.clone(),
+            commander_thread_id: callback.commander_thread_id.clone(),
             delegated_input_sha256: callback.delegated_input_sha256.clone(),
             effect_identity: callback.effect_identity.clone(),
             parent_input,
+            requested_action: requested_action.to_string(),
+            convergence_proof: None,
             state: ContinuationDispatchState::Prepared,
         })
     }
@@ -746,7 +762,7 @@ impl SessionLifecycleStore {
             }
             let stored = read_stored_receipt(&pending_path)?;
             self.validate_receipt(&stored.receipt)?;
-            let expected = self.next_event_sequence(transaction_id)?;
+            let expected = self.next_receipt_event_sequence_unlocked(transaction_id)?;
             if stored.receipt.event_seq != expected {
                 let code = if stored.receipt.event_seq > expected {
                     "RECEIPT_EVENT_OUT_OF_ORDER"
@@ -994,6 +1010,61 @@ impl SessionLifecycleStore {
         self.transition_callback_continuation(expected, ContinuationDispatchState::Dispatched)
     }
 
+    pub fn bind_callback_continuation_convergence_proof(
+        &self,
+        expected: &ContinuationDispatchRecord,
+        proof: &CommanderConvergenceProof,
+    ) -> LifecycleResult<ContinuationWriteOutcome> {
+        self.validate_continuation(expected)?;
+        self.validate_convergence_proof(expected, proof)?;
+        self.with_lock(|| {
+            let path =
+                self.continuation_path(&expected.child_transaction_id, &expected.child_event_id);
+            let mut existing: ContinuationDispatchRecord = read_json(&path)?;
+            if !continuation_bound_fields_match(&existing, expected) {
+                return Err(LifecycleBlocker::new(
+                    "CONTINUATION_IDENTITY_CONFLICT",
+                    path.display().to_string(),
+                ));
+            }
+            if let Some(bound) = existing.convergence_proof.as_ref() {
+                return if bound == proof {
+                    Ok(match existing.state {
+                        ContinuationDispatchState::Prepared => {
+                            ContinuationWriteOutcome::AlreadyPrepared
+                        }
+                        ContinuationDispatchState::Dispatched => {
+                            ContinuationWriteOutcome::AlreadyDispatched
+                        }
+                        ContinuationDispatchState::Completed => {
+                            ContinuationWriteOutcome::AlreadyCompleted
+                        }
+                        ContinuationDispatchState::Acknowledged => {
+                            ContinuationWriteOutcome::AlreadyAcknowledged
+                        }
+                    })
+                } else {
+                    Err(LifecycleBlocker::new(
+                        "COMMANDER_CONVERGENCE_PROOF_CONFLICT",
+                        &existing.request_id,
+                    ))
+                };
+            }
+            existing.convergence_proof = Some(proof.clone());
+            durable_write_json(&path, &existing)?;
+            Ok(match existing.state {
+                ContinuationDispatchState::Prepared => ContinuationWriteOutcome::AlreadyPrepared,
+                ContinuationDispatchState::Dispatched => {
+                    ContinuationWriteOutcome::AlreadyDispatched
+                }
+                ContinuationDispatchState::Completed => ContinuationWriteOutcome::AlreadyCompleted,
+                ContinuationDispatchState::Acknowledged => {
+                    ContinuationWriteOutcome::AlreadyAcknowledged
+                }
+            })
+        })
+    }
+
     pub fn mark_callback_continuation_completed(
         &self,
         expected: &ContinuationDispatchRecord,
@@ -1027,15 +1098,42 @@ impl SessionLifecycleStore {
         record: &ContinuationDispatchRecord,
     ) -> LifecycleResult<bool> {
         self.validate_continuation(record)?;
+        if record.commander_thread_id.is_some() && record.convergence_proof.is_none() {
+            return Ok(false);
+        }
         self.with_lock(|| {
             for path in json_files(&self.root.join("receipts/applied"))? {
                 let stored = read_stored_receipt(&path)?;
                 let receipt = &stored.receipt;
+                let normal_runtime_identity =
+                    receipt.runtime_id == record.runtime_id && receipt.lease_id == record.lease_id;
+                let fallback_runtime_identity =
+                    record
+                        .commander_thread_id
+                        .as_ref()
+                        .is_some_and(|target_thread_id| {
+                            receipt.runtime_id != record.runtime_id
+                                && receipt
+                                    .audit_metadata
+                                    .get("commander_continuation_request_id")
+                                    == Some(&Value::String(record.request_id.clone()))
+                                && receipt
+                                    .audit_metadata
+                                    .get("commander_continuation_target_thread_id")
+                                    == Some(&Value::String(target_thread_id.clone()))
+                                && receipt
+                                    .audit_metadata
+                                    .get("commander_continuation_origin_runtime_id")
+                                    == Some(&Value::String(record.runtime_id.clone()))
+                                && receipt
+                                    .audit_metadata
+                                    .get("commander_continuation_origin_lease_id")
+                                    == Some(&Value::String(record.lease_id.clone()))
+                        });
                 if receipt.transaction_id != record.request_id
                     || receipt.commander_session_id != record.commander_session_id
                     || receipt.child_session_id != record.commander_session_id
-                    || receipt.runtime_id != record.runtime_id
-                    || receipt.lease_id != record.lease_id
+                    || (!normal_runtime_identity && !fallback_runtime_identity)
                     || receipt.terminal_state != TerminalState::Completed
                 {
                     continue;
@@ -1073,6 +1171,28 @@ impl SessionLifecycleStore {
                     "CONTINUATION_IDENTITY_CONFLICT",
                     path.display().to_string(),
                 ));
+            }
+            if target == ContinuationDispatchState::Completed
+                && existing.commander_thread_id.is_some()
+            {
+                let expected_proof = expected.convergence_proof.as_ref().ok_or_else(|| {
+                    LifecycleBlocker::new(
+                        "COMMANDER_CONVERGENCE_PROOF_MISSING",
+                        &expected.request_id,
+                    )
+                })?;
+                let persisted_proof = existing.convergence_proof.as_ref().ok_or_else(|| {
+                    LifecycleBlocker::new(
+                        "COMMANDER_CONVERGENCE_PROOF_NOT_DURABLE",
+                        &expected.request_id,
+                    )
+                })?;
+                if persisted_proof != expected_proof {
+                    return Err(LifecycleBlocker::new(
+                        "COMMANDER_CONVERGENCE_PROOF_CONFLICT",
+                        &expected.request_id,
+                    ));
+                }
             }
             if existing.state == ContinuationDispatchState::Acknowledged {
                 return Ok(ContinuationWriteOutcome::AlreadyAcknowledged);
@@ -1548,6 +1668,35 @@ impl SessionLifecycleStore {
                 &record.commander_session_id,
             ));
         }
+        if record.requested_action
+            != record
+                .parent_input
+                .get("requested_action")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            || !matches!(
+                record.requested_action.as_str(),
+                "MISSION_VERIFICATION" | "ROUTE_SELECTION"
+            )
+        {
+            return Err(LifecycleBlocker::new(
+                "CONTINUATION_REQUESTED_ACTION_INVALID",
+                &record.request_id,
+            ));
+        }
+        if record
+            .commander_thread_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(LifecycleBlocker::new(
+                "COMMANDER_THREAD_IDENTITY_INVALID",
+                &record.request_id,
+            ));
+        }
+        if let Some(proof) = record.convergence_proof.as_ref() {
+            self.validate_convergence_proof(record, proof)?;
+        }
         if matches!(
             record.effect_identity,
             CallbackEffectIdentity::UnsettledEffect { .. }
@@ -1617,6 +1766,40 @@ impl SessionLifecycleStore {
         Ok(())
     }
 
+    fn validate_convergence_proof(
+        &self,
+        record: &ContinuationDispatchRecord,
+        proof: &CommanderConvergenceProof,
+    ) -> LifecycleResult<()> {
+        proof
+            .validate_shape()
+            .map_err(|error| LifecycleBlocker::new("COMMANDER_CONVERGENCE_PROOF_INVALID", error))?;
+        let commander_thread_id = record.commander_thread_id.as_deref().ok_or_else(|| {
+            LifecycleBlocker::new(
+                "COMMANDER_CONVERGENCE_PROOF_WITHOUT_TARGET",
+                &record.request_id,
+            )
+        })?;
+        let effect = serde_json::to_value(&record.effect_identity).map_err(json_blocker)?;
+        let effect_identity_sha256 = canonical_value_sha256(&effect);
+        if proof.request_id != record.request_id
+            || proof.callback_payload_sha256 != record.callback_payload_sha256
+            || proof.effect_identity_sha256 != effect_identity_sha256
+            || proof.child_session_id != record.child_session_id
+            || proof.child_transaction_id != record.child_transaction_id
+            || proof.child_runtime_id != record.child_runtime_id
+            || proof.requested_action != record.requested_action
+            || proof.target_thread_id != commander_thread_id
+            || proof.pre_revision_sha256 != record.parent_mission_revision_sha256
+        {
+            return Err(LifecycleBlocker::new(
+                "COMMANDER_CONVERGENCE_PROOF_BINDING_MISMATCH",
+                &record.request_id,
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_checkpoint_pair(
         &self,
         first: &CheckpointIdentity,
@@ -1675,7 +1858,12 @@ impl SessionLifecycleStore {
         Ok(stable.clone())
     }
 
-    fn next_event_sequence(&self, transaction_id: &str) -> LifecycleResult<u64> {
+    pub fn next_receipt_event_sequence(&self, transaction_id: &str) -> LifecycleResult<u64> {
+        require_identifier("transaction_id", transaction_id)?;
+        self.with_lock(|| self.next_receipt_event_sequence_unlocked(transaction_id))
+    }
+
+    fn next_receipt_event_sequence_unlocked(&self, transaction_id: &str) -> LifecycleResult<u64> {
         let mut sequences = BTreeSet::new();
         for path in json_files(&self.root.join("receipts/applied"))? {
             let stored = read_stored_receipt(&path)?;
@@ -1909,6 +2097,8 @@ fn continuation_bound_fields_match(
     let mut expected = expected.clone();
     existing.state = ContinuationDispatchState::Prepared;
     expected.state = ContinuationDispatchState::Prepared;
+    existing.convergence_proof = None;
+    expected.convergence_proof = None;
     existing == expected
 }
 
@@ -2301,6 +2491,7 @@ mod tests {
         ChildAdmissionRecord::new(
             "commander-1",
             "69edd74f732aa5bed571d652e7f91874a16881116b454218a508f413a33fcd70",
+            None,
             "child-1",
             "runtime-0",
             "transaction-1",
@@ -2356,8 +2547,8 @@ mod tests {
                 &callback.callback_payload_sha256,
             )
             .expect("callback intake");
-        let continuation = ContinuationDispatchRecord::from_callback(&callback)
-            .expect("continuation identity");
+        let continuation =
+            ContinuationDispatchRecord::from_callback(&callback).expect("continuation identity");
         assert_eq!(
             store
                 .prepare_callback_continuation(&continuation)
@@ -2479,6 +2670,7 @@ mod tests {
             .expect("prepare continuation");
         let mut changed = record.clone();
         changed.parent_input["requested_action"] = Value::String("ROUTE_SELECTION".to_string());
+        changed.requested_action = "ROUTE_SELECTION".to_string();
         assert_eq!(
             store
                 .prepare_callback_continuation(&changed)
@@ -2518,6 +2710,110 @@ mod tests {
                 .code,
             "CONTINUATION_UNSETTLED_EFFECT_BLOCKED"
         );
+    }
+
+    #[test]
+    fn commander_target_continuation_requires_exact_bound_proof_before_completion() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let terminal_receipt = receipt("commander-convergence", 0);
+        let mut targeted_callback = callback(&terminal_receipt, "child result");
+        targeted_callback.commander_thread_id = Some("commander-thread-1".to_string());
+        publish_callback_fixture(&store, &terminal_receipt, &targeted_callback);
+        store
+            .mark_callback_intaken(
+                &targeted_callback.transaction_id,
+                &targeted_callback.event_id,
+                &targeted_callback.callback_payload_sha256,
+            )
+            .expect("intake callback");
+        let record = ContinuationDispatchRecord::from_callback(&targeted_callback)
+            .expect("target continuation");
+        store
+            .prepare_callback_continuation(&record)
+            .expect("prepare target continuation");
+        store
+            .mark_callback_continuation_dispatched(&record)
+            .expect("dispatch target continuation");
+        assert_eq!(
+            store
+                .mark_callback_continuation_completed(&record)
+                .expect_err("target continuation cannot complete without proof")
+                .code,
+            "COMMANDER_CONVERGENCE_PROOF_MISSING"
+        );
+        let effect = serde_json::to_value(&record.effect_identity).expect("effect value");
+        let mut proof = CommanderConvergenceProof {
+            schema_version: runtime_contract::COMMANDER_CONVERGENCE_PROOF_SCHEMA_VERSION
+                .to_string(),
+            request_id: record.request_id.clone(),
+            callback_payload_sha256: record.callback_payload_sha256.clone(),
+            effect_identity_sha256: canonical_value_sha256(&effect),
+            child_session_id: record.child_session_id.clone(),
+            child_transaction_id: record.child_transaction_id.clone(),
+            child_runtime_id: record.child_runtime_id.clone(),
+            requested_action: record.requested_action.clone(),
+            target_thread_id: "wrong-thread".to_string(),
+            pre_revision_sha256: record.parent_mission_revision_sha256.clone(),
+            post_revision_sha256: "b".repeat(64),
+            target_turn_id: "turn-1".to_string(),
+            final_assistant_sha256: "c".repeat(64),
+        };
+        assert_eq!(
+            store
+                .bind_callback_continuation_convergence_proof(&record, &proof)
+                .expect_err("wrong target proof must not bind")
+                .code,
+            "COMMANDER_CONVERGENCE_PROOF_BINDING_MISMATCH"
+        );
+        proof.target_thread_id = "commander-thread-1".to_string();
+        proof.requested_action = "ROUTE_SELECTION".to_string();
+        assert_eq!(
+            store
+                .bind_callback_continuation_convergence_proof(&record, &proof)
+                .expect_err("wrong action proof must not bind")
+                .code,
+            "COMMANDER_CONVERGENCE_PROOF_BINDING_MISMATCH"
+        );
+        proof.requested_action = record.requested_action.clone();
+        let mut caller_only = record.clone();
+        caller_only.convergence_proof = Some(proof.clone());
+        assert_eq!(
+            store
+                .mark_callback_continuation_completed(&caller_only)
+                .expect_err("caller proof cannot bypass durable proof binding")
+                .code,
+            "COMMANDER_CONVERGENCE_PROOF_NOT_DURABLE"
+        );
+        store
+            .bind_callback_continuation_convergence_proof(&record, &proof)
+            .expect("bind exact proof");
+        assert_eq!(
+            store
+                .bind_callback_continuation_convergence_proof(&record, &proof)
+                .expect("identical proof replay is idempotent"),
+            ContinuationWriteOutcome::AlreadyDispatched
+        );
+        let mut bound = record.clone();
+        bound.convergence_proof = Some(proof);
+        store
+            .mark_callback_continuation_completed(&bound)
+            .expect("complete with exact proof");
+        assert_eq!(
+            store
+                .callback_continuations_for_replay()
+                .expect("proof readback")[0]
+                .convergence_proof,
+            bound.convergence_proof
+        );
+
+        let legacy = ContinuationDispatchRecord::from_callback(&callback(
+            &terminal_receipt,
+            "legacy result",
+        ))
+        .expect("legacy continuation");
+        assert!(legacy.commander_thread_id.is_none());
+        assert!(legacy.convergence_proof.is_none());
     }
 
     #[test]
@@ -2664,6 +2960,106 @@ mod tests {
             store
                 .callback_continuation_completion_proven(&continuation)
                 .expect("terminal and reclaim prove completion")
+        );
+    }
+
+    #[test]
+    fn commander_target_accepts_only_exact_fallback_terminal_identity() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        let child_receipt = receipt("commander-fallback-child", 0);
+        let mut callback = callback(&child_receipt, "child result");
+        callback.commander_thread_id = Some("commander-thread-1".to_string());
+        publish_callback_fixture(&store, &child_receipt, &callback);
+        store
+            .mark_callback_intaken(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+            )
+            .expect("intake targeted callback");
+        let record = ContinuationDispatchRecord::from_callback(&callback)
+            .expect("derive targeted continuation");
+        store
+            .prepare_callback_continuation(&record)
+            .expect("prepare targeted continuation");
+        store
+            .mark_callback_continuation_dispatched(&record)
+            .expect("dispatch targeted continuation");
+        let effect = serde_json::to_value(&record.effect_identity).expect("effect value");
+        let proof = CommanderConvergenceProof {
+            schema_version: runtime_contract::COMMANDER_CONVERGENCE_PROOF_SCHEMA_VERSION
+                .to_string(),
+            request_id: record.request_id.clone(),
+            callback_payload_sha256: record.callback_payload_sha256.clone(),
+            effect_identity_sha256: canonical_value_sha256(&effect),
+            child_session_id: record.child_session_id.clone(),
+            child_transaction_id: record.child_transaction_id.clone(),
+            child_runtime_id: record.child_runtime_id.clone(),
+            requested_action: record.requested_action.clone(),
+            target_thread_id: "commander-thread-1".to_string(),
+            pre_revision_sha256: record.parent_mission_revision_sha256.clone(),
+            post_revision_sha256: "b".repeat(64),
+            target_turn_id: "turn-fallback".to_string(),
+            final_assistant_sha256: "c".repeat(64),
+        };
+        store
+            .bind_callback_continuation_convergence_proof(&record, &proof)
+            .expect("bind fallback proof");
+        let mut bound = record.clone();
+        bound.convergence_proof = Some(proof);
+
+        let mut fallback_receipt = TerminalReceipt::new(
+            TerminalReceiptIdentity::new(
+                &record.request_id,
+                "fallback-terminal",
+                0,
+                &record.commander_session_id,
+                &record.commander_session_id,
+                "fallback-runtime",
+                "fallback-lease",
+            ),
+            TerminalState::Completed,
+            1_786_845_600_200,
+        );
+        fallback_receipt.audit_metadata.insert(
+            "commander_continuation_request_id".to_string(),
+            Value::String(record.request_id.clone()),
+        );
+        fallback_receipt.audit_metadata.insert(
+            "commander_continuation_target_thread_id".to_string(),
+            Value::String("commander-thread-1".to_string()),
+        );
+        fallback_receipt.audit_metadata.insert(
+            "commander_continuation_origin_runtime_id".to_string(),
+            Value::String(record.runtime_id.clone()),
+        );
+        fallback_receipt.audit_metadata.insert(
+            "commander_continuation_origin_lease_id".to_string(),
+            Value::String(record.lease_id.clone()),
+        );
+        store
+            .write_terminal_receipt(&fallback_receipt)
+            .expect("write fallback terminal receipt");
+        store
+            .intake(&record.request_id, "fallback-terminal")
+            .expect("apply fallback terminal receipt");
+        assert!(
+            !store
+                .callback_continuation_completion_proven(&bound)
+                .expect("fallback without release is incomplete")
+        );
+        store
+            .reclaim_terminal_slot(
+                &record.request_id,
+                "fallback-terminal",
+                LiveEffectEvidence::default(),
+            )
+            .expect("reclaim fallback terminal slot");
+        assert!(
+            store
+                .callback_continuation_completion_proven(&bound)
+                .expect("exact fallback identity proves completion")
         );
     }
 
@@ -2960,6 +3356,25 @@ mod tests {
         let readback = after_intake.readback().expect("pending callback readback");
         assert_eq!(readback.commander_session_id, "commander-1");
         assert_eq!(readback.acknowledged_receipts, 0);
+    }
+
+    #[test]
+    fn next_receipt_sequence_uses_only_applied_same_transaction() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = store(root.path());
+        store
+            .write_terminal_receipt(&receipt("event-0", 0))
+            .expect("write seq0");
+        assert_eq!(store.next_receipt_event_sequence("transaction-1").unwrap(), 0);
+        assert_eq!(
+            store.intake("transaction-1", "event-0").unwrap(),
+            IntakeOutcome::Applied { event_seq: 0 }
+        );
+        assert_eq!(store.next_receipt_event_sequence("transaction-1").unwrap(), 1);
+        let mut other = receipt("other-event-0", 0);
+        other.transaction_id = "transaction-2".to_string();
+        store.write_terminal_receipt(&other).expect("write other pending");
+        assert_eq!(store.next_receipt_event_sequence("transaction-1").unwrap(), 1);
     }
 
     #[test]

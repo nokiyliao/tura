@@ -1,6 +1,6 @@
 use chrono::Utc;
 use lifecycle::{RuntimeAggregate, RuntimeState};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -9,10 +9,10 @@ use crate::provider_flow::errors::finish_runtime_failure_with_retry_policy;
 use crate::provider_flow::provider_response::apply_provider_response;
 use crate::runtime_event_writer::RuntimeEventWriter;
 use tura_llm_rust::official_codex_app_server::{
-    run_official_codex_turn, CodexAppServerExecutable, CodexCommandRunCommandObservation,
-    CodexCommandRunEffectObservation, CodexExecutionLedger, CodexObservedCommandAccess,
-    CodexReadOnlyCommandObservation, CodexReadOnlyEffectObservation, OfficialCodexServerRequest,
-    OfficialCodexServerRequestFuture, OfficialCodexServerRequestHandler, OfficialCodexTurnRequest,
+    CodexAppServerExecutable, CodexCommandRunCommandObservation, CodexCommandRunEffectObservation,
+    CodexExecutionLedger, CodexObservedCommandAccess, CodexReadOnlyCommandObservation,
+    CodexReadOnlyEffectObservation, OfficialCodexServerRequest, OfficialCodexServerRequestFuture,
+    OfficialCodexServerRequestHandler, OfficialCodexTurnRequest, run_official_codex_turn,
 };
 
 pub(crate) struct OfficialCodexRuntimeInput {
@@ -23,6 +23,8 @@ pub(crate) struct OfficialCodexRuntimeInput {
     pub(crate) allowed_command_run_commands: Option<BTreeSet<String>>,
     pub(crate) disable_permission_restrictions: bool,
     pub(crate) jspace_contract: Option<Value>,
+    pub(crate) commander_continuation: Option<runtime_contract::CommanderContinuationBinding>,
+    pub(crate) fallback_from_id: Option<String>,
 }
 
 pub(crate) async fn call_runtime_official_codex(
@@ -44,6 +46,7 @@ pub(crate) async fn call_runtime_official_codex(
     let request = OfficialCodexTurnRequest {
         tura_session_id: runtime.session_id.clone(),
         runtime_id: runtime.runtime_id.clone(),
+        fallback_from_id: input.fallback_from_id,
         session_directory: input.session_directory,
         model: provider.model.clone(),
         messages: input.messages,
@@ -55,6 +58,7 @@ pub(crate) async fn call_runtime_official_codex(
         dynamic_tools: app_server_dynamic_tools(input.dynamic_tools),
         allowed_command_run_commands,
         disable_permission_restrictions: input.disable_permission_restrictions,
+        commander_continuation: input.commander_continuation,
     };
     let result = run_official_codex_turn(request, Some(&mut handler)).await;
     let finished_at = Utc::now();
@@ -84,6 +88,7 @@ pub(crate) async fn call_runtime_official_codex(
                 "usage": response.usage,
                 "monetary_cost_authority": "unknown",
                 "authoritative_events": response.authoritative_events,
+                "commander_convergence_proof": response.commander_convergence_proof,
             }))?;
             apply_provider_response(runtime, &response.content, finished_at)?;
             runtime
@@ -675,14 +680,14 @@ mod tests {
     }
 
     use super::{
-        app_server_dynamic_tools, command_call_id, governed_dynamic_tool_arguments,
-        qualifies_for_synthetic_read_only_recovery, safe_call_id, RuntimeOfficialCodexHandler,
+        RuntimeOfficialCodexHandler, app_server_dynamic_tools, command_call_id,
+        governed_dynamic_tool_arguments, qualifies_for_synthetic_read_only_recovery, safe_call_id,
     };
     use std::{collections::BTreeSet, path::Path, sync::Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tura_llm_rust::official_codex_app_server::{
-        CodexExecutionLedger, OfficialCodexServerRequest, OfficialCodexServerRequestHandler,
-        CODEX_EXECUTION_LEDGER_SCHEMA_VERSION,
+        CODEX_EXECUTION_LEDGER_SCHEMA_VERSION, CodexExecutionLedger, OfficialCodexServerRequest,
+        OfficialCodexServerRequestHandler,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -745,6 +750,8 @@ mod tests {
             effects: Vec::new(),
             interrupted_recovery: None,
             terminal_status: None,
+            commander_convergence_proof: None,
+            commander_convergence_final_assistant: None,
         };
         first
             .persist_execution_ledger(&ledger)
@@ -768,10 +775,12 @@ mod tests {
             .expect("read adopted ledger")
             .expect("adopted ledger exists");
         assert_eq!(reread.runtime_ids, ["runtime-1", "runtime-2"]);
-        assert!(retry
-            .load_execution_ledger(&"b".repeat(64))
-            .expect("different input lookup")
-            .is_none());
+        assert!(
+            retry
+                .load_execution_ledger(&"b".repeat(64))
+                .expect("different input lookup")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -905,30 +914,36 @@ mod tests {
             default_temperature: 0.0,
             providers: vec![provider("official_codex_app_server"), provider("openai")],
         };
-        assert!(mixed
-            .official_codex_app_server_provider()
-            .expect_err("official fallback must be rejected")
-            .to_string()
-            .contains("fallback is prohibited"));
+        assert!(
+            mixed
+                .official_codex_app_server_provider()
+                .expect_err("official fallback must be rejected")
+                .to_string()
+                .contains("fallback is prohibited")
+        );
 
         let legacy = tura_llm_rust::RouteConfig {
             default_temperature: 0.0,
             providers: vec![provider("codex"), provider("openai")],
         };
-        assert!(legacy
-            .official_codex_app_server_provider()
-            .expect_err("legacy Codex provider must not remain selectable")
-            .to_string()
-            .contains("legacy provider 'codex' is disabled"));
+        assert!(
+            legacy
+                .official_codex_app_server_provider()
+                .expect_err("legacy Codex provider must not remain selectable")
+                .to_string()
+                .contains("legacy provider 'codex' is disabled")
+        );
 
         let non_codex = tura_llm_rust::RouteConfig {
             default_temperature: 0.0,
             providers: vec![provider("openai")],
         };
-        assert!(non_codex
-            .official_codex_app_server_provider()
-            .expect("non-Codex routes remain admitted")
-            .is_none());
+        assert!(
+            non_codex
+                .official_codex_app_server_provider()
+                .expect("non-Codex routes remain admitted")
+                .is_none()
+        );
     }
 
     #[test]

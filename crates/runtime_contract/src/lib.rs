@@ -52,6 +52,124 @@ pub struct LifecycleExecutionContext {
     pub goal_id: Option<String>,
     #[serde(default)]
     pub operator_override: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander_continuation: Option<CommanderContinuationBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommanderContinuationBinding {
+    pub target_thread_id: String,
+    pub requested_action: String,
+    pub continuation_request_id: String,
+    pub child_session_id: String,
+    pub child_transaction_id: String,
+    pub child_runtime_id: String,
+    pub callback_payload_sha256: String,
+    pub effect_identity_sha256: String,
+    pub pre_revision_sha256: String,
+}
+
+impl CommanderContinuationBinding {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("target_thread_id", self.target_thread_id.as_str()),
+            ("requested_action", self.requested_action.as_str()),
+            (
+                "continuation_request_id",
+                self.continuation_request_id.as_str(),
+            ),
+            ("child_session_id", self.child_session_id.as_str()),
+            ("child_transaction_id", self.child_transaction_id.as_str()),
+            ("child_runtime_id", self.child_runtime_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("COMMANDER_CONTINUATION_IDENTITY_MISSING:{name}"));
+            }
+        }
+        if !matches!(
+            self.requested_action.as_str(),
+            "MISSION_VERIFICATION" | "ROUTE_SELECTION"
+        ) {
+            return Err("COMMANDER_CONTINUATION_ACTION_INVALID".to_string());
+        }
+        for (name, value) in [
+            (
+                "callback_payload_sha256",
+                self.callback_payload_sha256.as_str(),
+            ),
+            (
+                "effect_identity_sha256",
+                self.effect_identity_sha256.as_str(),
+            ),
+            ("pre_revision_sha256", self.pre_revision_sha256.as_str()),
+        ] {
+            if !is_lower_sha256(value) {
+                return Err(format!("COMMANDER_CONTINUATION_IDENTITY_INVALID:{name}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub const COMMANDER_CONVERGENCE_PROOF_SCHEMA_VERSION: &str = "tura_commander_convergence_proof_v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommanderConvergenceProof {
+    pub schema_version: String,
+    pub request_id: String,
+    pub callback_payload_sha256: String,
+    pub effect_identity_sha256: String,
+    pub child_session_id: String,
+    pub child_transaction_id: String,
+    pub child_runtime_id: String,
+    pub requested_action: String,
+    pub target_thread_id: String,
+    pub pre_revision_sha256: String,
+    pub post_revision_sha256: String,
+    pub target_turn_id: String,
+    pub final_assistant_sha256: String,
+}
+
+impl CommanderConvergenceProof {
+    pub fn validate_shape(&self) -> Result<(), String> {
+        if self.schema_version != COMMANDER_CONVERGENCE_PROOF_SCHEMA_VERSION {
+            return Err("COMMANDER_CONVERGENCE_PROOF_SCHEMA_UNSUPPORTED".to_string());
+        }
+        let binding = CommanderContinuationBinding {
+            target_thread_id: self.target_thread_id.clone(),
+            requested_action: self.requested_action.clone(),
+            continuation_request_id: self.request_id.clone(),
+            child_session_id: self.child_session_id.clone(),
+            child_transaction_id: self.child_transaction_id.clone(),
+            child_runtime_id: self.child_runtime_id.clone(),
+            callback_payload_sha256: self.callback_payload_sha256.clone(),
+            effect_identity_sha256: self.effect_identity_sha256.clone(),
+            pre_revision_sha256: self.pre_revision_sha256.clone(),
+        };
+        binding.validate()?;
+        if self.target_turn_id.trim().is_empty() {
+            return Err("COMMANDER_CONVERGENCE_PROOF_IDENTITY_MISSING:target_turn_id".to_string());
+        }
+        for (name, value) in [
+            ("post_revision_sha256", self.post_revision_sha256.as_str()),
+            (
+                "final_assistant_sha256",
+                self.final_assistant_sha256.as_str(),
+            ),
+        ] {
+            if !is_lower_sha256(value) {
+                return Err(format!(
+                    "COMMANDER_CONVERGENCE_PROOF_IDENTITY_INVALID:{name}"
+                ));
+            }
+        }
+        if self.post_revision_sha256 == self.pre_revision_sha256 {
+            return Err("COMMANDER_CONVERGENCE_PROOF_REVISION_DID_NOT_ADVANCE".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

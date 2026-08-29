@@ -107,6 +107,14 @@ pub(crate) struct RuntimeEventWriter {
 }
 
 impl RuntimeEventWriter {
+    pub(crate) fn commander_continuation(
+        &self,
+    ) -> Option<&runtime_contract::CommanderContinuationBinding> {
+        self.lifecycle
+            .as_ref()
+            .and_then(|context| context.commander_continuation.as_ref())
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         session_id: String,
@@ -305,6 +313,29 @@ impl RuntimeEventWriter {
                 serde_json::json!(value),
             );
         }
+        if let Some(binding) = lifecycle.commander_continuation.as_ref() {
+            receipt.audit_metadata.insert(
+                "commander_continuation_request_id".to_string(),
+                serde_json::json!(binding.continuation_request_id),
+            );
+            receipt.audit_metadata.insert(
+                "commander_continuation_target_thread_id".to_string(),
+                serde_json::json!(binding.target_thread_id),
+            );
+            if let Some(digest) = binding
+                .continuation_request_id
+                .strip_prefix("callback-continuation-request-")
+            {
+                receipt.audit_metadata.insert(
+                    "commander_continuation_origin_runtime_id".to_string(),
+                    serde_json::json!(format!("callback-continuation-runtime-{digest}")),
+                );
+                receipt.audit_metadata.insert(
+                    "commander_continuation_origin_lease_id".to_string(),
+                    serde_json::json!(format!("callback-continuation-lease-{digest}")),
+                );
+            }
+        }
         receipt.audit_metadata.insert(
             "runtime_event_seq".to_string(),
             serde_json::json!(cursor.next_event_seq),
@@ -414,6 +445,7 @@ impl RuntimeEventWriter {
                 ));
             }
         };
+        self.seed_receipt_sequence_after_registration()?;
         let lease_id = if runtime_id == self.initial_runtime_id {
             self.initial_lease_id.clone()
         } else {
@@ -457,6 +489,28 @@ impl RuntimeEventWriter {
                 pending_terminal: None,
             },
         );
+        Ok(())
+    }
+
+    fn seed_receipt_sequence_after_registration(&mut self) -> Result<(), String> {
+        if !self.cursors.is_empty() {
+            return Ok(());
+        }
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return Ok(());
+        };
+        let base = session_log_contract::client::default_db_dir().join("session_lifecycle_v1");
+        let root = commander_store_path(&base, &lifecycle.commander_session_id)
+            .map_err(|error| error.to_string())?;
+        let store = SessionLifecycleStore::open(
+            root,
+            &lifecycle.commander_session_id,
+            LifecycleConfig::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.next_receipt_event_seq = store
+            .next_receipt_event_sequence(&lifecycle.transaction_id)
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 }
@@ -706,6 +760,7 @@ mod tests {
             task_id: Some("ordering-task".to_string()),
             goal_id: Some("ordering-goal".to_string()),
             operator_override: true,
+            commander_continuation: None,
         };
         let mut writer = RuntimeEventWriter::new_with_lifecycle(
             "ordering-child".to_string(),

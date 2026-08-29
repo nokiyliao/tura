@@ -3884,6 +3884,7 @@ dependencies = [
  "futures-util",
  "regex",
  "reqwest 0.12.28",
+ "runtime_contract",
  "serde",
  "serde_json",
  "sha2",
@@ -4269,10 +4270,12 @@ version = "0.1.0"
 dependencies = [
  "agents",
  "anyhow",
+ "chrono",
  "fs2",
  "lifecycle",
  "parking_lot",
  "personas",
+ "provider",
  "router_contract",
  "runtime_contract",
  "serde",
@@ -4758,6 +4761,7 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "notify",
+ "runtime_contract",
  "serde",
  "serde_json",
  "sha2",

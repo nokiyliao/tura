@@ -8,14 +8,14 @@ use tracing::error;
 use crate::profile_timings;
 use crate::provider_flow::checkpointing;
 use crate::provider_flow::errors::{
-    finish_provider_call_failure, finish_runtime_failure,
-    finish_runtime_failure_with_retry_policy, runtime_timeout,
+    finish_provider_call_failure, finish_runtime_failure, finish_runtime_failure_with_retry_policy,
+    runtime_timeout,
 };
 use crate::provider_flow::official_codex::{
-    call_runtime_official_codex, OfficialCodexRuntimeInput,
+    OfficialCodexRuntimeInput, call_runtime_official_codex,
 };
 use crate::provider_flow::provider_response::apply_provider_response;
-use crate::provider_flow::provider_streaming::{call_runtime_streaming, RuntimeStreamingInput};
+use crate::provider_flow::provider_streaming::{RuntimeStreamingInput, call_runtime_streaming};
 pub use crate::provider_flow::request_options::route_by_name;
 use crate::provider_flow::request_options::{
     normalize_provider_messages, parallel_tool_calls_enabled, prompt_cache_key,
@@ -262,6 +262,11 @@ pub(crate) async fn call_runtime_with_writer(
         }
     };
     let call_result = if let Some(provider) = official_provider {
+        let fallback_from_id = runtime.fallback_from_id.clone();
+        let commander_continuation = runtime_event_writer
+            .as_deref()
+            .and_then(RuntimeEventWriter::commander_continuation)
+            .cloned();
         call_runtime_official_codex(
             &mut runtime,
             provider,
@@ -273,6 +278,8 @@ pub(crate) async fn call_runtime_with_writer(
                 allowed_command_run_commands: input.allowed_command_run_commands.clone(),
                 disable_permission_restrictions: input.disable_permission_restrictions,
                 jspace_contract: input.jspace_contract.clone(),
+                commander_continuation,
+                fallback_from_id,
             },
             runtime_event_writer.as_deref_mut(),
         )
@@ -348,7 +355,11 @@ fn legacy_codex_provider_requested(provider_name: &str) -> bool {
         .eq_ignore_ascii_case("codex")
         || std::env::var("TURA_SESSION_MODEL_OVERRIDE")
             .ok()
-            .and_then(|value| value.split_once('/').map(|(provider, _)| provider.to_string()))
+            .and_then(|value| {
+                value
+                    .split_once('/')
+                    .map(|(provider, _)| provider.to_string())
+            })
             .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("codex"))
 }
 
@@ -504,7 +515,7 @@ pub async fn dequeue_runtime(
 
 #[cfg(test)]
 mod tests {
-    use super::{call_runtime, CallRuntimeInput};
+    use super::{CallRuntimeInput, call_runtime};
     use chrono::Utc;
     use lifecycle::{ProviderConfig, ToolChoice};
     use lifecycle::{RuntimeAggregate, RuntimeProviderConfig};
@@ -687,11 +698,13 @@ mod tests {
         );
         assert!(!error.retry_allowed);
         assert!(!error.fallback_allowed);
-        assert!(error
-            .error_text
-            .as_deref()
-            .unwrap_or_default()
-            .contains("legacy provider 'codex' is disabled"));
+        assert!(
+            error
+                .error_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("legacy provider 'codex' is disabled")
+        );
     }
 
     #[tokio::test]
@@ -724,11 +737,13 @@ mod tests {
             Some("PROVIDER_ROUTE_ADMISSION_REJECTED")
         );
         assert!(!error.retry_allowed);
-        assert!(error
-            .error_text
-            .as_deref()
-            .unwrap_or_default()
-            .contains("legacy provider 'codex' is disabled"));
+        assert!(
+            error
+                .error_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("legacy provider 'codex' is disabled")
+        );
     }
 
     #[tokio::test]
@@ -783,10 +798,12 @@ mod tests {
         assert_eq!(runtime_error.error_code.as_deref(), Some("CALL_FAILED"));
         assert!(!runtime_error.retry_allowed);
         assert!(!runtime_error.fallback_allowed);
-        assert!(runtime_error
-            .error_text
-            .as_deref()
-            .unwrap_or_default()
-            .contains("API Key not found"));
+        assert!(
+            runtime_error
+                .error_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("API Key not found")
+        );
     }
 }

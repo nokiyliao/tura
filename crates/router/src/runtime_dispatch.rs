@@ -82,6 +82,7 @@ async fn dispatch_run_agent_inner(
             task_id: None,
             goal_id: None,
             operator_override: false,
+            commander_continuation: None,
         });
     }
     if router_debug_enabled() {

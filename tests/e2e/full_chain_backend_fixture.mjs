@@ -128,6 +128,8 @@ export class BackendStressHarness {
     this.sessions = [];
     this.targetSession = undefined;
     this.providerGateMarker = options.providerGateMarker;
+    this.officialCodexAppServer = options.officialCodexAppServer;
+    this.sessionModel = options.sessionModel || (this.officialCodexAppServer ? "official_codex_app_server/gpt-5.6-sol" : "openai/mock-coder");
     this.providerGateObservedPromise = new Promise((resolve) => {
       this.providerGateObserved = resolve;
     });
@@ -338,6 +340,8 @@ export class BackendStressHarness {
   }
 
   async writeProviderConfig(providerUrl) {
+    const providerName = this.officialCodexAppServer ? "official_codex_app_server" : "openai";
+    const modelId = this.officialCodexAppServer ? "gpt-5.6-sol" : "mock-coder";
     const routes = {};
     for (const route of [
       "fast",
@@ -350,7 +354,7 @@ export class BackendStressHarness {
     ]) {
       routes[route] = {
         default_temperature: 0,
-        providers: [{ provider: "openai", model: "mock-coder", temperature: 0 }],
+        providers: [{ provider: providerName, base_url: providerUrl, model: modelId, temperature: 0 }],
       };
     }
     const configPath = path.join(this.runRoot, "provider_config.json");
@@ -358,18 +362,18 @@ export class BackendStressHarness {
       configPath,
       JSON.stringify(
         {
-          provider_base_url: { openai: providerUrl },
+          provider_base_url: { [providerName]: providerUrl },
           routes,
           model_catalog: {
             tiers: ["fast", "thinking"],
             providers: {
-              openai: {
+              [providerName]: {
                 display_name: "Local OpenAI-compatible stress provider",
-                runtime_provider: "openai",
-                api_style: "openai-responses",
+                runtime_provider: providerName,
+                api_style: this.officialCodexAppServer ? "official-codex-app-server" : "openai-responses",
                 base_url: providerUrl,
                 token_env: "OPENAI_API_KEY",
-                models: { default: [{ id: "mock-coder", name: "Mock Coder" }] },
+                models: { default: [{ id: modelId, name: modelId }] },
               },
             },
           },
@@ -390,7 +394,11 @@ export class BackendStressHarness {
       TURA_PROJECT_ROOT: repoRoot,
       OPENAI_API_KEY: "local-stress-key",
       OPENAI_LOGIN: "api_key",
-      TURA_SESSION_MODEL_OVERRIDE: "openai/mock-coder",
+      TURA_SESSION_MODEL_OVERRIDE: this.sessionModel,
+      ...(this.officialCodexAppServer ? {
+        TURA_CODEX_APP_SERVER_EXECUTABLE: this.officialCodexAppServer,
+        TURA_P5_HARD_CRASH_E2E: "1",
+      } : {}),
       TURA_PROVIDER_TOTAL_TIMEOUT_MS: "60000",
       TURA_PROVIDER_FIRST_OUTPUT_TIMEOUT_MS: "10000",
       TURA_PROVIDER_IDLE_OUTPUT_TIMEOUT_MS: "10000",
@@ -600,7 +608,7 @@ export class BackendStressHarness {
           {
             directory: workspace,
             agent: "direct-text-only",
-            model: "openai/mock-coder",
+            model: this.sessionModel,
             model_variant: "default",
             model_acceleration_enabled: false,
             disable_permission_restrictions: true,
@@ -626,7 +634,7 @@ export class BackendStressHarness {
       {
         messageID: `msg_${currentMarker}`,
         parts: [{ id: `part_${currentMarker}`, type: "text", text: richUserPrompt(currentMarker) }],
-        model: "openai/mock-coder",
+        model: this.sessionModel,
         agent: "direct-text-only",
         source: "backend-stress",
       },
@@ -672,12 +680,13 @@ export class BackendStressHarness {
       command_id: `create:${sessionId}`,
       session_id: sessionId,
       creation_command: { command: "create_session", task_plan: taskPlan },
+      initial_task_plan_patch: null,
       copy_context: false,
       workspace,
       session_directory: workspace,
       name: sessionName,
       created_at: createdAt,
-      model: "openai/mock-coder",
+      model: this.sessionModel,
       agent: "direct-text-only",
       session_type: "coding",
       kill_processes_on_start: false,

@@ -41,6 +41,7 @@ struct CanonicalRecoveryRequest<'a> {
     expected_session_event_seq: u64,
     expected_session_state: SessionState,
     reason: RecoveryCloseRuntimeReason,
+    convergence_proof_sha256: Option<&'a str>,
 }
 
 impl SessionLogStore {
@@ -122,6 +123,7 @@ impl SessionLogStore {
                 expected_session_event_seq: request.expected_session_event_seq,
                 expected_session_state: request.expected_session_state,
                 reason: request.reason,
+                convergence_proof_sha256: request.convergence_proof_sha256.as_deref(),
             })?;
 
             if let Some(existing) = load_recovery_receipt(&tx, &request.receipt_id)? {
@@ -140,6 +142,7 @@ impl SessionLogStore {
                     || receipt.session_id != request.session_id
                     || receipt.lease_id != request.lease_id
                     || receipt.reason != request.reason
+                    || receipt.convergence_proof_sha256 != request.convergence_proof_sha256
                     || receipt.lease_active
                     || !receipt.terminal
                 {
@@ -340,10 +343,72 @@ impl SessionLogStore {
                         });
                     }
                 }
+                RecoveryCloseRuntimeReason::CommanderConvergenceProven => {
+                    if events.is_empty() {
+                        return Ok(RecoveryCloseRuntimeOutcome::InvalidRecoveryShape {
+                            error: "proven Commander convergence requires a replayable runtime"
+                                .to_string(),
+                        });
+                    }
+                    let aggregate = RuntimeAggregate::replay(
+                        request.runtime_id.clone(),
+                        events.iter().cloned(),
+                    )
+                    .map_err(anyhow::Error::msg)
+                    .context("invalid runtime event stream during proven convergence recovery")?;
+                    if aggregate.session_id != request.session_id {
+                        return Ok(RecoveryCloseRuntimeOutcome::IdentityMismatch {
+                            field: "runtime_event_session_id".to_string(),
+                        });
+                    }
+                    if aggregate.fallback_from_id != row.fallback_from_id {
+                        return Ok(RecoveryCloseRuntimeOutcome::IdentityMismatch {
+                            field: "runtime_event_fallback_from_id".to_string(),
+                        });
+                    }
+                    if !aggregate.state.is_live() || aggregate.output.is_some() {
+                        return Ok(RecoveryCloseRuntimeOutcome::InvalidRecoveryShape {
+                            error: "proven Commander convergence recovery requires live runtime without output"
+                                .to_string(),
+                        });
+                    }
+                    events.push(RuntimeEvent::RuntimeFailed {
+                        finished_at: chrono::Utc::now(),
+                        error: RuntimeError {
+                            error_code: Some(
+                                "commander_convergence_proven_before_runtime_output".to_string(),
+                            ),
+                            error_text: Some(
+                                "provider target turn completed before runtime output became durable"
+                                    .to_string(),
+                            ),
+                            retry_allowed: true,
+                            fallback_allowed: false,
+                            fallback_to_id: None,
+                        },
+                        state: RuntimeState::Failed,
+                        usage: aggregate.usage.clone(),
+                    });
+                    let recovered = RuntimeAggregate::replay(
+                        request.runtime_id.clone(),
+                        events.clone(),
+                    )
+                    .map_err(anyhow::Error::msg)
+                    .context("proven Commander convergence recovery event is invalid")?;
+                    if recovered.state != RuntimeState::Failed {
+                        return Ok(RecoveryCloseRuntimeOutcome::InvalidRecoveryShape {
+                            error: "proven Commander convergence did not produce failed state"
+                                .to_string(),
+                        });
+                    }
+                }
             }
 
-            let appends_runtime_event =
-                matches!(request.reason, RecoveryCloseRuntimeReason::OrphanedRuntime);
+            let appends_runtime_event = matches!(
+                request.reason,
+                RecoveryCloseRuntimeReason::OrphanedRuntime
+                    | RecoveryCloseRuntimeReason::CommanderConvergenceProven
+            );
             let post_revision = row.revision + u64::from(appends_runtime_event);
             let post_last_event_seq = row.last_event_seq + u64::from(appends_runtime_event);
             if let Some(event) = events.last().filter(|_| appends_runtime_event) {
@@ -388,7 +453,16 @@ impl SessionLogStore {
             let post_session_event_seq = if session.state.is_recoverable_running() {
                 let mut projection_row = load_session_projection_row(&tx, &request.session_id)?
                     .with_context(|| format!("session {} not found", request.session_id))?;
-                let event = session.execute(SessionCommand::InterruptSession)?;
+                let command = if request.reason
+                    == RecoveryCloseRuntimeReason::CommanderConvergenceProven
+                {
+                    SessionCommand::RuntimeFailed {
+                        runtime_id: request.runtime_id.clone(),
+                    }
+                } else {
+                    SessionCommand::InterruptSession
+                };
+                let event = session.execute(command)?;
                 persist_session_projection(
                     &tx,
                     &request.session_id,
@@ -419,6 +493,7 @@ impl SessionLogStore {
                 last_event_seq: post_last_event_seq,
                 session_event_seq: post_session_event_seq,
                 reason: request.reason,
+                convergence_proof_sha256: request.convergence_proof_sha256.clone(),
                 lease_active: false,
                 terminal: true,
                 session_state: projection.state,
@@ -504,6 +579,25 @@ fn validate_request(request: &RecoveryCloseRuntimeRequest) -> Result<()> {
     }
     if request.expected_lease_active && request.lease_id.is_none() {
         anyhow::bail!("an active recovery lease must have a lease_id");
+    }
+    match request.reason {
+        RecoveryCloseRuntimeReason::CommanderConvergenceProven => {
+            let digest = request.convergence_proof_sha256.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("proven Commander convergence requires proof SHA-256")
+            })?;
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                anyhow::bail!("Commander convergence proof digest is not lowercase SHA-256");
+            }
+        }
+        RecoveryCloseRuntimeReason::OrphanedRuntime | RecoveryCloseRuntimeReason::UnbornRuntime => {
+            if request.convergence_proof_sha256.is_some() {
+                anyhow::bail!("generic runtime recovery cannot carry Commander proof");
+            }
+        }
     }
     Ok(())
 }
@@ -900,6 +994,9 @@ mod tests {
                 expected_session_event_seq,
                 expected_session_state,
                 reason,
+                convergence_proof_sha256: (reason
+                    == RecoveryCloseRuntimeReason::CommanderConvergenceProven)
+                    .then(|| "a".repeat(64)),
                 quiescence: quiescent_proof(),
             }
         }
@@ -1153,6 +1250,95 @@ mod tests {
                 })
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn proven_commander_convergence_closes_as_failed_and_is_retryable_exactly_once() {
+        let fixture = RecoveryFixture::new("commander-proof");
+        let revision = fixture.commit_events(false);
+        let request = fixture.request(
+            "recovery-receipt-commander-proof",
+            RecoveryCloseRuntimeReason::CommanderConvergenceProven,
+            revision,
+        );
+
+        let first = fixture
+            .store
+            .recovery_close_runtime(request.clone())
+            .expect("close proven Commander convergence runtime");
+        assert!(matches!(
+            first,
+            RecoveryCloseRuntimeOutcome::Closed { ref receipt }
+                if receipt.session_state == SessionState::Failed
+                    && receipt.convergence_proof_sha256.as_deref()
+                        == Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    && receipt.terminal
+                    && !receipt.lease_active
+        ));
+        assert!(matches!(
+            fixture
+                .store
+                .recovery_close_runtime(request)
+                .expect("replay proven Commander convergence close"),
+            RecoveryCloseRuntimeOutcome::AlreadyClosed { .. }
+        ));
+        assert_eq!(
+            fixture.recovery_receipt_count("recovery-receipt-commander-proof"),
+            1
+        );
+
+        let runtime = fixture
+            .store
+            .replay_runtime(ReplayRuntimeRequest {
+                runtime_id: fixture.runtime_id.clone(),
+            })
+            .expect("replay proven Commander convergence runtime")
+            .expect("proven Commander convergence runtime exists")
+            .aggregate;
+        assert_eq!(runtime.state, RuntimeState::Failed);
+        assert!(matches!(
+            runtime.error,
+            Some(lifecycle::RuntimeError {
+                ref error_code,
+                retry_allowed: true,
+                fallback_allowed: false,
+                ..
+            }) if error_code.as_deref()
+                == Some("commander_convergence_proven_before_runtime_output")
+        ));
+        let session = fixture
+            .store
+            .get_session(GetSessionRequest {
+                session_id: fixture.session_id.clone(),
+            })
+            .expect("read failed Commander convergence session")
+            .expect("Commander convergence session exists");
+        assert_eq!(session.lifecycle_projection.state, SessionState::Failed);
+        assert!(session.lifecycle_projection.active_runtime_id.is_none());
+    }
+
+    #[test]
+    fn proven_commander_convergence_without_proof_is_rejected_without_mutation() {
+        let fixture = RecoveryFixture::new("commander-proof-missing");
+        let revision = fixture.commit_events(false);
+        let mut request = fixture.request(
+            "recovery-receipt-commander-proof-missing",
+            RecoveryCloseRuntimeReason::CommanderConvergenceProven,
+            revision,
+        );
+        request.convergence_proof_sha256 = None;
+        let before = fixture.runtime_event_rows();
+
+        let error = fixture
+            .store
+            .recovery_close_runtime(request)
+            .expect_err("missing proof must fail before mutation");
+        assert!(error.to_string().contains("requires proof SHA-256"));
+        assert_eq!(fixture.runtime_event_rows(), before);
+        assert_eq!(
+            fixture.recovery_receipt_count("recovery-receipt-commander-proof-missing"),
+            0
         );
     }
 

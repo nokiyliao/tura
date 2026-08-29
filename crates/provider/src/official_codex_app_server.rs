@@ -1,5 +1,9 @@
+use runtime_contract::{
+    COMMANDER_CONVERGENCE_PROOF_SCHEMA_VERSION, CommanderContinuationBinding,
+    CommanderConvergenceProof,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::future::Future;
@@ -154,6 +158,10 @@ pub struct CodexExecutionLedger {
     pub interrupted_recovery: Option<CodexInterruptedRecoveryAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander_convergence_proof: Option<CommanderConvergenceProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander_convergence_final_assistant: Option<String>,
 }
 
 impl CodexExecutionLedger {
@@ -166,6 +174,8 @@ impl CodexExecutionLedger {
             effects: Vec::new(),
             interrupted_recovery: None,
             terminal_status: None,
+            commander_convergence_proof: None,
+            commander_convergence_final_assistant: None,
         }
     }
 
@@ -190,19 +200,166 @@ impl CodexExecutionLedger {
             return Err("execution ledger canonical input digest changed".to_string());
         }
         if self.terminal_status.as_deref() == Some("completed") {
-            return Err("execution ledger is already terminal completed".to_string());
+            let binding = request
+                .commander_continuation
+                .as_ref()
+                .ok_or_else(|| "execution ledger is already terminal completed".to_string())?;
+            let proof = self
+                .commander_convergence_proof
+                .as_ref()
+                .ok_or_else(|| "terminal Commander convergence proof is missing".to_string())?;
+            let final_assistant = self
+                .commander_convergence_final_assistant
+                .as_ref()
+                .ok_or_else(|| {
+                    "terminal Commander convergence final assistant is missing".to_string()
+                })?;
+            proof.validate_shape()?;
+            if proof.request_id != binding.continuation_request_id
+                || proof.callback_payload_sha256 != binding.callback_payload_sha256
+                || proof.effect_identity_sha256 != binding.effect_identity_sha256
+                || proof.child_session_id != binding.child_session_id
+                || proof.child_transaction_id != binding.child_transaction_id
+                || proof.child_runtime_id != binding.child_runtime_id
+                || proof.requested_action != binding.requested_action
+                || proof.target_thread_id != binding.target_thread_id
+                || proof.pre_revision_sha256 != binding.pre_revision_sha256
+                || proof.final_assistant_sha256
+                    != sha256_canonical_json(Value::String(final_assistant.clone()))
+                        .map_err(|error| error.to_string())?
+            {
+                return Err(
+                    "terminal Commander convergence proof does not match request identity"
+                        .to_string(),
+                );
+            }
+            if !self.runtime_ids.iter().any(|id| id == &request.runtime_id) {
+                let fallback_from_id = request.fallback_from_id.as_deref().ok_or_else(|| {
+                    "terminal Commander convergence replay omitted fallback_from_id".to_string()
+                })?;
+                if !self.runtime_ids.iter().any(|id| id == fallback_from_id) {
+                    return Err(
+                        "terminal Commander convergence fallback is not bound to the durable runtime lineage"
+                            .to_string(),
+                    );
+                }
+                self.runtime_ids.push(request.runtime_id.clone());
+            }
+            return Ok(());
         }
         if !self.runtime_ids.iter().any(|id| id == &request.runtime_id) {
+            let fallback_from_id = request.fallback_from_id.as_deref().ok_or_else(|| {
+                "execution ledger runtime changed without fallback_from_id".to_string()
+            })?;
+            if !self.runtime_ids.iter().any(|id| id == fallback_from_id) {
+                return Err("execution ledger fallback source is not durable".to_string());
+            }
             self.runtime_ids.push(request.runtime_id.clone());
         }
         Ok(())
     }
 }
 
+pub fn load_terminal_commander_convergence_ledger(
+    session_directory: &Path,
+    tura_session_id: &str,
+    original_runtime_id: &str,
+    binding: &CommanderContinuationBinding,
+) -> Result<Option<CodexExecutionLedger>, String> {
+    binding.validate()?;
+    let directory = session_directory
+        .join(".tura")
+        .join("run")
+        .join("effect_ledgers");
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("execution ledger root is not a regular directory".to_string());
+    }
+    let mut paths = std::fs::read_dir(&directory)
+        .map_err(|error| error.to_string())?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    paths.sort();
+    if paths.len() > 256 {
+        return Err("execution ledger scan exceeded bounded population".to_string());
+    }
+    let mut matched = None;
+    for path in paths {
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "execution ledger member is not a regular file: {}",
+                path.display()
+            ));
+        }
+        let ledger: CodexExecutionLedger =
+            serde_json::from_slice(&std::fs::read(&path).map_err(|error| error.to_string())?)
+                .map_err(|error| format!("invalid execution ledger {}: {error}", path.display()))?;
+        if ledger.tura_session_id != tura_session_id
+            || !ledger
+                .runtime_ids
+                .iter()
+                .any(|runtime_id| runtime_id == original_runtime_id)
+            || ledger.terminal_status.as_deref() != Some("completed")
+        {
+            continue;
+        }
+        let file_digest = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if file_digest != ledger.canonical_input_sha256 {
+            return Err("execution ledger filename/input digest mismatch".to_string());
+        }
+        let proof = ledger
+            .commander_convergence_proof
+            .as_ref()
+            .ok_or_else(|| "terminal Commander convergence proof is missing".to_string())?;
+        let final_assistant = ledger
+            .commander_convergence_final_assistant
+            .as_ref()
+            .ok_or_else(|| {
+                "terminal Commander convergence final assistant is missing".to_string()
+            })?;
+        proof.validate_shape()?;
+        if proof.request_id != binding.continuation_request_id
+            || proof.callback_payload_sha256 != binding.callback_payload_sha256
+            || proof.effect_identity_sha256 != binding.effect_identity_sha256
+            || proof.child_session_id != binding.child_session_id
+            || proof.child_transaction_id != binding.child_transaction_id
+            || proof.child_runtime_id != binding.child_runtime_id
+            || proof.requested_action != binding.requested_action
+            || proof.target_thread_id != binding.target_thread_id
+            || proof.pre_revision_sha256 != binding.pre_revision_sha256
+            || proof.final_assistant_sha256
+                != sha256_canonical_json(Value::String(final_assistant.clone()))
+                    .map_err(|error| error.to_string())?
+        {
+            return Err(
+                "terminal Commander convergence ledger does not match the requested binding"
+                    .to_string(),
+            );
+        }
+        if matched.replace(ledger).is_some() {
+            return Err("multiple terminal Commander convergence ledgers matched".to_string());
+        }
+    }
+    Ok(matched)
+}
+
 #[derive(Clone, Debug)]
 pub struct OfficialCodexTurnRequest {
     pub tura_session_id: String,
     pub runtime_id: String,
+    pub fallback_from_id: Option<String>,
     pub session_directory: PathBuf,
     pub model: String,
     pub messages: Vec<Value>,
@@ -211,6 +368,7 @@ pub struct OfficialCodexTurnRequest {
     pub dynamic_tools: Vec<Value>,
     pub allowed_command_run_commands: Option<BTreeSet<String>>,
     pub disable_permission_restrictions: bool,
+    pub commander_continuation: Option<CommanderContinuationBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -228,6 +386,8 @@ pub struct CodexThreadAssociation {
     pub observed_tool_effects: Vec<CodexObservedToolEffect>,
     #[serde(default, skip_serializing, rename = "interrupted_recovery")]
     pub interrupted_recovery: Option<CodexInterruptedRecoveryAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association_scope_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -254,6 +414,7 @@ pub struct OfficialCodexTurnResponse {
     pub association: CodexThreadAssociation,
     pub usage: Option<OfficialCodexUsage>,
     pub authoritative_events: Vec<OfficialCodexAuthoritativeEvent>,
+    pub commander_convergence_proof: Option<CommanderConvergenceProof>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -397,6 +558,18 @@ pub enum OfficialCodexAppServerError {
     RpcError { method: String, error: Value },
     #[error("invalid official Codex App Server response: {0}")]
     InvalidResponse(String),
+    #[error("COMMANDER_CONTINUATION_BINDING_INVALID: {0}")]
+    CommanderContinuationBindingInvalid(String),
+    #[error(
+        "COMMANDER_TARGET_PREIMAGE_MISMATCH: thread {thread_id} expected {expected}, observed {actual}"
+    )]
+    CommanderTargetPreimageMismatch {
+        thread_id: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("COMMANDER_CONVERGENCE_PROOF_INVALID: {0}")]
+    CommanderConvergenceProofInvalid(String),
     #[error("official Codex App Server requested unsupported client method {0}")]
     UnsupportedServerRequest(String),
     #[error("governed handler rejected official Codex App Server method {method}: {reason}")]
@@ -459,8 +632,33 @@ pub async fn run_official_codex_turn(
     request: OfficialCodexTurnRequest,
     mut request_handler: Option<&mut dyn OfficialCodexServerRequestHandler>,
 ) -> Result<OfficialCodexTurnResponse, OfficialCodexAppServerError> {
+    if let Some(binding) = request.commander_continuation.as_ref() {
+        binding
+            .validate()
+            .map_err(OfficialCodexAppServerError::CommanderContinuationBindingInvalid)?;
+        let expected_original_runtime_id = binding
+            .continuation_request_id
+            .strip_prefix("callback-continuation-request-")
+            .map(|digest| format!("callback-continuation-runtime-{digest}"))
+            .unwrap_or_default();
+        let runtime_is_original = request.runtime_id == expected_original_runtime_id;
+        let runtime_is_bound_fallback =
+            request.fallback_from_id.as_deref() == Some(expected_original_runtime_id.as_str());
+        if !runtime_is_original && !runtime_is_bound_fallback {
+            return Err(
+                OfficialCodexAppServerError::CommanderContinuationBindingInvalid(
+                    "runtime/request identity mismatch".to_string(),
+                ),
+            );
+        }
+    }
     let executable_identity = identify_executable(&request.executable).await?;
-    let prior = load_thread_association(&request.session_directory, &request.tura_session_id)?;
+    let association_scope_id = association_scope_id(&request);
+    let prior = load_thread_association_scoped(
+        &request.session_directory,
+        &request.tura_session_id,
+        &association_scope_id,
+    )?;
     if prior
         .as_ref()
         .is_some_and(|association| association.executable_identity != executable_identity)
@@ -468,6 +666,24 @@ pub async fn run_official_codex_turn(
         return Err(OfficialCodexAppServerError::ExecutableIdentityMismatch(
             request.tura_session_id,
         ));
+    }
+    let current_snapshot = canonical_mission_snapshot(&request, &executable_identity)?;
+    let execution_ledger = load_execution_ledger(
+        &request,
+        prior.as_ref(),
+        &current_snapshot,
+        &mut request_handler,
+    )?;
+    if execution_ledger.terminal_status.as_deref() == Some("completed") {
+        let mut association = prior.ok_or_else(|| {
+            OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                "terminal convergence ledger omitted target association".to_string(),
+            )
+        })?;
+        association.active_turn_id = None;
+        association.turn_attempt = None;
+        persist_thread_association(&request.session_directory, &association)?;
+        return terminal_commander_convergence_response(&execution_ledger, association);
     }
     if prior.as_ref().is_some_and(|association| {
         association.active_turn_id.is_some() && association.turn_attempt.is_none()
@@ -516,6 +732,8 @@ pub async fn run_official_codex_turn(
         &request,
         prior,
         executable_identity,
+        current_snapshot,
+        execution_ledger,
         &mut stdin,
         &mut lines,
         &mut request_handler,
@@ -681,10 +899,41 @@ fn load_execution_ledger(
     Ok(ledger)
 }
 
+fn terminal_commander_convergence_response(
+    execution_ledger: &CodexExecutionLedger,
+    association: CodexThreadAssociation,
+) -> Result<OfficialCodexTurnResponse, OfficialCodexAppServerError> {
+    let final_assistant = execution_ledger
+        .commander_convergence_final_assistant
+        .clone()
+        .ok_or_else(|| {
+            OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                "terminal convergence ledger omitted final assistant".to_string(),
+            )
+        })?;
+    let proof = execution_ledger
+        .commander_convergence_proof
+        .clone()
+        .ok_or_else(|| {
+            OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                "terminal convergence ledger omitted proof".to_string(),
+            )
+        })?;
+    Ok(OfficialCodexTurnResponse {
+        content: Value::String(final_assistant),
+        association,
+        usage: None,
+        authoritative_events: Vec::new(),
+        commander_convergence_proof: Some(proof),
+    })
+}
+
 async fn run_protocol(
     request: &OfficialCodexTurnRequest,
     prior: Option<CodexThreadAssociation>,
     executable_identity: CodexAppServerExecutableIdentity,
+    current_snapshot: CodexMissionSnapshot,
+    mut execution_ledger: CodexExecutionLedger,
     stdin: &mut tokio::process::ChildStdin,
     lines: &mut Lines<BufReader<ChildStdout>>,
     request_handler: &mut Option<&mut dyn OfficialCodexServerRequestHandler>,
@@ -693,9 +942,6 @@ async fn run_protocol(
     let mut pending = Vec::new();
     let mut authoritative_events = Vec::new();
     let mut seen_authoritative_events = HashSet::new();
-    let current_snapshot = canonical_mission_snapshot(request, &executable_identity)?;
-    let mut execution_ledger =
-        load_execution_ledger(request, prior.as_ref(), &current_snapshot, request_handler)?;
     let initialize = json!({
         "clientInfo": {
             "name": "tura",
@@ -724,8 +970,16 @@ async fn run_protocol(
         .as_ref()
         .filter(|recovery| recovery.state == CodexInterruptedRecoveryState::ThreadAcknowledged)
         .and_then(|recovery| recovery.recovery_thread_id.as_deref());
-    let resume_thread_id = recovery_thread_id
-        .or_else(|| prior.as_ref().map(|association| association.thread_id.as_str()));
+    let resume_thread_id = request
+        .commander_continuation
+        .as_ref()
+        .map(|binding| binding.target_thread_id.as_str())
+        .or(recovery_thread_id)
+        .or_else(|| {
+            prior
+                .as_ref()
+                .map(|association| association.thread_id.as_str())
+        });
     let thread_response = if let Some(thread_id) = resume_thread_id {
         rpc_request(
             "thread/resume",
@@ -937,10 +1191,8 @@ async fn run_protocol(
             None,
         )
         .await?;
-        for (effect, replay_request_id) in execution_ledger
-            .effects
-            .iter_mut()
-            .zip(replay_request_ids)
+        for (effect, replay_request_id) in
+            execution_ledger.effects.iter_mut().zip(replay_request_ids)
         {
             effect.replay_request_id = Some(replay_request_id);
         }
@@ -1013,7 +1265,144 @@ async fn run_protocol(
             association,
             usage,
             authoritative_events,
+            commander_convergence_proof: None,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_successful_turn_with_convergence(
+        request: &OfficialCodexTurnRequest,
+        association: CodexThreadAssociation,
+        execution_ledger: &mut CodexExecutionLedger,
+        request_handler: &mut Option<&mut dyn OfficialCodexServerRequestHandler>,
+        turn_id: &str,
+        final_answer: Option<String>,
+        usage: Option<OfficialCodexUsage>,
+        authoritative_events: Vec<OfficialCodexAuthoritativeEvent>,
+        commander_pre_turn_ids: Option<&[String]>,
+        next_id: &mut u64,
+        stdin: &mut tokio::process::ChildStdin,
+        lines: &mut Lines<BufReader<ChildStdout>>,
+        pending: &mut Vec<Value>,
+    ) -> Result<OfficialCodexTurnResponse, OfficialCodexAppServerError> {
+        let convergence_proof = if let Some(binding) = request.commander_continuation.as_ref() {
+            let final_answer = final_answer
+                .as_deref()
+                .ok_or(OfficialCodexAppServerError::MissingFinalAnswer)?;
+            if final_answer.trim() == latest_user_input(&request.messages)?.trim() {
+                return Err(
+                    OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                        "final assistant is a prompt echo".to_string(),
+                    ),
+                );
+            }
+            let pre_turn_ids = commander_pre_turn_ids.ok_or_else(|| {
+                OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                    "pre-submit turn identity set is missing".to_string(),
+                )
+            })?;
+            let thread_read = rpc_request(
+                "thread/read",
+                json!({"threadId": binding.target_thread_id, "includeTurns": true}),
+                next_id,
+                stdin,
+                lines,
+                request_handler,
+                pending,
+                None,
+            )
+            .await?;
+            let thread = thread_read
+                .get("thread")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    OfficialCodexAppServerError::InvalidResponse(
+                        "post-submit thread/read omitted thread".to_string(),
+                    )
+                })?;
+            let post_thread_id = required_string(thread, "id", "post-submit thread.id")?;
+            if post_thread_id != binding.target_thread_id {
+                return Err(
+                    OfficialCodexAppServerError::CommanderConvergenceProofInvalid(format!(
+                        "post-submit thread/read returned {post_thread_id}, expected {}",
+                        binding.target_thread_id
+                    )),
+                );
+            }
+            let turns = thread
+                .get("turns")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let post_turn_ids = ordered_turn_ids(&turns)?;
+            if post_turn_ids.len() != pre_turn_ids.len() + 1
+                || post_turn_ids[..pre_turn_ids.len()] != *pre_turn_ids
+                || post_turn_ids.last().map(String::as_str) != Some(turn_id)
+            {
+                return Err(
+                    OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                        "target thread did not advance by the exact completed turn".to_string(),
+                    ),
+                );
+            }
+            let target_turn = turns.last().ok_or_else(|| {
+                OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                    "post-submit target turn is missing".to_string(),
+                )
+            })?;
+            if target_turn.get("status").and_then(Value::as_str) != Some("completed")
+                || authoritative_turn_answer(target_turn).as_deref() != Some(final_answer)
+            {
+                return Err(
+                    OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                        "post-submit target turn/final assistant does not match completion"
+                            .to_string(),
+                    ),
+                );
+            }
+            let proof = CommanderConvergenceProof {
+                schema_version: COMMANDER_CONVERGENCE_PROOF_SCHEMA_VERSION.to_string(),
+                request_id: binding.continuation_request_id.clone(),
+                callback_payload_sha256: binding.callback_payload_sha256.clone(),
+                effect_identity_sha256: binding.effect_identity_sha256.clone(),
+                child_session_id: binding.child_session_id.clone(),
+                child_transaction_id: binding.child_transaction_id.clone(),
+                child_runtime_id: binding.child_runtime_id.clone(),
+                requested_action: binding.requested_action.clone(),
+                target_thread_id: binding.target_thread_id.clone(),
+                pre_revision_sha256: binding.pre_revision_sha256.clone(),
+                post_revision_sha256: canonical_thread_revision_sha256_from_ids(
+                    &binding.target_thread_id,
+                    &post_turn_ids,
+                ),
+                target_turn_id: turn_id.to_string(),
+                final_assistant_sha256: sha256_canonical_json(Value::String(
+                    final_answer.to_string(),
+                ))?,
+            };
+            proof
+                .validate_shape()
+                .map_err(OfficialCodexAppServerError::CommanderConvergenceProofInvalid)?;
+            Some(proof)
+        } else {
+            None
+        };
+        if let Some(proof) = convergence_proof.as_ref() {
+            execution_ledger.commander_convergence_proof = Some(proof.clone());
+            execution_ledger.commander_convergence_final_assistant = final_answer.clone();
+        }
+        let mut response = finish_successful_turn(
+            request,
+            association,
+            execution_ledger,
+            request_handler,
+            turn_id,
+            final_answer,
+            usage,
+            authoritative_events,
+        )?;
+        response.commander_convergence_proof = convergence_proof;
+        Ok(response)
     }
     let codex_session_id = thread
         .get("sessionId")
@@ -1036,6 +1425,8 @@ async fn run_protocol(
         mission_snapshot: None,
         observed_tool_effects: Vec::new(),
         interrupted_recovery: None,
+        association_scope_id: (association_scope_id(request) != request.tura_session_id)
+            .then(|| association_scope_id(request)),
     };
     persist_thread_association(&request.session_directory, &association)?;
     let authoritative_turns = if resume_thread_id.is_some() {
@@ -1050,6 +1441,22 @@ async fn run_protocol(
             None,
         )
         .await?;
+        if let Some(binding) = request.commander_continuation.as_ref() {
+            let pre_thread_id = thread_read
+                .pointer("/thread/id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    OfficialCodexAppServerError::InvalidResponse(
+                        "pre-submit thread/read omitted thread.id".to_string(),
+                    )
+                })?;
+            if pre_thread_id != binding.target_thread_id {
+                return Err(OfficialCodexAppServerError::InvalidResponse(format!(
+                    "pre-submit thread/read returned {pre_thread_id}, expected {}",
+                    binding.target_thread_id
+                )));
+            }
+        }
         thread_read
             .pointer("/thread/turns")
             .and_then(Value::as_array)
@@ -1058,6 +1465,28 @@ async fn run_protocol(
     } else {
         Vec::new()
     };
+    let commander_pre_turn_ids = if let Some(binding) = request.commander_continuation.as_ref() {
+        let pre_turn_ids = association
+            .turn_attempt
+            .as_ref()
+            .map(|attempt| attempt.authoritative_turn_ids_before_submit.clone())
+            .map(Ok)
+            .unwrap_or_else(|| ordered_turn_ids(&authoritative_turns))?;
+        let actual =
+            canonical_thread_revision_sha256_from_ids(&binding.target_thread_id, &pre_turn_ids);
+        if actual != binding.pre_revision_sha256 {
+            return Err(
+                OfficialCodexAppServerError::CommanderTargetPreimageMismatch {
+                    thread_id: binding.target_thread_id.clone(),
+                    expected: binding.pre_revision_sha256.clone(),
+                    actual,
+                },
+            );
+        }
+        Some(pre_turn_ids)
+    } else {
+        None
+    };
 
     let mut recovered_turn = None;
     if let Some(attempt) = association.turn_attempt.as_ref() {
@@ -1065,6 +1494,16 @@ async fn run_protocol(
             return Err(OfficialCodexAppServerError::TurnAttemptInputMismatch(
                 request.tura_session_id.clone(),
             ));
+        }
+        if request.commander_continuation.is_some()
+            && attempt.state == CodexTurnSubmissionState::Prepared
+        {
+            return Err(
+                OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                    "target turn/start delivery is uncertain; blind reconciliation is forbidden"
+                        .to_string(),
+                ),
+            );
         }
         let candidates = authoritative_turns
             .iter()
@@ -1078,18 +1517,36 @@ async fn run_protocol(
             })
             .cloned()
             .collect::<Vec<_>>();
-        match candidates.as_slice() {
-            [] => {
-                association.active_turn_id = None;
-                association.turn_attempt = None;
-                persist_thread_association(&request.session_directory, &association)?;
+        if request.commander_continuation.is_some() {
+            let expected_turn_id = attempt.turn_id.as_deref().ok_or_else(|| {
+                OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                    "acknowledged target turn omitted durable turn id".to_string(),
+                )
+            })?;
+            if candidates.len() != 1
+                || candidates[0].get("id").and_then(Value::as_str) != Some(expected_turn_id)
+            {
+                return Err(
+                    OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                        "target turn cannot be reconciled to its exact durable turn id".to_string(),
+                    ),
+                );
             }
-            [turn] => recovered_turn = Some(turn.clone()),
-            _ => {
-                return Err(OfficialCodexAppServerError::AmbiguousTurnReconciliation {
-                    attempt_id: attempt.attempt_id.clone(),
-                    candidate_count: candidates.len(),
-                });
+            recovered_turn = candidates.first().cloned();
+        } else {
+            match candidates.as_slice() {
+                [] => {
+                    association.active_turn_id = None;
+                    association.turn_attempt = None;
+                    persist_thread_association(&request.session_directory, &association)?;
+                }
+                [turn] => recovered_turn = Some(turn.clone()),
+                _ => {
+                    return Err(OfficialCodexAppServerError::AmbiguousTurnReconciliation {
+                        attempt_id: attempt.attempt_id.clone(),
+                        candidate_count: candidates.len(),
+                    });
+                }
             }
         }
     }
@@ -1160,7 +1617,7 @@ async fn run_protocol(
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         if status == "completed" {
-            return finish_successful_turn(
+            return finish_successful_turn_with_convergence(
                 request,
                 association,
                 &mut execution_ledger,
@@ -1169,9 +1626,22 @@ async fn run_protocol(
                 final_answer,
                 usage,
                 authoritative_events,
-            );
+                commander_pre_turn_ids.as_deref(),
+                &mut next_id,
+                stdin,
+                lines,
+                &mut pending,
+            )
+            .await;
         }
         if status == "interrupted" {
+            if request.commander_continuation.is_some() {
+                return Err(
+                    OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                        "target Commander turn interrupted; delivery remains unsettled".to_string(),
+                    ),
+                );
+            }
             let started = start_interrupted_recovery(
                 request,
                 &mut association,
@@ -1263,6 +1733,14 @@ async fn run_protocol(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
                 if status == "interrupted" {
+                    if request.commander_continuation.is_some() {
+                        return Err(
+                            OfficialCodexAppServerError::CommanderConvergenceProofInvalid(
+                                "target Commander turn interrupted; delivery remains unsettled"
+                                    .to_string(),
+                            ),
+                        );
+                    }
                     let started = start_interrupted_recovery(
                         request,
                         &mut association,
@@ -1299,7 +1777,7 @@ async fn run_protocol(
                         }
                     }
                 }
-                return finish_successful_turn(
+                return finish_successful_turn_with_convergence(
                     request,
                     association,
                     &mut execution_ledger,
@@ -1308,7 +1786,13 @@ async fn run_protocol(
                     final_answer,
                     usage,
                     authoritative_events,
-                );
+                    commander_pre_turn_ids.as_deref(),
+                    &mut next_id,
+                    stdin,
+                    lines,
+                    &mut pending,
+                )
+                .await;
             }
             _ => {}
         }
@@ -2104,7 +2588,8 @@ fn reconcile_durable_command_run_effects(
                 })?
                 .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
                     effect_index,
-                    reason: "runtime did not produce a command_run identity observation".to_string(),
+                    reason: "runtime did not produce a command_run identity observation"
+                        .to_string(),
                 })?,
         };
         validate_command_run_observation(effect_index, &observation)?;
@@ -2751,6 +3236,54 @@ fn authoritative_turn_answer(turn: &Value) -> Option<String> {
         })
 }
 
+fn ordered_turn_ids(turns: &[Value]) -> Result<Vec<String>, OfficialCodexAppServerError> {
+    let mut seen = HashSet::new();
+    turns
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| {
+            let id = turn
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    OfficialCodexAppServerError::CommanderConvergenceProofInvalid(format!(
+                        "thread/read turn {index} omitted id"
+                    ))
+                })?
+                .to_string();
+            if !seen.insert(id.clone()) {
+                return Err(
+                    OfficialCodexAppServerError::CommanderConvergenceProofInvalid(format!(
+                        "thread/read repeated turn id {id}"
+                    )),
+                );
+            }
+            Ok(id)
+        })
+        .collect()
+}
+
+fn canonical_thread_revision_sha256_from_ids(thread_id: &str, turn_ids: &[String]) -> String {
+    let value = canonical_json(json!({
+        "thread_id": thread_id,
+        "ordered_turn_ids": turn_ids,
+    }));
+    let bytes = serde_json::to_vec(&value).expect("canonical thread revision is serializable");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+pub fn canonical_thread_revision_sha256(
+    thread_id: &str,
+    turns: &[Value],
+) -> Result<String, OfficialCodexAppServerError> {
+    Ok(canonical_thread_revision_sha256_from_ids(
+        thread_id,
+        &ordered_turn_ids(turns)?,
+    ))
+}
+
 fn is_authoritative_event(method: &str) -> bool {
     method.starts_with("item/")
         || method.starts_with("turn/")
@@ -2813,7 +3346,8 @@ fn canonical_mission_snapshot(
         "permissionSemantics": {
             "allowedCommandRunCommands": request.allowed_command_run_commands,
             "disablePermissionRestrictions": request.disable_permission_restrictions,
-        }
+        },
+        "commanderContinuation": request.commander_continuation,
     });
     Ok(CodexMissionSnapshot {
         input_sha256: sha256_canonical_json(payload)?,
@@ -2879,10 +3413,21 @@ pub fn load_thread_association(
     session_directory: &Path,
     tura_session_id: &str,
 ) -> Result<Option<CodexThreadAssociation>, OfficialCodexAppServerError> {
-    let path = association_path(session_directory, tura_session_id);
+    load_thread_association_scoped(session_directory, tura_session_id, tura_session_id)
+}
+
+fn load_thread_association_scoped(
+    session_directory: &Path,
+    tura_session_id: &str,
+    association_scope_id: &str,
+) -> Result<Option<CodexThreadAssociation>, OfficialCodexAppServerError> {
+    let path = association_path(session_directory, association_scope_id);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if association_scope_id != tura_session_id {
+                return Ok(None);
+            }
             let legacy_path = session_directory.join(ASSOCIATION_FILE);
             let legacy_bytes = match std::fs::read(&legacy_path) {
                 Ok(bytes) => bytes,
@@ -2927,6 +3472,16 @@ pub fn load_thread_association(
             actual: association.tura_session_id,
         });
     }
+    if association_scope_id != tura_session_id
+        && association.association_scope_id.as_deref() != Some(association_scope_id)
+    {
+        return Err(OfficialCodexAppServerError::AssociationSessionMismatch {
+            expected: association_scope_id.to_string(),
+            actual: association
+                .association_scope_id
+                .unwrap_or(association.tura_session_id),
+        });
+    }
     Ok(Some(association))
 }
 
@@ -2934,7 +3489,13 @@ fn persist_thread_association(
     session_directory: &Path,
     association: &CodexThreadAssociation,
 ) -> Result<(), OfficialCodexAppServerError> {
-    let path = association_path(session_directory, &association.tura_session_id);
+    let path = association_path(
+        session_directory,
+        association
+            .association_scope_id
+            .as_deref()
+            .unwrap_or(&association.tura_session_id),
+    );
     let association_directory = path.parent().unwrap_or(session_directory);
     std::fs::create_dir_all(association_directory).map_err(|source| {
         OfficialCodexAppServerError::CreateAssociationDirectory {
@@ -2971,6 +3532,24 @@ fn association_path(session_directory: &Path, tura_session_id: &str) -> PathBuf 
         .join("run")
         .join(ASSOCIATION_DIRECTORY)
         .join(format!("{session_digest}.json"))
+}
+
+fn association_scope_id(request: &OfficialCodexTurnRequest) -> String {
+    request
+        .commander_continuation
+        .as_ref()
+        .map(|binding| {
+            let original_runtime_id = binding
+                .continuation_request_id
+                .strip_prefix("callback-continuation-request-")
+                .map(|digest| format!("callback-continuation-runtime-{digest}"))
+                .unwrap_or_else(|| request.runtime_id.clone());
+            format!(
+                "{}:commander-continuation:{}",
+                request.tura_session_id, original_runtime_id
+            )
+        })
+        .unwrap_or_else(|| request.tura_session_id.clone())
 }
 
 #[cfg(test)]
@@ -3054,6 +3633,8 @@ mod interrupted_read_only_reconciliation_tests {
             }],
             interrupted_recovery: None,
             terminal_status: None,
+            commander_convergence_proof: None,
+            commander_convergence_final_assistant: None,
         }
     }
 
@@ -3078,6 +3659,7 @@ mod interrupted_read_only_reconciliation_tests {
             }),
             observed_tool_effects: execution_ledger(read_only_observation()).effects,
             interrupted_recovery: None,
+            association_scope_id: None,
         };
 
         let value = serde_json::to_value(association).expect("serialize association");
@@ -3181,7 +3763,10 @@ mod interrupted_read_only_reconciliation_tests {
         .expect_err("failed receipt without reconciliation must remain fail closed");
         assert!(matches!(
             error,
-            OfficialCodexAppServerError::UncertainToolEffect { effect_index: 0, .. }
+            OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index: 0,
+                ..
+            }
         ));
     }
 
@@ -3200,7 +3785,10 @@ mod interrupted_read_only_reconciliation_tests {
             .expect_err("not-started receipt with a pid must remain fail closed");
         assert!(matches!(
             error,
-            OfficialCodexAppServerError::UncertainToolEffect { effect_index: 0, .. }
+            OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index: 0,
+                ..
+            }
         ));
     }
 
@@ -3232,17 +3820,22 @@ mod interrupted_read_only_reconciliation_tests {
             }],
             interrupted_recovery: None,
             terminal_status: None,
+            commander_convergence_proof: None,
+            commander_convergence_final_assistant: None,
         };
         let mut handler = IdentityOnlyVerifier::default();
-        let mut request_handler =
-            Some(&mut handler as &mut dyn OfficialCodexServerRequestHandler);
+        let mut request_handler = Some(&mut handler as &mut dyn OfficialCodexServerRequestHandler);
         let error = reconcile_durable_command_run_effects(
             root.path(),
             &mut execution_ledger,
             &mut request_handler,
         )
         .expect_err("legacy multi-runtime effect must not guess its receipt owner");
-        assert!(error.to_string().contains("legacy effect runtime identity is ambiguous"));
+        assert!(
+            error
+                .to_string()
+                .contains("legacy effect runtime identity is ambiguous")
+        );
     }
 
     fn receipt_directory(session_directory: &Path) -> PathBuf {
@@ -3344,9 +3937,11 @@ mod interrupted_read_only_reconciliation_tests {
             handler.handle_calls, 0,
             "uncertain recovery replayed the tool call"
         );
-        assert!(error
-            .to_string()
-            .contains("was claimed without a terminal receipt"));
+        assert!(
+            error
+                .to_string()
+                .contains("was claimed without a terminal receipt")
+        );
         assert_eq!(
             execution_ledger.effects[0].state,
             CodexObservedToolEffectState::Observed
