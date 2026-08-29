@@ -22,7 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-const ROUTER_HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
+const ROUTER_HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_ROUTER_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_ROUTER_STARTUP_TIMEOUT: Duration = Duration::from_secs(1800);
+pub(crate) const ROUTER_STARTUP_TIMEOUT_ENV: &str = "TURA_ROUTER_HEALTH_TIMEOUT_SECS";
 const DEFAULT_ROUTER_EXECUTION_TIMEOUT: Duration = Duration::from_secs(35 * 60);
 const ROUTER_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 const ROUTER_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -46,10 +49,34 @@ struct ProcessLockRecord {
     home: Option<String>,
 }
 
+#[derive(Debug)]
+enum RouterStartupWait {
+    Ready(RouterEndpoint),
+    ChildExited,
+    MaximumBudgetExhausted,
+}
+
+pub fn router_startup_timeout() -> Duration {
+    router_startup_timeout_from(std::env::var(ROUTER_STARTUP_TIMEOUT_ENV).ok().as_deref())
+}
+
+pub fn router_startup_timeout_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .map(|timeout| timeout.min(MAX_ROUTER_STARTUP_TIMEOUT))
+        .unwrap_or(DEFAULT_ROUTER_STARTUP_TIMEOUT)
+}
+
+pub fn router_startup_health_probe_timeout(remaining: Duration) -> Duration {
+    remaining.min(ROUTER_HEALTH_REQUEST_TIMEOUT)
+}
+
 pub struct RouterProcess {
     router_bin: Option<PathBuf>,
     addr: ParkingMutex<Option<String>>,
     child: ParkingMutex<Option<std::process::Child>>,
+    startup_lock: ParkingMutex<()>,
     request_seq: AtomicU64,
     restart_count: AtomicU64,
     last_error: ParkingMutex<Option<String>>,
@@ -94,6 +121,7 @@ impl RouterProcess {
             router_bin,
             addr: ParkingMutex::new(None),
             child: ParkingMutex::new(None),
+            startup_lock: ParkingMutex::new(()),
             request_seq: AtomicU64::new(1),
             restart_count: AtomicU64::new(0),
             last_error: ParkingMutex::new(None),
@@ -101,12 +129,15 @@ impl RouterProcess {
     }
 
     pub fn ensure_started(&self) -> Result<()> {
+        let _startup_guard = self.startup_lock.lock();
         if let Some((endpoint, _health)) = self.healthy_owned_router_endpoint()? {
             *self.addr.lock() = Some(endpoint.addr);
             *self.last_error.lock() = None;
             return Ok(());
         }
 
+        let startup_budget = router_startup_timeout();
+        let startup_deadline = Instant::now() + startup_budget;
         for attempt in 0..2 {
             self.kill_managed_router_child();
             let _ = terminate_router_from_lock()?;
@@ -115,37 +146,33 @@ impl RouterProcess {
             self.restart_count.fetch_add(1, Ordering::SeqCst);
             *self.child.lock() = Some(child);
 
-            if let Some(endpoint) = self.wait_for_healthy_owned_router(ROUTER_HEALTH_TIMEOUT)? {
-                *self.addr.lock() = Some(endpoint.addr);
-                *self.last_error.lock() = None;
-                return Ok(());
-            }
-
-            let killed_spawned_child = self.kill_managed_router_child();
-            remove_router_endpoint_files();
-            *self.addr.lock() = None;
-            if let Some(error) = session_log_contract::client::unreachable_owner_lock_message() {
-                *self.last_error.lock() = Some(error.clone());
-                return Err(anyhow!("failed to start router daemon: {error}"));
-            }
-
-            if !killed_spawned_child {
-                let error =
-                    "router daemon did not become healthy within 20 seconds and could not be killed"
-                        .to_string();
-                *self.last_error.lock() = Some(error.clone());
-                return Err(anyhow!("failed to start router daemon: {error}"));
-            }
-
-            if attempt == 0 {
-                continue;
+            match self.wait_for_healthy_owned_router(startup_deadline)? {
+                RouterStartupWait::Ready(endpoint) => {
+                    *self.addr.lock() = Some(endpoint.addr);
+                    *self.last_error.lock() = None;
+                    return Ok(());
+                }
+                RouterStartupWait::ChildExited if attempt == 0 => {
+                    self.kill_managed_router_child();
+                    remove_router_endpoint_files();
+                    *self.addr.lock() = None;
+                    continue;
+                }
+                RouterStartupWait::ChildExited | RouterStartupWait::MaximumBudgetExhausted => {
+                    self.kill_managed_router_child();
+                    remove_router_endpoint_files();
+                    *self.addr.lock() = None;
+                    break;
+                }
             }
         }
 
-        let error =
-            session_log_contract::client::unreachable_owner_lock_message().unwrap_or_else(|| {
-                "router daemon did not become healthy within 20 seconds".to_string()
-            });
+        let error = session_log_contract::client::unreachable_owner_lock_message().unwrap_or_else(|| {
+            format!(
+                "router startup maximum budget of {} seconds exhausted without a reachable matching endpoint",
+                startup_budget.as_secs()
+            )
+        });
         *self.last_error.lock() = Some(error.clone());
         Err(anyhow!("failed to start router daemon: {error}"))
     }
@@ -394,7 +421,7 @@ impl RouterProcess {
             self.request_seq.fetch_add(1, Ordering::SeqCst)
         );
         let request = if method == METHOD_HEALTH_CHECK {
-            IpcRequest::health_check(request_id, ROUTER_HEALTH_TIMEOUT.as_millis() as u64)
+            IpcRequest::health_check(request_id, ROUTER_HEALTH_REQUEST_TIMEOUT.as_millis() as u64)
         } else {
             IpcRequest::call(request_id, method, payload)
         };
@@ -438,8 +465,11 @@ impl RouterProcess {
         Ok(Some(endpoint))
     }
 
-    fn healthy_owned_router_endpoint(&self) -> Result<Option<(RouterEndpoint, serde_json::Value)>> {
-        let Some((endpoint, health)) = healthy_router_endpoint()? else {
+    fn healthy_owned_router_endpoint_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<(RouterEndpoint, serde_json::Value)>> {
+        let Some((endpoint, health)) = healthy_router_endpoint(timeout)? else {
             return Ok(None);
         };
         if !self.router_binary_matches(&endpoint)?
@@ -451,18 +481,29 @@ impl RouterProcess {
         Ok(Some((endpoint, health)))
     }
 
-    fn wait_for_healthy_owned_router(&self, timeout: Duration) -> Result<Option<RouterEndpoint>> {
-        let started = Instant::now();
-        while started.elapsed() < timeout {
-            if let Some((endpoint, _health)) = self.healthy_owned_router_endpoint()? {
-                return Ok(Some(endpoint));
+    fn healthy_owned_router_endpoint(&self) -> Result<Option<(RouterEndpoint, serde_json::Value)>> {
+        self.healthy_owned_router_endpoint_with_timeout(ROUTER_HEALTH_REQUEST_TIMEOUT)
+    }
+
+    fn wait_for_healthy_owned_router(&self, deadline: Instant) -> Result<RouterStartupWait> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(RouterStartupWait::MaximumBudgetExhausted);
+            }
+            if let Some((endpoint, _health)) = self.healthy_owned_router_endpoint_with_timeout(
+                router_startup_health_probe_timeout(remaining),
+            )? {
+                return Ok(RouterStartupWait::Ready(endpoint));
             }
             if !self.managed_router_child_alive() {
-                return Ok(None);
+                return Ok(RouterStartupWait::ChildExited);
             }
-            std::thread::sleep(ROUTER_STARTUP_POLL_INTERVAL);
+            std::thread::sleep(
+                ROUTER_STARTUP_POLL_INTERVAL
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
-        Ok(None)
     }
 
     fn owns_router_endpoint(&self, endpoint: &RouterEndpoint) -> bool {
@@ -560,7 +601,7 @@ fn call_router_addr(
 
 fn read_timeout_for(method: &str) -> Option<Duration> {
     if method == "health_check" {
-        Some(ROUTER_HEALTH_TIMEOUT)
+        Some(ROUTER_HEALTH_REQUEST_TIMEOUT)
     } else if method == "execution.probe_sessions" {
         Some(Duration::from_secs(5))
     } else if method == "execution.shutdown" {
@@ -651,23 +692,21 @@ fn read_router_endpoint_record() -> Result<Option<RouterEndpoint>> {
     Ok(Some(endpoint))
 }
 
-fn healthy_router_endpoint() -> Result<Option<(RouterEndpoint, serde_json::Value)>> {
+fn healthy_router_endpoint(
+    timeout: Duration,
+) -> Result<Option<(RouterEndpoint, serde_json::Value)>> {
     let Some(mut endpoint) = read_router_endpoint_record()? else {
         return Ok(None);
     };
-    let request = IpcRequest::health_check(
-        "gateway-health-probe",
-        ROUTER_HEALTH_TIMEOUT.as_millis() as u64,
-    );
-    let response =
-        match call_router_addr(&endpoint.addr, &request, read_timeout_for("health_check")) {
-            Ok(response) => response,
-            Err(_) => {
-                let _ = terminate_router_endpoint_process(&endpoint);
-                let _ = std::fs::remove_file(router_addr_path());
-                return Ok(None);
-            }
-        };
+    let request = IpcRequest::health_check("gateway-health-probe", timeout.as_millis() as u64);
+    let response = match call_router_addr(&endpoint.addr, &request, Some(timeout)) {
+        Ok(response) => response,
+        Err(_) => {
+            let _ = terminate_router_endpoint_process(&endpoint);
+            let _ = std::fs::remove_file(router_addr_path());
+            return Ok(None);
+        }
+    };
     if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
         let _ = std::fs::remove_file(router_addr_path());
         return Ok(None);
@@ -1120,7 +1159,7 @@ mod tests {
             assert_eq!(read_timeout_for("execution.enqueue_turn"), None);
             assert_eq!(
                 read_timeout_for("health_check"),
-                Some(ROUTER_HEALTH_TIMEOUT)
+                Some(ROUTER_HEALTH_REQUEST_TIMEOUT)
             );
             assert_eq!(
                 read_timeout_for("execution.shutdown"),
@@ -1276,7 +1315,7 @@ mod tests {
         )?;
 
         assert!(
-            healthy_router_endpoint()?.is_none(),
+            healthy_router_endpoint(ROUTER_HEALTH_REQUEST_TIMEOUT)?.is_none(),
             "gateway must not adopt a raw TCP endpoint that does not answer router health"
         );
         assert!(
@@ -1383,6 +1422,7 @@ mod tests {
             router_bin: Some(router_bin),
             addr: ParkingMutex::new(None),
             child: ParkingMutex::new(None),
+            startup_lock: ParkingMutex::new(()),
             request_seq: AtomicU64::new(1),
             restart_count: AtomicU64::new(0),
             last_error: ParkingMutex::new(None),
@@ -1490,6 +1530,38 @@ mod tests {
         .expect("foreign home lock");
         assert!(!router_endpoint_process_identity_matches(&endpoint));
         assert!(!terminate_router_from_lock().expect("foreign home lock should not kill"));
+    }
+
+    #[test]
+    fn router_startup_timeout_uses_one_bounded_shared_contract() {
+        assert_eq!(
+            router_startup_timeout_from(None),
+            DEFAULT_ROUTER_STARTUP_TIMEOUT
+        );
+        assert_eq!(
+            router_startup_timeout_from(Some("45")),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            router_startup_timeout_from(Some("1801")),
+            MAX_ROUTER_STARTUP_TIMEOUT
+        );
+        assert_eq!(
+            router_startup_health_probe_timeout(Duration::from_secs(21)),
+            ROUTER_HEALTH_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            router_startup_health_probe_timeout(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            router_startup_timeout_from(Some("0")),
+            DEFAULT_ROUTER_STARTUP_TIMEOUT
+        );
+        assert_eq!(
+            router_startup_timeout_from(Some("invalid")),
+            DEFAULT_ROUTER_STARTUP_TIMEOUT
+        );
     }
 
     #[test]

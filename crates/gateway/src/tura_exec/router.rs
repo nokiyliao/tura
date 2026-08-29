@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::cli::CliConfig;
 use super::env::normalize_model;
@@ -16,9 +16,7 @@ use super::output::{
 };
 use super::session::{ensure_cli_session, final_text_from_session_db};
 
-const ROUTER_HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
 const ROUTER_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const ROUTER_HEALTH_TIMEOUT_ENV: &str = "TURA_ROUTER_HEALTH_TIMEOUT_SECS";
 
 /// Thin-client turn: dispatch to the detached `tura_router` daemon (which owns
 /// session_db and spawns the runtime worker), block for completion, then render
@@ -431,36 +429,46 @@ fn ensure_router_daemon() -> Result<String, String> {
     command.env_remove("TURA_CLI_PROGRESS");
     configure_router_stderr(&mut command);
     tura_path::process_hardening::hide_child_console_window_and_detach(&mut command);
-    command
+    let mut child = command
         .spawn()
         .map_err(|err| format!("failed to start router daemon: {err}"))?;
-    let timeout = router_health_timeout();
+    let timeout = gateway::router_process::router_startup_timeout();
     let started = Instant::now();
     while started.elapsed() < timeout {
-        if let Some(addr) = reachable_router_addr() {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        if let Some(addr) = reachable_router_addr_with_timeout(
+            gateway::router_process::router_startup_health_probe_timeout(remaining),
+        ) {
             return Ok(addr);
         }
-        std::thread::sleep(ROUTER_HEALTH_POLL_INTERVAL);
+        std::thread::sleep(ROUTER_HEALTH_POLL_INTERVAL.min(remaining));
     }
+    let cleaned_up = kill_spawned_router_child(&mut child);
     if let Some(error) = session_log_contract::client::unreachable_owner_lock_message() {
         return Err(format!(
-            "router daemon did not become healthy within {} seconds: {error}",
-            timeout.as_secs()
+            "router daemon did not become healthy within {} seconds (spawned child cleanup: {cleaned_up}): {error}",
+            timeout.as_secs(),
         ));
     }
     Err(format!(
-        "router daemon did not become healthy within {} seconds",
-        timeout.as_secs()
+        "router daemon did not become healthy within {} seconds (spawned child cleanup: {cleaned_up})",
+        timeout.as_secs(),
     ))
 }
 
-fn router_health_timeout() -> Duration {
-    std::env::var(ROUTER_HEALTH_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(ROUTER_HEALTH_TIMEOUT)
+fn kill_spawned_router_child(child: &mut std::process::Child) -> bool {
+    match child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            let killed = child.kill().is_ok();
+            let _ = child.wait();
+            killed
+        }
+        Err(_) => false,
+    }
 }
 
 fn router_final_text(response: &Value) -> Option<String> {
@@ -597,6 +605,12 @@ fn router_addr_path() -> PathBuf {
 
 /// Read the published router endpoint and confirm it is actually connectable.
 fn reachable_router_addr() -> Option<String> {
+    reachable_router_addr_with_timeout(
+        gateway::router_process::router_startup_health_probe_timeout(Duration::MAX),
+    )
+}
+
+fn reachable_router_addr_with_timeout(timeout: Duration) -> Option<String> {
     let raw = fs::read_to_string(router_addr_path()).ok()?;
     let endpoint: Value = serde_json::from_str(raw.trim()).ok()?;
     let version = endpoint
@@ -608,7 +622,7 @@ fn reachable_router_addr() -> Option<String> {
     }
     let addr = endpoint.get("addr").and_then(Value::as_str)?.to_string();
     let socket: std::net::SocketAddr = addr.parse().ok()?;
-    if router_health_ok(socket) {
+    if router_health_ok(socket, timeout) {
         Some(addr)
     } else {
         let _ = fs::remove_file(router_addr_path());
@@ -616,19 +630,20 @@ fn reachable_router_addr() -> Option<String> {
     }
 }
 
-fn router_health_ok(socket: std::net::SocketAddr) -> bool {
-    let mut stream = match std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(2)) {
-        Ok(stream) => stream,
-        Err(_) => return false,
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+fn router_health_ok(socket: std::net::SocketAddr, timeout: Duration) -> bool {
+    let mut stream =
+        match std::net::TcpStream::connect_timeout(&socket, timeout.min(Duration::from_secs(2))) {
+            Ok(stream) => stream,
+            Err(_) => return false,
+        };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout.min(Duration::from_secs(2))));
     let request = json!({
         "request_id": format!("exec-health-{}", uuid::Uuid::new_v4()),
         "kind": "health_check",
         "method": "health_check",
         "payload": {},
-        "deadline_ms": 5000,
+        "deadline_ms": timeout.as_millis() as u64,
     });
     if stream
         .write_all(format!("{request}\n").as_bytes())
@@ -675,11 +690,21 @@ fn resolve_router_binary() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         read_router_response, router_callback_cli_events, router_final_text, router_health_ok,
         router_session_log, router_stderr_log_path, router_turn_read_timeout_from,
         router_turn_started_at_ms, router_usage, worker_env_from_current_process,
     };
+
+    #[test]
+    fn router_spawn_uses_the_gateway_startup_timeout_contract() {
+        assert_eq!(
+            gateway::router_process::router_startup_timeout_from(Some("45")),
+            Duration::from_secs(45)
+        );
+    }
     use serde_json::json;
     use std::collections::HashSet;
     use std::ffi::OsString;
@@ -955,7 +980,7 @@ mod tests {
             Ok(())
         });
 
-        assert!(router_health_ok(addr));
+        assert!(router_health_ok(addr, Duration::from_secs(5)));
         server
             .join()
             .map_err(|_| anyhow::anyhow!("health probe server panicked"))??;
