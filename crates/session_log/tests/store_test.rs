@@ -1842,6 +1842,17 @@ fn runtime_registration_persists_exact_lifecycle_identity_and_rejects_drift() {
         dispatch_lease_id: "lease-identity".to_string(),
         receipt_event_seq: 0,
     };
+    assert!(matches!(
+        store
+            .register_runtime(RegisterRuntimeRequest {
+                runtime_id: runtime_id.clone(),
+                session_id: session_id.clone(),
+                fallback_from_id: None,
+                lifecycle: None,
+            })
+            .expect("register provisional runtime identity"),
+        RuntimeRegistrationOutcome::Registered { .. }
+    ));
     let request = RegisterRuntimeRequest {
         runtime_id: runtime_id.clone(),
         session_id: session_id.clone(),
@@ -1851,8 +1862,8 @@ fn runtime_registration_persists_exact_lifecycle_identity_and_rejects_drift() {
     assert!(matches!(
         store
             .register_runtime(request.clone())
-            .expect("register runtime with lifecycle identity"),
-        RuntimeRegistrationOutcome::Registered { .. }
+            .expect("enrich provisional runtime with lifecycle identity"),
+        RuntimeRegistrationOutcome::AlreadyRegistered { .. }
     ));
     assert!(matches!(
         store
@@ -1880,6 +1891,106 @@ fn runtime_registration_persists_exact_lifecycle_identity_and_rejects_drift() {
                 lifecycle: Some(drifted),
             })
             .expect("drifted lifecycle identity must be classified"),
+        RuntimeRegistrationOutcome::RuntimeIdConflict
+    );
+}
+
+#[test]
+fn runtime_lifecycle_enrichment_rejects_active_terminal_and_identity_drift() {
+    let db = DirectDbGuard::new();
+    let store = SessionLogStore::open_default().expect("store");
+    let workspace = db.workspace("runtime-lifecycle-enrichment-guards");
+    let session_id = format!("runtime-lifecycle-guards-{}", uuid::Uuid::new_v4());
+    let other_session_id = format!("runtime-lifecycle-other-{}", uuid::Uuid::new_v4());
+    create_typed_session(&store, &workspace, &session_id);
+    create_typed_session(&store, &workspace, &other_session_id);
+
+    let lifecycle_for = |runtime_id: &str, transaction_id: &str| RuntimeLifecycleIdentity {
+        commander_session_id: "commander-enrichment-guards".to_string(),
+        transaction_id: transaction_id.to_string(),
+        task_id: Some("task-enrichment-guards".to_string()),
+        goal_id: Some("goal-enrichment-guards".to_string()),
+        operator_override: false,
+        dispatch_runtime_id: runtime_id.to_string(),
+        dispatch_lease_id: format!("lease-{runtime_id}"),
+        receipt_event_seq: 0,
+    };
+    let register_provisional = |runtime_id: &str| {
+        store
+            .register_runtime(RegisterRuntimeRequest {
+                runtime_id: runtime_id.to_string(),
+                session_id: session_id.clone(),
+                fallback_from_id: None,
+                lifecycle: None,
+            })
+            .expect("register provisional runtime")
+    };
+
+    let active_runtime_id = format!("runtime-active-{}", uuid::Uuid::new_v4());
+    assert!(matches!(
+        register_provisional(&active_runtime_id),
+        RuntimeRegistrationOutcome::Registered { .. }
+    ));
+    assert!(matches!(
+        store
+            .activate_runtime_lease(ActivateRuntimeLeaseRequest {
+                runtime_id: active_runtime_id.clone(),
+                lease_id: "lease-active-enrichment".to_string(),
+            })
+            .expect("activate runtime lease"),
+        RuntimeLeaseOutcome::Activated { .. }
+    ));
+    assert_eq!(
+        store
+            .register_runtime(RegisterRuntimeRequest {
+                runtime_id: active_runtime_id.clone(),
+                session_id: session_id.clone(),
+                fallback_from_id: None,
+                lifecycle: Some(lifecycle_for(&active_runtime_id, "transaction-active")),
+            })
+            .expect("classify active enrichment"),
+        RuntimeRegistrationOutcome::RuntimeIdConflict
+    );
+
+    let terminal_runtime_id = format!("runtime-terminal-{}", uuid::Uuid::new_v4());
+    let conn = rusqlite::Connection::open(db.workspace_db(&workspace)).expect("workspace db");
+    conn.execute(
+        "INSERT INTO runtimes(runtime_id, session_id, lifecycle_json, terminal) VALUES (?1, ?2, NULL, 1)",
+        rusqlite::params![terminal_runtime_id, session_id],
+    )
+    .expect("seed terminal provisional runtime");
+    assert_eq!(
+        store
+            .register_runtime(RegisterRuntimeRequest {
+                runtime_id: terminal_runtime_id.clone(),
+                session_id: session_id.clone(),
+                fallback_from_id: None,
+                lifecycle: Some(lifecycle_for(&terminal_runtime_id, "transaction-terminal")),
+            })
+            .expect("classify terminal enrichment"),
+        RuntimeRegistrationOutcome::RuntimeIdConflict
+    );
+
+    assert_eq!(
+        store
+            .register_runtime(RegisterRuntimeRequest {
+                runtime_id: active_runtime_id.clone(),
+                session_id: other_session_id,
+                fallback_from_id: None,
+                lifecycle: Some(lifecycle_for(&active_runtime_id, "transaction-session")),
+            })
+            .expect("classify session drift"),
+        RuntimeRegistrationOutcome::RuntimeIdConflict
+    );
+    assert_eq!(
+        store
+            .register_runtime(RegisterRuntimeRequest {
+                runtime_id: active_runtime_id.clone(),
+                session_id,
+                fallback_from_id: Some("different-fallback".to_string()),
+                lifecycle: Some(lifecycle_for(&active_runtime_id, "transaction-fallback")),
+            })
+            .expect("classify fallback drift"),
         RuntimeRegistrationOutcome::RuntimeIdConflict
     );
 }
