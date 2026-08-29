@@ -8,7 +8,7 @@ use super::{
 use serde_json::json;
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn command_allowlist_matches_shell_aliases_by_canonical_identity() {
@@ -754,6 +754,104 @@ async fn parallel_read_only_shells_each_preserve_a_known_terminal_receipt() {
     }
 
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupted_parallel_batch_still_terminalizes_every_admitted_command_once() {
+    let workspace = temporary_workspace("interrupted-parallel-terminal-receipts");
+    let receipt_directory = workspace.join(".tura/run/command_receipts");
+    let active_shell = crate::commands::active_shell_command_name();
+    let fifo_paths = (0..4)
+        .map(|index| workspace.join(format!("terminal-{index}.fifo")))
+        .collect::<Vec<_>>();
+    for path in &fifo_paths {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("create FIFO");
+        assert!(status.success(), "mkfifo failed for {}", path.display());
+    }
+    let commands = (0..4)
+        .map(|index| {
+            json!({
+                "command_type": active_shell,
+                "command_line": format!("cat {}", fifo_paths[index].display()),
+                "timeout_ms": 5000,
+                "step": 1
+            })
+        })
+        .collect::<Vec<_>>();
+    let execution = tokio::spawn(super::execute_async_value(
+        json!({"execution_id": "interrupted-parallel", "commands": commands}),
+        workspace.clone(),
+    ));
+
+    wait_for_receipt_count(&receipt_directory, true, 4).await;
+    execution.abort();
+    let writers = fifo_paths
+        .into_iter()
+        .map(|path| {
+            std::thread::spawn(move || {
+                std::fs::write(path, b"terminal\n").expect("release FIFO reader");
+            })
+        })
+        .collect::<Vec<_>>();
+    wait_for_receipt_count(&receipt_directory, false, 4).await;
+    for writer in writers {
+        writer.join().expect("FIFO writer");
+    }
+
+    for index in 0..4 {
+        let identity = format!("interrupted-parallel:step:1:index:{index}");
+        let encoded = identity.replace(':', "_x3a_");
+        let claim: Value = serde_json::from_slice(
+            &std::fs::read(receipt_directory.join(format!("{encoded}.claim.json")))
+                .expect("command claim"),
+        )
+        .expect("command claim JSON");
+        let receipt: Value = serde_json::from_slice(
+            &std::fs::read(receipt_directory.join(format!("{encoded}.json")))
+                .expect("terminal receipt"),
+        )
+        .expect("terminal receipt JSON");
+        assert_eq!(claim["call_id"], identity);
+        assert_eq!(claim["execution_count"], 1);
+        assert_eq!(claim["state"], "completed");
+        assert_eq!(receipt["call_id"], identity);
+        assert_eq!(receipt["terminal_state"], "completed");
+        assert_eq!(receipt["outcome"], "known");
+    }
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+async fn wait_for_receipt_count(directory: &std::path::Path, claims: bool, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let count = std::fs::read_dir(directory)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if claims {
+                        name.ends_with(".claim.json")
+                    } else {
+                        name.ends_with(".json") && !name.ends_with(".claim.json")
+                    }
+                })
+                .count();
+            if count == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receipt count did not converge");
 }
 
 #[tokio::test]
