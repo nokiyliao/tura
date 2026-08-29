@@ -1,11 +1,12 @@
 use crate::commands::CommandResponse;
 use crate::runtime::tool::ToolContext;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,7 +14,8 @@ use tokio::io::AsyncReadExt;
 
 use super::process::{
     attach_shell_process_scope, configure_process_scope, configure_tokio_process_scope,
-    process_is_alive, retain_shell_process_scope, terminate_process_tree,
+    panic_cleanup_process_scope_empty, process_is_alive, retain_shell_process_scope,
+    terminate_process_tree,
 };
 use super::response::failed_async_response;
 
@@ -35,7 +37,7 @@ pub(super) fn run_command_with_timeout(
     configure_process_scope(&mut command);
     match command.spawn() {
         Ok(mut child) => {
-            let mut scope = attach_shell_process_scope(child.id());
+            let mut scope = attach_shell_process_scope(child.id(), None);
             let stdout_task = child.stdout.take().map(|stream| {
                 let progress = progress.clone();
                 thread::spawn(move || read_blocking_stream(stream, progress))
@@ -296,6 +298,7 @@ pub(super) async fn run_tokio_command_with_timeout(
         }
     };
     let pid = child.id();
+    let mut scope = pid.and_then(|pid| attach_shell_process_scope(pid, ctx.current_call_id()));
     if let Err(error) = update_command_claim_running(ctx, pid, timeout_secs, stall_timeout_secs) {
         let _ = child.kill().await;
         let _ = child.wait().await;
@@ -328,7 +331,6 @@ pub(super) async fn run_tokio_command_with_timeout(
         }
         return response;
     }
-    let mut scope = pid.and_then(attach_shell_process_scope);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let call_id = ctx.current_call_id().unwrap_or("command_run").to_string();
@@ -362,7 +364,7 @@ pub(super) async fn run_tokio_command_with_timeout(
             progress.clone(),
         ))
     });
-    let mut wait_task = tokio::spawn(async move { child.wait().await });
+    let mut wait_task = Box::pin(child.wait());
     let mut expiration = None;
     let mut termination = None;
     let status = if ctx.cancellation.is_cancelled() {
@@ -376,7 +378,7 @@ pub(super) async fn run_tokio_command_with_timeout(
         None
     } else {
         tokio::select! {
-            output = &mut wait_task => output.ok().and_then(Result::ok),
+            output = &mut wait_task => output.ok(),
             _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
                 termination = Some(("CommandWallClockTimedOut", "wrapper_wall_clock_timeout", "command_run_wrapper"));
                 expiration = Some(format!("Timed out after {timeout_secs} seconds"));
@@ -420,7 +422,6 @@ pub(super) async fn run_tokio_command_with_timeout(
         )
         .await
         .ok()
-        .and_then(|joined| joined.ok())
         .and_then(Result::ok)
         .is_some();
     }
@@ -896,6 +897,413 @@ fn mark_claim_terminal(
     durable_replace_json(&path, &claim)
 }
 
+fn command_run_batch_path(session_dir: &Path, execution_id: &str) -> PathBuf {
+    session_dir
+        .join(".tura/run/command_receipts")
+        .join(format!("{}.batch-admission", safe_call_id(execution_id)))
+}
+
+pub fn begin_command_run_batch(
+    session_dir: &Path,
+    execution_id: &str,
+    call_ids: &[String],
+) -> Result<(), String> {
+    if call_ids.is_empty() || call_ids.iter().collect::<BTreeSet<_>>().len() != call_ids.len() {
+        return Err("COMMAND_RUN_BATCH_IDENTITY_INVALID".to_string());
+    }
+    let path = command_run_batch_path(session_dir, execution_id);
+    let admission = json!({
+        "schema_version": "tura_command_run_batch_admission_v1",
+        "execution_id": execution_id,
+        "call_ids": call_ids,
+        "accepted_call_ids": [],
+        "state": "admitted",
+        "accepted_claim_count": 0,
+        "zero_effect_proven": false
+    });
+    if path.exists() {
+        let existing: Value = serde_json::from_slice(
+            &fs::read(&path)
+                .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_READ_FAILED:{error}"))?,
+        )
+        .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_INVALID:{error}"))?;
+        if existing.get("schema_version").and_then(Value::as_str)
+            == Some("tura_command_run_batch_admission_v1")
+            && existing.get("execution_id").and_then(Value::as_str) == Some(execution_id)
+            && existing.get("call_ids") == Some(&json!(call_ids))
+        {
+            return Ok(());
+        }
+        return Err("COMMAND_RUN_BATCH_MARKER_CONFLICT".to_string());
+    }
+    durable_write_receipt(&path, &admission)
+}
+
+fn command_run_batch_marker_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+pub fn mark_command_run_batch_call_accepted(
+    session_dir: &Path,
+    execution_id: &str,
+    call_id: &str,
+) -> Result<(), String> {
+    let path = command_run_batch_path(session_dir, execution_id);
+    if !path.exists() {
+        return Ok(());
+    }
+    let _guard = command_run_batch_marker_lock()
+        .lock()
+        .map_err(|_| "COMMAND_RUN_BATCH_MARKER_LOCK_POISONED".to_string())?;
+    let mut marker: Value = serde_json::from_slice(
+        &fs::read(&path)
+            .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_READ_FAILED:{error}"))?,
+    )
+    .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_INVALID:{error}"))?;
+    let call_ids = marker
+        .get("call_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "COMMAND_RUN_BATCH_MARKER_INVALID".to_string())?;
+    if marker.get("schema_version").and_then(Value::as_str)
+        != Some("tura_command_run_batch_admission_v1")
+        || marker.get("execution_id").and_then(Value::as_str) != Some(execution_id)
+        || !call_ids.iter().any(|value| value.as_str() == Some(call_id))
+    {
+        return Err("COMMAND_RUN_BATCH_MARKER_CONFLICT".to_string());
+    }
+    let state = marker
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "COMMAND_RUN_BATCH_MARKER_INVALID".to_string())?
+        .to_string();
+    let accepted = marker
+        .get_mut("accepted_call_ids")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "COMMAND_RUN_BATCH_MARKER_INVALID".to_string())?;
+    if accepted.iter().any(|value| value.as_str() == Some(call_id)) {
+        return Ok(());
+    }
+    if state != "admitted" {
+        return Err("COMMAND_RUN_BATCH_MARKER_CONFLICT".to_string());
+    }
+    accepted.push(Value::String(call_id.to_string()));
+    durable_replace_json(&path, &marker)
+}
+
+pub fn complete_command_run_batch(
+    session_dir: &Path,
+    execution_id: &str,
+    call_ids: &[String],
+) -> Result<(), String> {
+    update_command_run_batch(session_dir, execution_id, call_ids, "finished", None)
+}
+
+fn update_command_run_batch(
+    session_dir: &Path,
+    execution_id: &str,
+    call_ids: &[String],
+    state: &str,
+    accepted_claim_count: Option<usize>,
+) -> Result<(), String> {
+    let path = command_run_batch_path(session_dir, execution_id);
+    let mut marker: Value = serde_json::from_slice(
+        &fs::read(&path)
+            .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_READ_FAILED:{error}"))?,
+    )
+    .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_INVALID:{error}"))?;
+    let current_state = marker.get("state").and_then(Value::as_str);
+    if marker.get("schema_version").and_then(Value::as_str)
+        != Some("tura_command_run_batch_admission_v1")
+        || marker.get("execution_id").and_then(Value::as_str) != Some(execution_id)
+        || marker.get("call_ids") != Some(&json!(call_ids))
+    {
+        return Err("COMMAND_RUN_BATCH_MARKER_CONFLICT".to_string());
+    }
+    if current_state == Some(state) || (state == "finished" && current_state != Some("admitted")) {
+        return Ok(());
+    }
+    if current_state != Some("admitted") {
+        return Err("COMMAND_RUN_BATCH_MARKER_CONFLICT".to_string());
+    }
+    let object = marker
+        .as_object_mut()
+        .ok_or_else(|| "COMMAND_RUN_BATCH_MARKER_INVALID".to_string())?;
+    object.insert("state".to_string(), Value::String(state.to_string()));
+    if let Some(count) = accepted_claim_count {
+        object.insert("accepted_claim_count".to_string(), json!(count));
+        object.insert("zero_effect_proven".to_string(), json!(count == 0));
+    }
+    object.insert("terminal_at_unix_ms".to_string(), json!(unix_time_ms()));
+    durable_replace_json(&path, &marker)
+}
+
+fn terminal_receipt_proves_process_terminal(receipt: &Value, call_id: &str) -> Result<(), String> {
+    let terminal_state = receipt.get("terminal_state").and_then(Value::as_str);
+    if receipt.get("schema_version").and_then(Value::as_str)
+        != Some("tura_command_terminal_receipt_v1")
+        || receipt.get("call_id").and_then(Value::as_str) != Some(call_id)
+        || !matches!(
+            terminal_state,
+            Some(
+                "completed"
+                    | "failed"
+                    | "terminated"
+                    | "cancelled"
+                    | "not_started"
+                    | "spawn_failed"
+                    | "claim_update_failed"
+                    | "interrupted"
+            )
+        )
+        || receipt.get("termination_proven").and_then(Value::as_bool) != Some(true)
+        || receipt.get("process_reaped").and_then(Value::as_bool) != Some(true)
+        || receipt.get("process_group_empty").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(format!(
+            "COMMAND_TERMINAL_RECEIPT_PROOF_INCOMPLETE:{call_id}"
+        ));
+    }
+    Ok(())
+}
+
+fn claim_state_is_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "completed"
+            | "failed"
+            | "terminated"
+            | "cancelled"
+            | "not_started"
+            | "spawn_failed"
+            | "claim_update_failed"
+            | "interrupted"
+    )
+}
+
+pub async fn terminalize_interrupted_command_run_claims(
+    session_dir: &Path,
+    execution_id: &str,
+    call_ids: &[String],
+) -> Result<usize, String> {
+    let marker_path = command_run_batch_path(session_dir, execution_id);
+    let marker: Value = serde_json::from_slice(
+        &fs::read(&marker_path)
+            .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_READ_FAILED:{error}"))?,
+    )
+    .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_INVALID:{error}"))?;
+    if marker.get("schema_version").and_then(Value::as_str)
+        != Some("tura_command_run_batch_admission_v1")
+        || marker.get("execution_id").and_then(Value::as_str) != Some(execution_id)
+        || marker.get("call_ids") != Some(&json!(call_ids))
+        || marker.get("state").and_then(Value::as_str) != Some("admitted")
+    {
+        return Err("COMMAND_RUN_BATCH_MARKER_CONFLICT".to_string());
+    }
+    let accepted_call_ids = marker
+        .get("accepted_call_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "COMMAND_RUN_BATCH_MARKER_INVALID".to_string())?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "COMMAND_RUN_BATCH_MARKER_INVALID".to_string())
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut claims = Vec::new();
+    for call_id in call_ids {
+        let path = command_claim_path(session_dir, call_id);
+        if !path.exists() {
+            continue;
+        }
+        let claim: Value =
+            serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        if claim.get("call_id").and_then(Value::as_str) != Some(call_id) {
+            return Err(format!(
+                "COMMAND_EXECUTION_CLAIM_ID_CONFLICT:{}",
+                path.display()
+            ));
+        }
+        claims.push((path, claim));
+    }
+    let claimed_call_ids = claims
+        .iter()
+        .filter_map(|(_, claim)| claim.get("call_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if !claimed_call_ids.is_subset(&accepted_call_ids) {
+        return Err("COMMAND_RUN_PANIC_CLEANUP_UNACCEPTED_CLAIM".to_string());
+    }
+    if !accepted_call_ids.is_subset(&claimed_call_ids) {
+        return Err("COMMAND_RUN_PANIC_CLEANUP_ACCEPTED_WITHOUT_CLAIM".to_string());
+    }
+
+    let mut receipt_proof_error = None;
+    let mut processes = Vec::new();
+    for (_, claim) in &claims {
+        let state = claim
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("claimed");
+        if claim_state_is_terminal(state) {
+            continue;
+        }
+        let call_id = claim
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let receipt_path = command_receipt_path(session_dir, call_id);
+        let receipt_proves_terminal = if receipt_path.exists() {
+            match fs::read(&receipt_path)
+                .map_err(|error| error.to_string())
+                .and_then(|raw| {
+                    serde_json::from_slice::<Value>(&raw).map_err(|error| error.to_string())
+                })
+                .and_then(|receipt| terminal_receipt_proves_process_terminal(&receipt, call_id))
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    receipt_proof_error.get_or_insert(error);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if !receipt_proves_terminal && let Some(pid) = claim.get("pid").and_then(Value::as_u64) {
+            processes.push((call_id.to_string(), pid as u32));
+        }
+    }
+    processes.sort_unstable();
+    processes.dedup();
+    for (_, pid) in &processes {
+        terminate_process_tree(*pid);
+    }
+    let cleanup_started = Instant::now();
+    loop {
+        let mut live = Vec::new();
+        for (call_id, pid) in &processes {
+            if !panic_cleanup_process_scope_empty(call_id, *pid)? {
+                live.push((call_id.clone(), *pid));
+            }
+        }
+        if live.is_empty() {
+            break;
+        }
+        if cleanup_started.elapsed() >= Duration::from_secs(PROCESS_TERMINATION_GRACE_SECS) {
+            return Err(format!(
+                "COMMAND_RUN_PANIC_CLEANUP_TIMEOUT:{}:{live:?}",
+                execution_id
+            ));
+        }
+        for (_, pid) in live {
+            terminate_process_tree(pid);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if let Some(error) = receipt_proof_error {
+        return Err(error);
+    }
+
+    for (path, claim) in &mut claims {
+        let call_id = claim
+            .get("call_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("COMMAND_EXECUTION_CLAIM_ID_MISSING:{}", path.display()))?
+            .to_string();
+        let receipt_path = command_receipt_path(session_dir, &call_id);
+        let receipt = if receipt_path.exists() {
+            let receipt = serde_json::from_slice::<Value>(
+                &fs::read(&receipt_path).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            terminal_receipt_proves_process_terminal(&receipt, &call_id)?;
+            let claim_state = claim
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("claimed");
+            if claim_state_is_terminal(claim_state)
+                && receipt.get("terminal_state").and_then(Value::as_str) != Some(claim_state)
+            {
+                return Err(format!("COMMAND_TERMINAL_RECEIPT_STATE_CONFLICT:{call_id}"));
+            }
+            receipt
+        } else {
+            let receipt = json!({
+                "schema_version": "tura_command_terminal_receipt_v1",
+                "call_id": call_id,
+                "pid": claim.get("pid").cloned().unwrap_or(Value::Null),
+                "terminal_state": "interrupted",
+                "failure_class": "worker_panic",
+                "termination_origin": "router_command_run_supervisor",
+                "exit_code": -1,
+                "wall_time_ms": unix_time_ms().saturating_sub(
+                    claim.get("started_at_unix_ms").and_then(Value::as_u64).unwrap_or(0)
+                ),
+                "wall_timeout_ms": claim.get("wall_timeout_ms").cloned().unwrap_or(Value::Null),
+                "stall_timeout_ms": claim.get("stall_timeout_ms").cloned().unwrap_or(Value::Null),
+                "outcome": "unknown",
+                "process_reaped": true,
+                "process_group_empty": true,
+                "termination_proven": true,
+                "authority_effect": "none",
+                "authoritative_publication": "unproven",
+                "staging_authority": "none",
+                "retry_safe": false,
+                "auto_retry_allowed": false,
+                "reconcile_required": true,
+                "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof"
+            });
+            durable_write_receipt(&receipt_path, &receipt)?;
+            receipt
+        };
+        let object = claim
+            .as_object_mut()
+            .ok_or_else(|| format!("COMMAND_EXECUTION_CLAIM_INVALID:{}", path.display()))?;
+        object.insert(
+            "state".to_string(),
+            receipt
+                .get("terminal_state")
+                .cloned()
+                .unwrap_or_else(|| Value::String("interrupted".to_string())),
+        );
+        object.insert("terminal_at_unix_ms".to_string(), json!(unix_time_ms()));
+        object.insert(
+            "process_reaped".to_string(),
+            receipt
+                .get("process_reaped")
+                .cloned()
+                .unwrap_or(json!(true)),
+        );
+        object.insert(
+            "process_group_empty".to_string(),
+            receipt
+                .get("process_group_empty")
+                .cloned()
+                .unwrap_or(json!(true)),
+        );
+        object.insert(
+            "reconcile_required".to_string(),
+            receipt
+                .get("reconcile_required")
+                .cloned()
+                .unwrap_or(json!(true)),
+        );
+        durable_replace_json(path, &claim)?;
+    }
+    update_command_run_batch(
+        session_dir,
+        execution_id,
+        call_ids,
+        "panic_terminalized",
+        Some(claims.len()),
+    )?;
+    Ok(claims.len())
+}
+
 fn reconcile_command_execution_claims(
     session_dir: &Path,
     current_call_id: Option<&str>,
@@ -1296,13 +1704,15 @@ async fn drain_stream_tasks(
 mod tests {
     use super::super::response::failed_async_response;
     use super::{
-        claim_command_execution, command_claim_path, command_receipt_path, read_stream_with_deltas,
+        ProgressClock, SharedOutput, begin_command_run_batch, claim_command_execution,
+        command_claim_path, command_receipt_path, command_run_batch_path, durable_replace_json,
+        durable_write_receipt, mark_command_run_batch_call_accepted, read_stream_with_deltas,
         reconcile_command_execution_claims, run_command_with_timeout,
-        run_tokio_command_with_timeout, tail_chars, terminalize_pre_execution_zero_effect,
-        ProgressClock, SharedOutput,
+        run_tokio_command_with_timeout, tail_chars, terminalize_interrupted_command_run_claims,
+        terminalize_pre_execution_zero_effect,
     };
     use crate::runtime::tool::{ToolContext, ToolRuntimeEvent};
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -1323,6 +1733,173 @@ mod tests {
             command.args(["-c", "printf shell-ok"]);
             command
         }
+    }
+
+    fn write_test_claim(workspace: &std::path::Path, call_id: &str, state: &str) {
+        let path = command_claim_path(workspace, call_id);
+        fs::create_dir_all(path.parent().expect("claim parent")).expect("claim directory");
+        durable_replace_json(
+            &path,
+            &json!({
+                "schema_version": "tura_command_execution_claim_v1",
+                "call_id": call_id,
+                "state": state,
+                "pid": Value::Null,
+                "execution_count": 1
+            }),
+        )
+        .expect("test claim");
+    }
+
+    fn write_test_terminal_receipt(
+        workspace: &std::path::Path,
+        call_id: &str,
+        terminal_state: &str,
+    ) {
+        durable_write_receipt(
+            &command_receipt_path(workspace, call_id),
+            &json!({
+                "schema_version": "tura_command_terminal_receipt_v1",
+                "call_id": call_id,
+                "terminal_state": terminal_state,
+                "termination_proven": true,
+                "process_reaped": true,
+                "process_group_empty": true
+            }),
+        )
+        .expect("test receipt");
+    }
+
+    #[tokio::test]
+    async fn panic_cleanup_uses_exact_ids_filters_terminal_claims_and_ignores_unrelated_corruption()
+    {
+        let workspace =
+            std::env::temp_dir().join(format!("tura-exact-panic-cleanup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace");
+        let execution_id = "exact-batch";
+        let completed_id = execution_id.to_string();
+        let running_id = format!("{execution_id}:status_update");
+        let call_ids = vec![completed_id.clone(), running_id.clone()];
+        begin_command_run_batch(&workspace, execution_id, &call_ids).expect("batch admission");
+        mark_command_run_batch_call_accepted(&workspace, execution_id, &completed_id)
+            .expect("completed acceptance");
+        mark_command_run_batch_call_accepted(&workspace, execution_id, &running_id)
+            .expect("running acceptance");
+        write_test_claim(&workspace, &completed_id, "completed");
+        write_test_terminal_receipt(&workspace, &completed_id, "completed");
+        write_test_claim(&workspace, &running_id, "running");
+        fs::write(
+            workspace.join(".tura/run/command_receipts/unrelated.claim.json"),
+            b"not-json",
+        )
+        .expect("unrelated corrupt claim");
+
+        assert_eq!(
+            terminalize_interrupted_command_run_claims(&workspace, execution_id, &call_ids,)
+                .await
+                .expect("exact batch cleanup"),
+            2
+        );
+
+        let completed: Value = serde_json::from_slice(
+            &fs::read(command_claim_path(&workspace, &completed_id)).expect("completed claim"),
+        )
+        .expect("completed claim JSON");
+        let running: Value = serde_json::from_slice(
+            &fs::read(command_claim_path(&workspace, &running_id)).expect("running claim"),
+        )
+        .expect("running claim JSON");
+        assert_eq!(completed["state"], "completed");
+        assert_eq!(running["state"], "interrupted");
+        assert_eq!(running["process_reaped"], true);
+        assert_eq!(running["process_group_empty"], true);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn panic_cleanup_zero_claims_needs_and_terminalizes_durable_admission_marker() {
+        let workspace = std::env::temp_dir().join(format!(
+            "tura-zero-claim-panic-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace");
+        let execution_id = "zero-claim-batch";
+        let call_ids = vec![execution_id.to_string()];
+        let missing =
+            terminalize_interrupted_command_run_claims(&workspace, execution_id, &call_ids)
+                .await
+                .expect_err("missing admission marker cannot prove zero effect");
+        assert!(missing.contains("COMMAND_RUN_BATCH_MARKER_READ_FAILED"));
+
+        begin_command_run_batch(&workspace, execution_id, &call_ids).expect("batch admission");
+        mark_command_run_batch_call_accepted(&workspace, execution_id, execution_id)
+            .expect("accepted command");
+        let accepted_without_claim =
+            terminalize_interrupted_command_run_claims(&workspace, execution_id, &call_ids)
+                .await
+                .expect_err("accepted command without claim is ambiguous");
+        assert!(
+            accepted_without_claim.contains("COMMAND_RUN_PANIC_CLEANUP_ACCEPTED_WITHOUT_CLAIM")
+        );
+
+        let execution_id = "durable-zero-claim-batch";
+        let call_ids = vec![execution_id.to_string()];
+        begin_command_run_batch(&workspace, execution_id, &call_ids).expect("zero batch admission");
+        assert_eq!(
+            terminalize_interrupted_command_run_claims(&workspace, execution_id, &call_ids,)
+                .await
+                .expect("durable zero effect"),
+            0
+        );
+        let marker: Value = serde_json::from_slice(
+            &fs::read(command_run_batch_path(&workspace, execution_id)).expect("batch marker"),
+        )
+        .expect("batch marker JSON");
+        assert_eq!(marker["state"], "panic_terminalized");
+        assert_eq!(marker["accepted_claim_count"], 0);
+        assert_eq!(marker["zero_effect_proven"], true);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn panic_cleanup_rejects_incomplete_existing_terminal_receipt() {
+        let workspace = std::env::temp_dir().join(format!(
+            "tura-incomplete-receipt-panic-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace");
+        let execution_id = "incomplete-receipt-batch";
+        let call_ids = vec![execution_id.to_string()];
+        begin_command_run_batch(&workspace, execution_id, &call_ids).expect("batch admission");
+        mark_command_run_batch_call_accepted(&workspace, execution_id, execution_id)
+            .expect("running acceptance");
+        write_test_claim(&workspace, execution_id, "running");
+        durable_write_receipt(
+            &command_receipt_path(&workspace, execution_id),
+            &json!({
+                "schema_version": "tura_command_terminal_receipt_v1",
+                "call_id": execution_id,
+                "terminal_state": "interrupted",
+                "termination_proven": false,
+                "process_reaped": false,
+                "process_group_empty": false
+            }),
+        )
+        .expect("incomplete receipt");
+
+        let error = terminalize_interrupted_command_run_claims(&workspace, execution_id, &call_ids)
+            .await
+            .expect_err("incomplete process proof must fail closed");
+        assert!(error.contains("COMMAND_TERMINAL_RECEIPT_PROOF_INCOMPLETE"));
+        let claim: Value = serde_json::from_slice(
+            &fs::read(command_claim_path(&workspace, execution_id)).expect("claim"),
+        )
+        .expect("claim JSON");
+        assert_eq!(claim["state"], "running");
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -1437,11 +2014,13 @@ mod tests {
         assert!(response.success, "{}", response.stderr);
         assert_eq!(response.exit_code, 0);
         assert!(response.stdout.contains("shell-ok"), "{response:?}");
-        assert!(response
-            .output
-            .as_str()
-            .unwrap_or_default()
-            .contains("Exit code: 0"));
+        assert!(
+            response
+                .output
+                .as_str()
+                .unwrap_or_default()
+                .contains("Exit code: 0")
+        );
     }
 
     #[test]
@@ -1451,11 +2030,13 @@ mod tests {
         assert!(!response.success);
         assert_eq!(response.exit_code, 7);
         assert!(response.stderr.contains("shell-bad"), "{response:?}");
-        assert!(response
-            .output
-            .as_str()
-            .unwrap_or_default()
-            .contains("Stderr:"));
+        assert!(
+            response
+                .output
+                .as_str()
+                .unwrap_or_default()
+                .contains("Stderr:")
+        );
     }
 
     #[test]
@@ -1521,10 +2102,12 @@ mod tests {
 
         assert!(!response.success);
         assert_eq!(response.exit_code, -1);
-        assert!(response.output["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Timed out after 1 seconds"));
+        assert!(
+            response.output["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Timed out after 1 seconds")
+        );
         assert_eq!(response.output["outcome"], "unknown");
     }
 
@@ -1601,10 +2184,12 @@ mod tests {
             "stdout should keep bytes read before timeout: {response:?}"
         );
         assert!(response.stderr.contains("Timed out after 1 seconds"));
-        assert!(response.output["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("retained-output"));
+        assert!(
+            response.output["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("retained-output")
+        );
         assert_eq!(response.output["retry_safe"], false);
     }
 

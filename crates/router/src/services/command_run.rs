@@ -34,6 +34,26 @@ pub struct CommandRunRequest {
     pub jspace_contract: Option<Value>,
 }
 
+#[cfg(test)]
+const TEST_PANIC_AFTER_RUNNING_CLAIM: &str = "TURA_TEST_PANIC_AFTER_RUNNING_CLAIM";
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct PanicCleanupGate {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(test)]
+impl PanicCleanupGate {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandRunService {
     active: Arc<AtomicUsize>,
@@ -42,6 +62,9 @@ pub struct CommandRunService {
     next_cancellation_id: Arc<AtomicU64>,
     idle: Arc<tokio::sync::Notify>,
     jspace: JSpaceAdmissionCache,
+    panic_cleanup_quarantine: Arc<Mutex<Vec<PendingPanicCleanup>>>,
+    #[cfg(test)]
+    panic_cleanup_gate: Arc<Mutex<Option<PanicCleanupGate>>>,
 }
 
 impl CommandRunService {
@@ -53,6 +76,9 @@ impl CommandRunService {
             next_cancellation_id: Arc::new(AtomicU64::new(1)),
             idle: Arc::new(tokio::sync::Notify::new()),
             jspace: JSpaceAdmissionCache::default(),
+            panic_cleanup_quarantine: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            panic_cleanup_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -144,33 +170,123 @@ impl CommandRunService {
                 .entry("execution_id".to_string())
                 .or_insert_with(|| Value::String(execution_id.clone()));
         }
-        let worker = tokio::spawn(async move {
+        let (batch_execution_id, batch_call_ids) =
+            code_tools::command_run::command_run_batch_identity(&arguments)
+                .map_err(|error| anyhow!("COMMAND_RUN_BATCH_IDENTITY_INVALID:{error}"))?;
+        let session_directory = request.session_directory;
+        let cleanup_directory = session_directory.clone();
+        #[cfg(test)]
+        let worker_session_directory = session_directory.clone();
+        let worker_session_id = session_id.clone();
+        #[cfg(test)]
+        let worker_call_ids = batch_call_ids.clone();
+        let runtime_id = request.runtime_id;
+        code_tools::shell_executor::begin_command_run_batch(
+            &session_directory,
+            &batch_execution_id,
+            &batch_call_ids,
+        )
+        .map_err(|error| anyhow!("COMMAND_RUN_BATCH_ADMISSION_FAILED:{error}"))?;
+        let panic_cleanup_quarantine = Arc::clone(&self.panic_cleanup_quarantine);
+        #[allow(unused_mut)]
+        let mut command_env = request.command_env;
+        #[cfg(test)]
+        let panic_after_running_claim =
+            command_env.remove(TEST_PANIC_AFTER_RUNNING_CLAIM).is_some();
+        #[cfg(test)]
+        let panic_cleanup_gate = self.panic_cleanup_gate.lock().clone();
+        let supervisor = tokio::spawn(async move {
             let cancellation = active.cancellation_token();
-            let output = code_tools::registry::with_command_environment(
-                request.command_env,
-                code_tools::command_run::execute_async_value_with_allowed_lock_scope_sandbox_and_cancellation(
-                    arguments,
-                    request.session_directory,
-                    request.allowed_commands,
-                    session_id.clone(),
-                    request.sandbox,
-                    cancellation,
-                ),
-            )
-            .await;
-            drop(active);
-            json!({
-                "status": "finished",
-                "owner": "router",
-                "session_id": session_id,
-                "runtime_id": request.runtime_id,
-                "execution_id": execution_id,
-                "result": output,
-            })
+            let worker_cancellation = cancellation.clone();
+            let worker = tokio::spawn(async move {
+                let execution = code_tools::registry::with_command_environment(
+                    command_env,
+                    code_tools::command_run::execute_async_value_with_allowed_lock_scope_sandbox_and_cancellation(
+                        arguments,
+                        session_directory,
+                        request.allowed_commands,
+                        worker_session_id,
+                        request.sandbox,
+                        worker_cancellation,
+                    ),
+                );
+                #[cfg(test)]
+                let output = if panic_after_running_claim {
+                    let execution = execution;
+                    tokio::pin!(execution);
+                    tokio::select! {
+                        output = &mut execution => output,
+                        _ = Self::wait_for_running_command_claim(
+                            &worker_session_directory,
+                            &worker_call_ids,
+                        ) => panic!("injected command worker panic after running claim"),
+                    }
+                } else {
+                    execution.await
+                };
+                #[cfg(not(test))]
+                let output = execution.await;
+                output
+            });
+
+            match worker.await {
+                Ok(output) => {
+                    code_tools::shell_executor::complete_command_run_batch(
+                        &cleanup_directory,
+                        &batch_execution_id,
+                        &batch_call_ids,
+                    )
+                    .map_err(|error| anyhow!("COMMAND_RUN_BATCH_TERMINALIZATION_FAILED:{error}"))?;
+                    drop(active);
+                    Ok(json!({
+                        "status": "finished",
+                        "owner": "router",
+                        "session_id": session_id,
+                        "runtime_id": runtime_id,
+                        "execution_id": execution_id,
+                        "result": output,
+                    }))
+                }
+                Err(worker_error) => {
+                    cancellation.cancel();
+                    #[cfg(test)]
+                    if let Some(gate) = panic_cleanup_gate {
+                        gate.entered.add_permits(1);
+                        gate.release
+                            .acquire()
+                            .await
+                            .expect("panic cleanup test gate")
+                            .forget();
+                    }
+                    match code_tools::shell_executor::terminalize_interrupted_command_run_claims(
+                        &cleanup_directory,
+                        &batch_execution_id,
+                        &batch_call_ids,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            drop(active);
+                            Err(anyhow!("ROUTER_COMMAND_RUN_WORKER_FAILED:{worker_error}"))
+                        }
+                        Err(cleanup_error) => {
+                            panic_cleanup_quarantine.lock().push(PendingPanicCleanup {
+                                session_directory: cleanup_directory,
+                                batch_execution_id,
+                                batch_call_ids,
+                                active,
+                            });
+                            Err(anyhow!(
+                                "ROUTER_COMMAND_RUN_PANIC_CLEANUP_INCOMPLETE:{worker_error}:{cleanup_error}"
+                            ))
+                        }
+                    }
+                }
+            }
         });
-        worker
+        supervisor
             .await
-            .map_err(|error| anyhow!("ROUTER_COMMAND_RUN_WORKER_FAILED:{error}"))
+            .map_err(|error| anyhow!("ROUTER_COMMAND_RUN_SUPERVISOR_FAILED:{error}"))?
     }
 
     pub fn active_count(&self) -> usize {
@@ -188,11 +304,45 @@ impl CommandRunService {
     pub async fn wait_for_session_idle(&self, session_id: &str) {
         loop {
             let notified = self.idle.notified();
+            self.retry_panic_cleanups_for_session(session_id).await;
             if self.active_count_for_session(session_id) == 0 {
                 return;
             }
-            notified.await;
+            tokio::select! {
+                _ = notified => {},
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+            }
         }
+    }
+
+    async fn retry_panic_cleanups_for_session(&self, session_id: &str) {
+        let pending = {
+            let mut quarantine = self.panic_cleanup_quarantine.lock();
+            let mut pending = Vec::new();
+            let mut index = 0;
+            while index < quarantine.len() {
+                if quarantine[index].active.session_id.as_deref() == Some(session_id) {
+                    pending.push(quarantine.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            pending
+        };
+        let mut failed = Vec::new();
+        for pending_cleanup in pending {
+            if code_tools::shell_executor::terminalize_interrupted_command_run_claims(
+                &pending_cleanup.session_directory,
+                &pending_cleanup.batch_execution_id,
+                &pending_cleanup.batch_call_ids,
+            )
+            .await
+            .is_err()
+            {
+                failed.push(pending_cleanup);
+            }
+        }
+        self.panic_cleanup_quarantine.lock().extend(failed);
     }
 
     pub fn cancel_session(&self, session_id: &str) -> usize {
@@ -209,8 +359,46 @@ impl CommandRunService {
     }
 
     #[cfg(test)]
+    fn install_panic_cleanup_gate(&self) -> PanicCleanupGate {
+        let gate = PanicCleanupGate::new();
+        *self.panic_cleanup_gate.lock() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(test)]
     fn jspace_admissions(&self) -> usize {
         self.jspace.admissions()
+    }
+
+    #[cfg(test)]
+    async fn wait_for_running_command_claim(session_directory: &Path, call_ids: &[String]) {
+        let directory = session_directory.join(".tura/run/command_receipts");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let running = std::fs::read_dir(&directory)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| std::fs::read(entry.path()).ok())
+                    .filter_map(|raw| serde_json::from_slice::<Value>(&raw).ok())
+                    .any(|claim| {
+                        claim
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|call_id| {
+                                call_ids.iter().any(|expected| expected == call_id)
+                            })
+                            && claim.get("state").and_then(Value::as_str) == Some("running")
+                    });
+                if running {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test command claim did not reach running state");
     }
 }
 
@@ -288,6 +476,7 @@ fn jspace_error_result(error: JSpaceError) -> Value {
     })
 }
 
+#[derive(Debug)]
 pub(crate) struct ActiveCommandRunGuard {
     active: Arc<AtomicUsize>,
     active_by_session: Arc<Mutex<HashMap<String, usize>>>,
@@ -296,6 +485,14 @@ pub(crate) struct ActiveCommandRunGuard {
     cancellation: CancellationToken,
     idle: Arc<tokio::sync::Notify>,
     session_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct PendingPanicCleanup {
+    session_directory: PathBuf,
+    batch_execution_id: String,
+    batch_call_ids: Vec<String>,
+    active: ActiveCommandRunGuard,
 }
 
 impl ActiveCommandRunGuard {
@@ -700,13 +897,136 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_panic_reaps_claimed_process_before_releasing_router_guard() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let receipt_directory = workspace.path().join(".tura/run/command_receipts");
+        let late_effect = workspace.path().join("late-effect.txt");
+        let service = CommandRunService::new();
+        let cleanup_gate = service.install_panic_cleanup_gate();
+        let request = json!({
+            "session_id": "panic-cleanup-session",
+            "runtime_id": "panic-cleanup-runtime",
+            "session_directory": workspace.path(),
+            "command_env": {super::TEST_PANIC_AFTER_RUNNING_CLAIM: "1"},
+            "arguments": {
+                "commands": [{
+                    "command": "shell_command",
+                    "id": "panic-cleanup",
+                    "command_line": json!({
+                        "command": format!(
+                            "sleep 1; printf late > '{}'",
+                            late_effect.display()
+                        ),
+                        "timeout_ms": 10_000
+                    }).to_string(),
+                    "step": 1
+                }]
+            }
+        });
+        let running = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .execute_with_request_id(request, Some("panic-cleanup"))
+                    .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), cleanup_gate.entered.acquire())
+            .await
+            .expect("panic cleanup must reach the deterministic gate")
+            .expect("panic cleanup gate")
+            .forget();
+        let claim: Value = serde_json::from_slice(
+            &std::fs::read(receipt_directory.join("panic-cleanup.claim.json"))
+                .expect("explicit-id claim"),
+        )
+        .expect("explicit-id claim JSON");
+        let pid = claim["pid"].as_u64().expect("spawned command pid") as u32;
+        assert_eq!(claim["state"], "running", "{claim}");
+        assert_eq!(service.active_count_for_session("panic-cleanup-session"), 1);
+        assert_eq!(service.cancel_session("panic-cleanup-session"), 1);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                service.wait_for_session_idle("panic-cleanup-session")
+            )
+            .await
+            .is_err(),
+            "Router must remain active while panic cleanup is pending"
+        );
+        assert!(!receipt_directory.join("panic-cleanup.json").exists());
+
+        cleanup_gate.release.add_permits(1);
+        let error = running
+            .await
+            .expect("outer Router task")
+            .expect_err("worker panic must remain a Router error");
+        assert!(
+            error
+                .to_string()
+                .contains("ROUTER_COMMAND_RUN_WORKER_FAILED"),
+            "{error:#}"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.wait_for_session_idle("panic-cleanup-session"),
+        )
+        .await
+        .expect("Router may become idle only after panic cleanup");
+        assert_eq!(service.active_count_for_session("panic-cleanup-session"), 0);
+
+        let claim: Value = serde_json::from_slice(
+            &std::fs::read(receipt_directory.join("panic-cleanup.claim.json"))
+                .expect("terminal explicit-id claim"),
+        )
+        .expect("terminal explicit-id claim JSON");
+        let receipt: Value = serde_json::from_slice(
+            &std::fs::read(receipt_directory.join("panic-cleanup.json"))
+                .expect("explicit-id receipt"),
+        )
+        .expect("explicit-id receipt JSON");
+        assert_eq!(claim["execution_count"], 1, "{claim}");
+        assert_eq!(claim["state"], "interrupted", "{claim}");
+        assert_eq!(receipt["terminal_state"], "interrupted", "{receipt}");
+        assert_eq!(receipt["failure_class"], "worker_panic", "{receipt}");
+        assert_eq!(receipt["outcome"], "unknown", "{receipt}");
+        assert_eq!(receipt["retry_safe"], false, "{receipt}");
+        assert_eq!(receipt["reconcile_required"], true, "{receipt}");
+        assert_eq!(receipt["process_reaped"], true, "{receipt}");
+        assert_eq!(receipt["process_group_empty"], true, "{receipt}");
+        assert!(
+            !std::process::Command::new("/bin/kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .status()
+                .expect("probe command pid")
+                .success(),
+            "panic-cleaned command pid {pid} must not remain alive"
+        );
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(
+            !late_effect.exists(),
+            "command effect continued after panic cleanup"
+        );
+    }
+
     #[tokio::test]
     async fn malformed_request_has_zero_router_admission_and_zero_command_effect() {
         let workspace = tempfile::tempdir().expect("workspace");
         let service = CommandRunService::new();
 
         service
-            .execute_with_request_id(json!({"invalid": true}), Some("zero-admission"))
+            .execute_with_request_id(
+                json!({
+                    "session_id": 42,
+                    "session_directory": workspace.path(),
+                    "arguments": {"commands": []}
+                }),
+                Some("zero-admission"),
+            )
             .await
             .expect_err("malformed payload must fail before Router admission");
 

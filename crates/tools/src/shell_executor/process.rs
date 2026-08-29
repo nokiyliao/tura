@@ -1,5 +1,7 @@
 #![allow(unsafe_code)]
 
+#[cfg(windows)]
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -31,8 +33,11 @@ pub(super) fn configure_tokio_process_scope(command: &mut tokio::process::Comman
     configure_tokio_platform_spawn(command);
 }
 
-pub(super) fn attach_shell_process_scope(pid: u32) -> Option<ShellProcessScope> {
-    ShellProcessScope::attach(pid)
+pub(super) fn attach_shell_process_scope(
+    pid: u32,
+    owner_scope: Option<&str>,
+) -> Option<ShellProcessScope> {
+    ShellProcessScope::attach(pid, owner_scope)
 }
 
 pub(super) fn terminate_process_tree(pid: u32) {
@@ -41,6 +46,42 @@ pub(super) fn terminate_process_tree(pid: u32) {
 
 pub(super) fn process_is_alive(pid: u32) -> bool {
     process_is_alive_platform(pid)
+}
+
+pub(super) fn panic_cleanup_process_scope_empty(
+    owner_scope: &str,
+    pid: u32,
+) -> Result<bool, String> {
+    #[cfg(not(windows))]
+    let _ = owner_scope;
+    #[cfg(unix)]
+    unsafe {
+        return Ok(kill(-(pid as i32), 0) != 0);
+    }
+    #[cfg(windows)]
+    {
+        let mut proofs = windows_panic_scope_proofs()
+            .lock()
+            .expect("Windows panic scope proof registry poisoned");
+        let key = (owner_scope.to_string(), pid);
+        let empty = proofs.get(&key).copied().ok_or_else(|| {
+            format!("WINDOWS_JOB_OBJECT_PANIC_CLEANUP_PROOF_MISSING:{owner_scope}:{pid}")
+        })?;
+        if empty {
+            proofs.remove(&key);
+        }
+        return Ok(empty);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(format!("PANIC_CLEANUP_PROCESS_SCOPE_UNSUPPORTED:{pid}"))
+    }
+}
+
+#[cfg(windows)]
+fn windows_panic_scope_proofs() -> &'static Mutex<HashMap<(String, u32), bool>> {
+    static PROOFS: OnceLock<Mutex<HashMap<(String, u32), bool>>> = OnceLock::new();
+    PROOFS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub(super) fn retain_shell_process_scope(scope: ShellProcessScope, owner_scope: Option<&str>) {
@@ -135,7 +176,7 @@ fn collect_descendant_processes(root_pid: u32) -> Vec<u32> {
     use std::collections::{HashMap, HashSet};
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
 
@@ -182,7 +223,7 @@ fn collect_descendant_processes(root_pid: u32) -> Vec<u32> {
 #[cfg(windows)]
 fn terminate_process(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
     unsafe {
         let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
@@ -200,7 +241,15 @@ fn process_is_alive_platform(_pid: u32) -> bool {
     true
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn terminate_platform_process_tree(pid: u32) {
+    unsafe {
+        let _ = kill(-(pid as i32), SIGTERM);
+        let _ = kill(-(pid as i32), SIGKILL);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn terminate_platform_process_tree(_pid: u32) {}
 
 #[cfg(unix)]
@@ -217,6 +266,8 @@ fn process_is_alive_platform(_pid: u32) -> bool {
 #[derive(Debug)]
 pub(super) struct ShellProcessScope {
     job: windows_sys::Win32::Foundation::HANDLE,
+    pid: u32,
+    owner_scope: Option<String>,
 }
 
 #[cfg(windows)]
@@ -227,12 +278,12 @@ unsafe impl Sync for ShellProcessScope {}
 
 #[cfg(windows)]
 impl ShellProcessScope {
-    fn attach(pid: u32) -> Option<Self> {
+    fn attach(pid: u32, owner_scope: Option<&str>) -> Option<Self> {
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
         use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
         };
         use windows_sys::Win32::System::Threading::{
             OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
@@ -270,7 +321,11 @@ impl ShellProcessScope {
                 return None;
             }
 
-            Some(Self { job })
+            Some(Self {
+                job,
+                pid,
+                owner_scope: owner_scope.map(str::to_string),
+            })
         }
     }
 
@@ -282,8 +337,8 @@ impl ShellProcessScope {
 
     pub(super) fn has_live_members(&self) -> bool {
         use windows_sys::Win32::System::JobObjects::{
-            JobObjectBasicAccountingInformation, QueryInformationJobObject,
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
         };
 
         unsafe {
@@ -303,6 +358,22 @@ impl ShellProcessScope {
 #[cfg(windows)]
 impl Drop for ShellProcessScope {
     fn drop(&mut self) {
+        let had_live_members = self.has_live_members();
+        let mut empty = !had_live_members;
+        if had_live_members {
+            self.terminate();
+            let started = std::time::Instant::now();
+            while self.has_live_members() && started.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            empty = !self.has_live_members();
+            if let Some(owner_scope) = self.owner_scope.as_ref() {
+                windows_panic_scope_proofs()
+                    .lock()
+                    .expect("Windows panic scope proof registry poisoned")
+                    .insert((owner_scope.clone(), self.pid), empty);
+            }
+        }
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.job);
         }
@@ -317,7 +388,7 @@ pub(super) struct ShellProcessScope {
 
 #[cfg(unix)]
 impl ShellProcessScope {
-    fn attach(pid: u32) -> Option<Self> {
+    fn attach(pid: u32, _owner_scope: Option<&str>) -> Option<Self> {
         Some(Self { pgid: pid as i32 })
     }
 
@@ -333,13 +404,22 @@ impl ShellProcessScope {
     }
 }
 
+#[cfg(unix)]
+impl Drop for ShellProcessScope {
+    fn drop(&mut self) {
+        if self.has_live_members() {
+            self.terminate();
+        }
+    }
+}
+
 #[cfg(not(any(unix, windows)))]
 #[derive(Debug)]
 pub(super) struct ShellProcessScope;
 
 #[cfg(not(any(unix, windows)))]
 impl ShellProcessScope {
-    fn attach(_pid: u32) -> Option<Self> {
+    fn attach(_pid: u32, _owner_scope: Option<&str>) -> Option<Self> {
         None
     }
 
@@ -447,7 +527,7 @@ fn configure_tokio_parent_death_signal(_command: &mut tokio::process::Command) {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_shell_process_scope_strategy, ShellProcessScopeStrategy};
+    use super::{ShellProcessScopeStrategy, current_shell_process_scope_strategy};
 
     #[test]
     fn shell_process_scope_strategy_matches_current_platform() {
@@ -495,14 +575,15 @@ mod tests {
         first.args(["-c", "sleep 60"]);
         super::configure_process_scope(&mut first);
         let mut first = first.spawn().expect("first retained process");
-        let first_scope = super::attach_shell_process_scope(first.id()).expect("first scope");
+        let first_scope = super::attach_shell_process_scope(first.id(), None).expect("first scope");
         super::retain_shell_process_scope(first_scope, Some("owner-a"));
 
         let mut second = std::process::Command::new("/bin/sh");
         second.args(["-c", "sleep 60"]);
         super::configure_process_scope(&mut second);
         let mut second = second.spawn().expect("second retained process");
-        let second_scope = super::attach_shell_process_scope(second.id()).expect("second scope");
+        let second_scope =
+            super::attach_shell_process_scope(second.id(), None).expect("second scope");
         super::retain_shell_process_scope(second_scope, Some("owner-b"));
 
         assert_eq!(

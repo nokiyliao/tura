@@ -6,16 +6,20 @@ mod request;
 mod response;
 mod shell;
 
+pub use execution::{
+    begin_command_run_batch, complete_command_run_batch, mark_command_run_batch_call_accepted,
+    terminalize_interrupted_command_run_claims,
+};
 pub(crate) use execution::{
     run_in_process_command_with_terminal_receipt, terminalize_pre_execution_zero_effect,
 };
 pub use process::{
-    current_shell_process_scope_strategy, retained_shell_process_scope_count,
-    retained_shell_process_scope_count_for_scope, terminate_retained_shell_process_scopes,
-    terminate_retained_shell_process_scopes_for_scope, ShellProcessScopeStrategy,
+    ShellProcessScopeStrategy, current_shell_process_scope_strategy,
+    retained_shell_process_scope_count, retained_shell_process_scope_count_for_scope,
+    terminate_retained_shell_process_scopes, terminate_retained_shell_process_scopes_for_scope,
 };
 
-use crate::commands::{apply_patch, command_safety, CommandResponse};
+use crate::commands::{CommandResponse, apply_patch, command_safety};
 use crate::runtime::tool::ToolContext;
 use std::path::Path;
 use std::process::Command;
@@ -284,7 +288,7 @@ pub(crate) fn json_like_output(
 
 #[cfg(test)]
 mod tests {
-    use super::{execute, execute_async, read_batch, request, shell, ShellKind};
+    use super::{ShellKind, execute, execute_async, read_batch, request, shell};
     use crate::runtime::tool::ToolContext;
     use read_batch::space_batched_read_command;
     use request::{embedded_apply_patch_text, parse_shell_request};
@@ -530,16 +534,20 @@ mod tests {
     #[test]
     fn does_not_space_complex_or_single_read_commands() {
         assert!(space_batched_read_command("Get-Content src/a.py", false).is_none());
-        assert!(space_batched_read_command(
-            "Get-Content src/a.py | Select-String needle; Get-Content src/b.py",
-            false
-        )
-        .is_none());
-        assert!(space_batched_read_command(
-            "$files=@('src/a.py','src/b.py'); foreach ($f in $files) { Get-Content $f }",
-            false
-        )
-        .is_none());
+        assert!(
+            space_batched_read_command(
+                "Get-Content src/a.py | Select-String needle; Get-Content src/b.py",
+                false
+            )
+            .is_none()
+        );
+        assert!(
+            space_batched_read_command(
+                "$files=@('src/a.py','src/b.py'); foreach ($f in $files) { Get-Content $f }",
+                false
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -165,10 +165,21 @@ impl CancellationToken {
     }
 
     pub async fn cancelled(&self) {
+        self.cancelled_after_registration(|| {}).await;
+    }
+
+    async fn cancelled_after_registration<F>(&self, registered: F)
+    where
+        F: FnOnce(),
+    {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        registered();
         if self.is_cancelled() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 }
 
@@ -640,6 +651,34 @@ mod tests {
         token.cancel();
         assert!(waiter.await.expect("waiter task"));
         token.cancelled().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_between_waiter_registration_and_state_recheck_cannot_be_lost() {
+        let token = CancellationToken::new();
+        let waiter_token = token.child_token();
+        let registered = Arc::new(std::sync::Barrier::new(2));
+        let cancelled = Arc::new(std::sync::Barrier::new(2));
+        let waiter = tokio::spawn({
+            let registered = Arc::clone(&registered);
+            let cancelled = Arc::clone(&cancelled);
+            async move {
+                waiter_token
+                    .cancelled_after_registration(|| {
+                        registered.wait();
+                        cancelled.wait();
+                    })
+                    .await;
+            }
+        });
+
+        registered.wait();
+        token.cancel();
+        cancelled.wait();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("registered waiter must observe concurrent cancellation")
+            .expect("waiter task");
     }
 
     #[tokio::test]

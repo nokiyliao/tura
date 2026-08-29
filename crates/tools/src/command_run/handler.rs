@@ -1,12 +1,12 @@
 use crate::runtime::tool::{CancellationToken, CommandRouter, ToolCall, ToolContext, ToolPayload};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 #[path = "handler_parse.rs"]
@@ -706,11 +706,37 @@ async fn run_command_run_item(
     }
     let canonical_command = crate::commands::canonical_command(&command.command);
     if canonical_command == "task_status" {
+        let call_id = command_call_id(execution_id, &command);
+        if let Err(error) = crate::shell_executor::mark_command_run_batch_call_accepted(
+            &ctx.session_dir,
+            execution_id,
+            &call_id,
+        ) {
+            return CommandRunItemResult::failed(
+                command.index,
+                command.effective_step(),
+                command.command,
+                error,
+            );
+        }
         return command_run_task_status_result(command);
     }
     if canonical_command == "planning"
         && allowed_commands.is_some_and(|commands| commands.contains("planning"))
     {
+        let call_id = command_call_id(execution_id, &command);
+        if let Err(error) = crate::shell_executor::mark_command_run_batch_call_accepted(
+            &ctx.session_dir,
+            execution_id,
+            &call_id,
+        ) {
+            return CommandRunItemResult::failed(
+                command.index,
+                command.effective_step(),
+                command.command,
+                error,
+            );
+        }
         let response = crate::commands::planning::execute(&command.command_line, &ctx.session_dir);
         return CommandRunItemResult {
             index: command.index,
@@ -752,6 +778,18 @@ async fn run_command_run_item(
             command.effective_step(),
             command_name,
             message,
+        );
+    }
+    if let Err(error) = crate::shell_executor::mark_command_run_batch_call_accepted(
+        &ctx.session_dir,
+        execution_id,
+        &call.call_id,
+    ) {
+        return CommandRunItemResult::failed(
+            command.index,
+            command.effective_step(),
+            command_name,
+            error,
         );
     }
     match router.dispatch(call, ctx, force_exclusive).await {
@@ -965,6 +1003,16 @@ fn command_call_id(execution_id: &str, command: &CommandItem) -> String {
         command.effective_step(),
         command.index
     )
+}
+
+pub fn command_run_batch_identity(arguments: &Value) -> Result<(String, Vec<String>), String> {
+    let args = parse_args(arguments)?;
+    let call_ids = args
+        .commands
+        .iter()
+        .map(|command| command_call_id(&args.execution_id, command))
+        .collect();
+    Ok((args.execution_id, call_ids))
 }
 
 fn normalize_shell_command_arguments(command: &CommandItem) -> Result<Value, String> {
