@@ -393,7 +393,7 @@ mod tests {
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
-    use tura_llm_rust::{strip_thought_blocks, ModelCatalog, ProviderEnumCatalog, Settings};
+    use tura_llm_rust::{ModelCatalog, ProviderEnumCatalog, Settings, strip_thought_blocks};
 
     const REASONING_ENV: &str = "TURA_SESSION_REASONING_EFFORT";
     const ACCEL_ENV: &str = "TURA_SESSION_ACCELERATION_ENABLED";
@@ -532,6 +532,67 @@ mod tests {
                 let provider = &route.providers[0];
                 assert_eq!(provider.provider, "gemini-api");
                 assert_eq!(provider.base_url, "https://google.test/v1beta");
+            },
+        );
+    }
+
+    #[test]
+    fn model_override_is_absent_only_when_the_environment_value_is_absent() {
+        let settings = Settings {
+            provider_base_url: HashMap::new(),
+            routes: HashMap::new(),
+            model_catalog: ModelCatalog::default(),
+            provider_enums: ProviderEnumCatalog::default(),
+        };
+        let fallback = openai_route();
+
+        with_env(MODEL_OVERRIDE_ENV, None, || {
+            let route = session_model_override_route(&settings, &fallback)
+                .expect("an absent override should not fail");
+            assert!(route.is_none());
+        });
+    }
+
+    #[test]
+    fn model_override_rejects_a_malformed_explicit_route() {
+        let settings = Settings {
+            provider_base_url: HashMap::new(),
+            routes: HashMap::new(),
+            model_catalog: ModelCatalog::default(),
+            provider_enums: ProviderEnumCatalog::default(),
+        };
+        let fallback = openai_route();
+
+        with_env(MODEL_OVERRIDE_ENV, Some("missing-route"), || {
+            let error = session_model_override_route(&settings, &fallback)
+                .expect_err("a malformed explicit route must fail");
+            assert_eq!(
+                error,
+                "invalid TURA_SESSION_MODEL_OVERRIDE `missing-route`: expected provider/model"
+            );
+        });
+    }
+
+    #[test]
+    fn model_override_rejects_an_unknown_explicit_provider() {
+        let settings = Settings {
+            provider_base_url: HashMap::new(),
+            routes: HashMap::new(),
+            model_catalog: ModelCatalog::default(),
+            provider_enums: ProviderEnumCatalog::default(),
+        };
+        let fallback = openai_route();
+
+        with_env(
+            MODEL_OVERRIDE_ENV,
+            Some("missing-provider/missing-model"),
+            || {
+                let error = session_model_override_route(&settings, &fallback)
+                    .expect_err("an unknown explicit provider must fail");
+                assert_eq!(
+                    error,
+                    "unknown provider in explicit model selection: missing-provider/missing-model"
+                );
             },
         );
     }
