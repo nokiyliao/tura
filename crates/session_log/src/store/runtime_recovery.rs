@@ -1042,6 +1042,104 @@ mod tests {
     }
 
     #[test]
+    fn terminalization_matrix_closes_only_the_registered_runtime_exactly_once() {
+        let rows = [
+            ("pre_provider_dispatch_failure", false),
+            ("provider_error", true),
+            ("provider_interruption", true),
+            ("provider_timeout", true),
+            ("tool_failure", true),
+            ("post_tool_feed_projection_failure", true),
+            ("explicit_cancel", true),
+            ("client_disconnect_durable_turn", true),
+            ("killed_runtime_worker", true),
+            ("router_restart_recovery", true),
+            ("legacy_orphan_or_stale_runtime", true),
+        ];
+
+        for (source, has_runtime_events) in rows {
+            let fixture = RecoveryFixture::new(&format!("matrix-{source}"));
+            let revision = has_runtime_events
+                .then(|| fixture.commit_events(false))
+                .unwrap_or_default();
+            fixture.interrupt();
+            let reason = if has_runtime_events {
+                RecoveryCloseRuntimeReason::OrphanedRuntime
+            } else {
+                RecoveryCloseRuntimeReason::UnbornRuntime
+            };
+            let receipt_id = format!("terminalization-matrix-{source}");
+            let request = fixture.request(&receipt_id, reason, revision);
+
+            let receipt = match fixture
+                .store
+                .recovery_close_runtime(request.clone())
+                .expect("close matrix runtime")
+            {
+                RecoveryCloseRuntimeOutcome::Closed { receipt } => receipt,
+                other => panic!("matrix row {source} did not close: {other:?}"),
+            };
+            assert_eq!(receipt.runtime_id, fixture.runtime_id, "row={source}");
+            assert_eq!(receipt.session_id, fixture.session_id, "row={source}");
+            assert!(receipt.terminal, "row={source}");
+            assert!(!receipt.lease_active, "row={source}");
+
+            let runtime = fixture
+                .store
+                .get_runtime_lease(GetRuntimeLeaseRequest {
+                    runtime_id: fixture.runtime_id.clone(),
+                    database_path: Some(fixture.database_path.clone()),
+                })
+                .expect("read matrix runtime")
+                .expect("matrix runtime exists");
+            assert!(runtime.terminal, "row={source}");
+            assert!(!runtime.lease_active, "row={source}");
+
+            let (feed, _) = fixture
+                .store
+                .read_session_feed(ReadSessionFeedRequest {
+                    session_id: fixture.session_id.clone(),
+                    after_cursor: 0,
+                    limit: 100,
+                })
+                .expect("read matrix terminal feed");
+            let terminal_projection_count = feed
+                .iter()
+                .filter(|entry| {
+                    entry.event_id
+                        == format!("runtime-recovery:{receipt_id}:session-projection")
+                        && matches!(entry.event, SessionFeedEvent::SessionProjectionUpdated { .. })
+                })
+                .count();
+            assert_eq!(terminal_projection_count, 1, "row={source}");
+            assert_eq!(fixture.recovery_receipt_count(&receipt_id), 1, "row={source}");
+
+            let other_terminal_count = fixture
+                .store
+                .with_workspace_connection(Path::new(&fixture.database_path), |conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM runtimes WHERE terminal = 1 AND runtime_id != ?1",
+                        params![fixture.runtime_id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .map_err(Into::into)
+                })
+                .expect("count non-target terminal runtimes");
+            assert_eq!(other_terminal_count, 0, "row={source}");
+
+            assert!(matches!(
+                fixture
+                    .store
+                    .recovery_close_runtime(request)
+                    .expect("replay matrix runtime"),
+                RecoveryCloseRuntimeOutcome::AlreadyClosed { ref receipt }
+                    if receipt.runtime_id == fixture.runtime_id
+            ));
+            assert_eq!(fixture.recovery_receipt_count(&receipt_id), 1, "row={source}");
+        }
+    }
+
+    #[test]
     fn unborn_runtime_ignores_unrelated_global_activity_but_rejects_target_liveness() {
         let fixture = RecoveryFixture::new("unborn");
         fixture.interrupt();
