@@ -55,7 +55,37 @@ pub(crate) async fn serve_stdio() -> anyhow::Result<()> {
 /// File (under the instance's db dir) recording the running router daemon's
 /// socket endpoint, so any front can probe-and-connect rather than spawn its own.
 pub(crate) fn router_addr_path() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(path) = ROUTER_ADDR_PATH_OVERRIDE.with(|value| value.borrow().clone()) {
+        return path;
+    }
     session_log_contract::client::default_db_dir().join("router.addr")
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROUTER_ADDR_PATH_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_router_addr_path_for_test<T>(
+    path: &std::path::Path,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<std::path::PathBuf>);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ROUTER_ADDR_PATH_OVERRIDE.with(|value| {
+                value.replace(self.0.take());
+            });
+        }
+    }
+
+    let previous = ROUTER_ADDR_PATH_OVERRIDE.with(|value| value.replace(Some(path.to_path_buf())));
+    let _reset = Reset(previous);
+    operation()
 }
 
 fn publish_router_addr(addr: &std::net::SocketAddr) -> anyhow::Result<()> {
@@ -78,7 +108,29 @@ fn publish_router_addr(addr: &std::net::SocketAddr) -> anyhow::Result<()> {
 }
 
 pub(crate) fn unpublish_router_addr() {
-    let _ = std::fs::remove_file(router_addr_path());
+    let pid = std::process::id();
+    let process_start_time = current_process_start_time(pid);
+    let _ = unpublish_router_addr_if_owned(&router_addr_path(), pid, process_start_time);
+}
+
+fn unpublish_router_addr_if_owned(
+    path: &std::path::Path,
+    pid: u32,
+    process_start_time: Option<u64>,
+) -> bool {
+    let Some(process_start_time) = process_start_time else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(endpoint) = serde_json::from_str::<RouterEndpoint>(raw.trim()) else {
+        return false;
+    };
+    if endpoint.pid != Some(pid) || endpoint.process_start_time != Some(process_start_time) {
+        return false;
+    }
+    std::fs::remove_file(path).is_ok()
 }
 
 pub(crate) async fn serve_socket() -> anyhow::Result<()> {
@@ -546,6 +598,29 @@ impl Drop for RouterDaemonLock {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn router_endpoint_unpublish_is_exact_process_owned() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("router.addr");
+        let foreign = RouterEndpoint {
+            addr: "127.0.0.1:1234".to_string(),
+            version: tura_path::instance_version(),
+            binary_sha256: Some("a".repeat(64)),
+            pid: Some(42),
+            process_start_time: Some(77),
+        };
+        let foreign_bytes = serde_json::to_vec(&foreign)?;
+        std::fs::write(&path, &foreign_bytes)?;
+
+        assert!(!unpublish_router_addr_if_owned(&path, 43, Some(77)));
+        assert_eq!(std::fs::read(&path)?, foreign_bytes);
+        assert!(!unpublish_router_addr_if_owned(&path, 42, Some(78)));
+        assert_eq!(std::fs::read(&path)?, foreign_bytes);
+        assert!(unpublish_router_addr_if_owned(&path, 42, Some(77)));
+        assert!(!path.exists());
+        Ok(())
+    }
 
     #[test]
     fn durable_execution_requests_are_detached_from_runtime_socket_disconnect() {

@@ -197,17 +197,22 @@ mod tests {
 
     #[test]
     fn execution_shutdown_sets_daemon_exit_flag() -> anyhow::Result<()> {
+        let endpoint_root = tempfile::tempdir()?;
+        let endpoint_path = endpoint_root.path().join("router.addr");
         let state = build_state();
-        let response = tokio_runtime()?.block_on(handle_ipc_request(
-            &state,
-            IpcRequest {
-                request_id: "shutdown-test".to_string(),
-                kind: "call".to_string(),
-                method: "execution.shutdown".to_string(),
-                payload: json!({}),
-                deadline_ms: None,
-            },
-        ));
+        let runtime = tokio_runtime()?;
+        let response = crate::daemon::with_router_addr_path_for_test(&endpoint_path, || {
+            runtime.block_on(handle_ipc_request(
+                &state,
+                IpcRequest {
+                    request_id: "shutdown-test".to_string(),
+                    kind: "call".to_string(),
+                    method: "execution.shutdown".to_string(),
+                    payload: json!({}),
+                    deadline_ms: None,
+                },
+            ))
+        });
 
         assert!(response.ok, "shutdown failed: {:?}", response.error);
         assert!(state.shutdown.load(Ordering::SeqCst));
@@ -216,6 +221,7 @@ mod tests {
         assert!(response.payload["background_process_scopes_terminated"]
             .as_u64()
             .is_some());
+        assert!(!endpoint_path.exists());
         Ok(())
     }
 
