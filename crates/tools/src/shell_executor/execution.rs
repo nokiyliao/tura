@@ -694,6 +694,68 @@ where
     response
 }
 
+pub(crate) fn terminalize_pre_execution_zero_effect(
+    ctx: &ToolContext,
+    mut response: CommandResponse,
+    timeout_secs: u64,
+    stall_timeout_secs: Option<u64>,
+) -> CommandResponse {
+    let started = Instant::now();
+    if let Err(error) = reconcile_command_execution_claims(&ctx.session_dir, ctx.current_call_id())
+    {
+        response.output = json!({
+            "error_type": "CommandExecutionReconciliationRequired",
+            "failure_class": "duplicate_or_unreconciled_execution",
+            "termination_origin": "command_run_admission",
+            "message": error,
+            "outcome": "unknown",
+            "retry_safe": false,
+            "auto_retry_allowed": false,
+            "reconcile_required": true
+        });
+        return response;
+    }
+    if let Err(error) = claim_command_execution(ctx, timeout_secs, stall_timeout_secs) {
+        response.output = json!({
+            "error_type": "CommandExecutionClaimFailed",
+            "failure_class": "duplicate_or_unreconciled_execution",
+            "termination_origin": "command_run_admission",
+            "message": error,
+            "outcome": "unknown",
+            "retry_safe": false,
+            "auto_retry_allowed": false,
+            "reconcile_required": true
+        });
+        return response;
+    }
+    if let Err(error) = attach_durable_terminal_receipt(
+        &mut response,
+        ctx,
+        None,
+        started,
+        timeout_secs,
+        stall_timeout_secs,
+        "not_started",
+        "pre_execution_zero_effect",
+        "command_run_pre_execution",
+        "known",
+        true,
+        true,
+    ) {
+        response.output = json!({
+            "error_type": "CommandTerminalReceiptWriteFailed",
+            "failure_class": "control_plane_receipt_failure",
+            "termination_origin": "command_run_pre_execution",
+            "message": error,
+            "outcome": "unknown",
+            "retry_safe": false,
+            "auto_retry_allowed": false,
+            "reconcile_required": true
+        });
+    }
+    response
+}
+
 fn command_receipt_path(session_dir: &Path, call_id: &str) -> PathBuf {
     session_dir
         .join(".tura/run/command_receipts")
@@ -877,6 +939,7 @@ fn reconcile_command_execution_claims(
                 | "failed"
                 | "terminated"
                 | "cancelled"
+                | "not_started"
                 | "spawn_failed"
                 | "claim_update_failed"
                 | "interrupted"
@@ -1231,10 +1294,12 @@ async fn drain_stream_tasks(
 
 #[cfg(test)]
 mod tests {
+    use super::super::response::failed_async_response;
     use super::{
         claim_command_execution, command_claim_path, command_receipt_path, read_stream_with_deltas,
         reconcile_command_execution_claims, run_command_with_timeout,
-        run_tokio_command_with_timeout, tail_chars, ProgressClock, SharedOutput,
+        run_tokio_command_with_timeout, tail_chars, terminalize_pre_execution_zero_effect,
+        ProgressClock, SharedOutput,
     };
     use crate::runtime::tool::{ToolContext, ToolRuntimeEvent};
     use serde_json::Value;
@@ -1405,6 +1470,49 @@ mod tests {
             response.output.as_str().unwrap_or_default(),
             response.stderr.as_str()
         );
+    }
+
+    #[test]
+    fn pre_execution_failure_writes_exact_known_zero_effect_receipt() {
+        let workspace = std::env::temp_dir().join(format!(
+            "tura-pre-execution-zero-effect-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace");
+        let call_id = "runtime:call:step:1:index:0";
+        let context = ToolContext::new(workspace.clone()).with_call_id(call_id.to_string());
+        let response = terminalize_pre_execution_zero_effect(
+            &context,
+            failed_async_response("denied before execution", 126),
+            5,
+            None,
+        );
+
+        assert!(!response.success);
+        assert_eq!(response.output["terminal_receipt"]["call_id"], call_id);
+        assert_eq!(
+            response.output["terminal_receipt"]["terminal_state"],
+            "not_started"
+        );
+        assert_eq!(
+            response.output["terminal_receipt"]["failure_class"],
+            "pre_execution_zero_effect"
+        );
+        assert_eq!(response.output["terminal_receipt"]["outcome"], "known");
+        assert_eq!(
+            response.output["terminal_receipt"]["reconcile_required"],
+            false
+        );
+        assert!(command_receipt_path(&workspace, call_id).is_file());
+        let claim: Value = serde_json::from_slice(
+            &fs::read(command_claim_path(&workspace, call_id)).expect("command claim"),
+        )
+        .expect("command claim JSON");
+        assert_eq!(claim["execution_count"], 1);
+        assert_eq!(claim["state"], "not_started");
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]

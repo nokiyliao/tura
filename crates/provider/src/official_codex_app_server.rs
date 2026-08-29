@@ -2570,6 +2570,18 @@ fn validate_terminal_receipt(
             && receipt.get("failure_class").and_then(Value::as_str) == Some("none")
             && receipt.get("exit_code").and_then(Value::as_i64) == Some(0)
             && receipt.get("reconcile_required").and_then(Value::as_bool) == Some(false)
+    } else if receipt.get("terminal_state").and_then(Value::as_str) == Some("not_started") {
+        receipt.get("failure_class").and_then(Value::as_str) == Some("pre_execution_zero_effect")
+            && receipt.get("termination_origin").and_then(Value::as_str)
+                == Some("command_run_pre_execution")
+            && receipt.get("pid").is_some_and(Value::is_null)
+            && receipt
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .is_some_and(|exit_code| exit_code != 0)
+            && receipt.get("reconcile_required").and_then(Value::as_bool) == Some(false)
+            && receipt.get("retry_safe").and_then(Value::as_bool) == Some(false)
+            && receipt.get("auto_retry_allowed").and_then(Value::as_bool) == Some(false)
     } else {
         receipt.get("terminal_state").and_then(Value::as_str) == Some("failed")
             && receipt.get("failure_class").and_then(Value::as_str) == Some("workload_exit_nonzero")
@@ -3126,6 +3138,32 @@ mod interrupted_read_only_reconciliation_tests {
         })
     }
 
+    fn pre_execution_terminal_receipt(call_id: &str) -> Value {
+        json!({
+            "schema_version": "tura_command_terminal_receipt_v1",
+            "call_id": call_id,
+            "pid": null,
+            "terminal_state": "not_started",
+            "failure_class": "pre_execution_zero_effect",
+            "termination_origin": "command_run_pre_execution",
+            "exit_code": 126,
+            "wall_time_ms": 0,
+            "wall_timeout_ms": 300000,
+            "stall_timeout_ms": null,
+            "outcome": "known",
+            "process_reaped": true,
+            "process_group_empty": true,
+            "termination_proven": true,
+            "authority_effect": "none",
+            "authoritative_publication": "unproven",
+            "staging_authority": "none",
+            "retry_safe": false,
+            "auto_retry_allowed": false,
+            "reconcile_required": false,
+            "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof"
+        })
+    }
+
     #[test]
     fn failed_terminal_receipt_requires_explicit_reconciliation() {
         validate_terminal_receipt(
@@ -3141,6 +3179,25 @@ mod interrupted_read_only_reconciliation_tests {
             false,
         )
         .expect_err("failed receipt without reconciliation must remain fail closed");
+        assert!(matches!(
+            error,
+            OfficialCodexAppServerError::UncertainToolEffect { effect_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn pre_execution_zero_effect_receipt_is_accepted_without_retry_authority() {
+        validate_terminal_receipt(
+            0,
+            &pre_execution_terminal_receipt("runtime-test:pre-execution"),
+            false,
+        )
+        .expect("exact not-started receipt should prove a known zero effect");
+
+        let mut ambiguous = pre_execution_terminal_receipt("runtime-test:pre-execution");
+        ambiguous["pid"] = json!(4242);
+        let error = validate_terminal_receipt(0, &ambiguous, false)
+            .expect_err("not-started receipt with a pid must remain fail closed");
         assert!(matches!(
             error,
             OfficialCodexAppServerError::UncertainToolEffect { effect_index: 0, .. }

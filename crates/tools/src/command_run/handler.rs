@@ -493,7 +493,7 @@ async fn execute_async(args: CommandRunArgs, ctx: ToolContext) -> CommandRunOutp
             .push(command);
     }
 
-    let router = CommandRouter::new();
+    let router = Arc::new(CommandRouter::new());
     let mut results = Vec::new();
     let mut cancelled = false;
     let mut cancel_reason = None;
@@ -514,7 +514,7 @@ async fn execute_async(args: CommandRunArgs, ctx: ToolContext) -> CommandRunOutp
             }
         });
         let step_output = run_command_run_step(
-            &router,
+            Arc::clone(&router),
             commands,
             ctx.child(),
             &execution_id,
@@ -581,7 +581,7 @@ fn normalize_command_steps(commands: &mut [CommandItem]) {
 }
 
 async fn run_command_run_step(
-    router: &CommandRouter,
+    router: Arc<CommandRouter>,
     commands: Vec<CommandItem>,
     ctx: ToolContext,
     execution_id: &str,
@@ -593,7 +593,7 @@ async fn run_command_run_step(
 
     for command in commands {
         let force_exclusive = !command
-            .is_macro_command_safe(router, &ctx, execution_id)
+            .is_macro_command_safe(&router, &ctx, execution_id)
             .await;
         if !force_exclusive {
             macro_command_batch.push(command);
@@ -602,7 +602,7 @@ async fn run_command_run_step(
 
         results.extend(
             run_macro_command_batch(
-                router,
+                Arc::clone(&router),
                 std::mem::take(&mut macro_command_batch),
                 ctx.child(),
                 execution_id,
@@ -612,7 +612,7 @@ async fn run_command_run_step(
             .await,
         );
         let result = run_command_run_item(
-            router,
+            &router,
             command,
             ctx.child(),
             execution_id,
@@ -656,7 +656,7 @@ fn is_failed_apply_patch_result(result: &CommandRunItemResult) -> bool {
 }
 
 async fn run_macro_command_batch(
-    router: &CommandRouter,
+    router: Arc<CommandRouter>,
     commands: Vec<CommandItem>,
     ctx: ToolContext,
     execution_id: &str,
@@ -669,15 +669,35 @@ async fn run_macro_command_batch(
 
     let mut in_flight = FuturesUnordered::new();
     for command in commands {
-        in_flight.push(run_command_run_item(
-            router,
-            command,
-            ctx.child(),
-            execution_id,
-            false,
-            allowed_commands,
-            sandbox,
-        ));
+        let index = command.index;
+        let step = command.effective_step();
+        let command_type = crate::commands::canonical_command(&command.command);
+        let router = Arc::clone(&router);
+        let ctx = ctx.child();
+        let execution_id = execution_id.to_string();
+        let allowed_commands = allowed_commands.cloned();
+        let task = tokio::spawn(async move {
+            run_command_run_item(
+                &router,
+                command,
+                ctx,
+                &execution_id,
+                false,
+                allowed_commands.as_ref(),
+                sandbox,
+            )
+            .await
+        });
+        in_flight.push(async move {
+            task.await.unwrap_or_else(|error| {
+                CommandRunItemResult::failed(
+                    index,
+                    step,
+                    command_type,
+                    format!("command task failed before result aggregation: {error}"),
+                )
+            })
+        });
     }
     let mut results = Vec::new();
     while let Some(result) = in_flight.next().await {

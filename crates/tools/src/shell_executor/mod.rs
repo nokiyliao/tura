@@ -6,7 +6,9 @@ mod request;
 mod response;
 mod shell;
 
-pub(crate) use execution::run_in_process_command_with_terminal_receipt;
+pub(crate) use execution::{
+    run_in_process_command_with_terminal_receipt, terminalize_pre_execution_zero_effect,
+};
 pub use process::{
     current_shell_process_scope_strategy, retained_shell_process_scope_count,
     retained_shell_process_scope_count_for_scope, terminate_retained_shell_process_scopes,
@@ -139,10 +141,20 @@ pub async fn execute_async(
         &request.cwd,
         session_dir,
     ) {
-        return response::blocked_command_response(&request.command, &reason);
+        return terminalize_pre_execution_zero_effect(
+            ctx,
+            response::blocked_command_response(&request.command, &reason),
+            request.timeout_secs,
+            request.stall_timeout_secs,
+        );
     }
     if ctx.cancellation.is_cancelled() {
-        return response::failed_async_response("tool task aborted", -1);
+        return terminalize_pre_execution_zero_effect(
+            ctx,
+            response::failed_async_response("tool task aborted", -1),
+            request.timeout_secs,
+            request.stall_timeout_secs,
+        );
     }
     let shell_kind = shell_kind.id();
     let use_zsh = shell_kind == "zsh";
@@ -153,9 +165,14 @@ pub async fn execute_async(
         .unwrap_or_else(|| request.command.clone());
     let mut command = if use_zsh {
         let Some(zsh) = shell::zsh_executable() else {
-            return response::failed_async_response(
-                "zsh executable was not found. Install zsh, set TURA_ZSH_PATH to a valid zsh binary, or use TURA_COMMAND_RUN_SHELL=bash.",
-                127,
+            return terminalize_pre_execution_zero_effect(
+                ctx,
+                response::failed_async_response(
+                    "zsh executable was not found. Install zsh, set TURA_ZSH_PATH to a valid zsh binary, or use TURA_COMMAND_RUN_SHELL=bash.",
+                    127,
+                ),
+                request.timeout_secs,
+                request.stall_timeout_secs,
             );
         };
         let mut command = tokio::process::Command::new(zsh);
