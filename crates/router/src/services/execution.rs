@@ -978,25 +978,6 @@ impl ExecutionService {
         delivery: &TerminalDeliveryIdentity,
     ) -> Result<Value> {
         let store = lifecycle_store(&delivery.commander_session_id)?;
-        let callback = store
-            .callbacks_for_replay()?
-            .into_iter()
-            .find(|record| {
-                record.transaction_id == delivery.transaction_id
-                    && record.event_id == delivery.event_id
-            })
-            .ok_or_else(|| {
-                anyhow!(
-                    "PERSISTED_CALLBACK_FOR_CONTINUATION_NOT_FOUND:{}:{}",
-                    delivery.transaction_id,
-                    delivery.event_id
-                )
-            })?;
-        store.mark_callback_intaken(
-            &callback.transaction_id,
-            &callback.event_id,
-            &callback.callback_payload_sha256,
-        )?;
         let persisted = store
             .callback_continuations_for_replay()?
             .into_iter()
@@ -1004,11 +985,47 @@ impl ExecutionService {
                 record.child_transaction_id == delivery.transaction_id
                     && record.child_event_id == delivery.event_id
             });
-        let continuation = if let Some(record) = persisted {
-            record
+        let (continuation, callback_to_intake) = if let Some(record) = persisted {
+            (record, None)
         } else {
-            ContinuationDispatchRecord::from_callback(&callback)?
+            let callback = store
+                .callbacks_for_replay()?
+                .into_iter()
+                .find(|record| {
+                    record.transaction_id == delivery.transaction_id
+                        && record.event_id == delivery.event_id
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "PERSISTED_CALLBACK_FOR_CONTINUATION_NOT_FOUND:{}:{}",
+                        delivery.transaction_id,
+                        delivery.event_id
+                    )
+                })?;
+            let continuation = ContinuationDispatchRecord::from_callback(&callback)?;
+            (continuation, Some(callback))
         };
+        if continuation.commander_session_id != delivery.commander_session_id
+            || continuation.child_transaction_id != delivery.transaction_id
+            || continuation.child_event_id != delivery.event_id
+            || continuation.child_runtime_id != delivery.runtime_id
+            || delivery.callback_payload_sha256.as_deref()
+                != Some(continuation.callback_payload_sha256.as_str())
+            || delivery.callback_effect_identity.as_ref() != Some(&continuation.effect_identity)
+        {
+            return Err(anyhow!(
+                "CONTINUATION_DELIVERY_IDENTITY_MISMATCH:{}:{}",
+                delivery.transaction_id,
+                delivery.event_id
+            ));
+        }
+        if let Some(callback) = callback_to_intake {
+            store.mark_callback_intaken(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+            )?;
+        }
         match store.prepare_callback_continuation(&continuation)? {
             ContinuationWriteOutcome::AlreadyAcknowledged => {
                 return Ok(continuation_result(&continuation, "already_acknowledged"));
@@ -2647,11 +2664,11 @@ mod tests {
         RouterRecoveryCloseRuntimeRequest, RuntimeLease, TerminalDeliveryIdentity,
         complete_and_ack_callback_continuation, failed_session_retry_root,
         failed_session_runtime_fallback, intake_terminal_receipt, is_historical_terminal_runtime,
-        payload_to_run_agent_request, publish_terminal_failure_callback_from_store,
-        replay_terminal_callbacks_from_store, require_successful_runtime_dispatch,
-        runtime_lease_from_snapshot, runtime_terminal_state_from_snapshot,
-        terminal_runtime_is_current, validate_delegated_input_digest,
-        validate_terminalization_identity,
+        lifecycle_store, payload_to_run_agent_request,
+        publish_terminal_failure_callback_from_store, replay_terminal_callbacks_from_store,
+        require_successful_runtime_dispatch, runtime_lease_from_snapshot,
+        runtime_terminal_state_from_snapshot, terminal_runtime_is_current,
+        validate_delegated_input_digest, validate_terminalization_identity,
     };
     use crate::{build_state, services::manager::ServiceManager};
     use lifecycle::{RuntimeState, SessionProjection, SessionState, TaskPlan};
@@ -3958,14 +3975,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn callback_continuation_completed_restart_finishes_ack_without_second_execution() {
-        let root = tempfile::tempdir().expect("temp lifecycle root");
-        let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Completed);
+    #[tokio::test]
+    async fn callback_ack_completed_restart_recovers_without_second_execution() {
+        let commander_session_id = format!("commander-callback-{}", uuid::Uuid::new_v4());
+        let store = lifecycle_store(&commander_session_id).expect("callback store");
+        let mut receipt = TerminalReceipt::new(
+            TerminalReceiptIdentity::new(
+                "transaction-callback",
+                "event-callback",
+                0,
+                &commander_session_id,
+                "child-callback",
+                "runtime-callback",
+                "lease-callback",
+            ),
+            TerminalState::Completed,
+            1_786_845_600_000,
+        );
+        receipt.audit_metadata.insert(
+            "parent_mission_revision_sha256".to_string(),
+            json!("a".repeat(64)),
+        );
+        receipt.audit_metadata.insert(
+            "delegated_input_sha256".to_string(),
+            json!(session_lifecycle::canonical_value_sha256(&json!(
+                "delegated prompt"
+            ))),
+        );
+        store
+            .write_terminal_receipt(&receipt)
+            .expect("terminal receipt");
+        store
+            .intake("transaction-callback", "event-callback")
+            .expect("receipt intake");
         let callback = DurableCallbackRecord::new(
-            &store
-                .terminal_receipt(&delivery.transaction_id, &delivery.event_id)
-                .expect("receipt"),
+            &receipt,
             json!("child result"),
             json!({"kind": "gateway.callback", "payload": {"body": {"item": {"id": "message-1", "text": "child result"}}}}),
             "a".repeat(64),
@@ -3994,26 +4038,113 @@ mod tests {
         store
             .mark_callback_continuation_completed(&continuation)
             .expect("durable parent completion before crash");
+        store
+            .acknowledge_callback(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+                &callback.effect_identity,
+            )
+            .expect("durable callback ack before crash");
+        store
+            .acknowledge(
+                &callback.transaction_id,
+                &callback.event_id,
+                &continuation.request_id,
+            )
+            .expect("durable receipt ack before crash");
+        let delivery = TerminalDeliveryIdentity {
+            commander_session_id: commander_session_id.clone(),
+            transaction_id: callback.transaction_id.clone(),
+            event_id: callback.event_id.clone(),
+            runtime_id: callback.runtime_id.clone(),
+            callback_payload_sha256: Some(callback.callback_payload_sha256.clone()),
+            callback_effect_identity: Some(callback.effect_identity.clone()),
+        };
         drop(store);
 
-        let reopened = SessionLifecycleStore::open(
-            root.path(),
-            "commander-callback",
-            LifecycleConfig::default(),
-        )
-        .expect("reopen after restart");
-        complete_and_ack_callback_continuation(&reopened, &continuation)
-            .expect("restart finishes ack");
+        let state = build_state();
+        let service = ExecutionService::new();
+        for (field, changed) in [
+            (
+                "transaction",
+                TerminalDeliveryIdentity {
+                    transaction_id: "changed-transaction".to_string(),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "event",
+                TerminalDeliveryIdentity {
+                    event_id: "changed-event".to_string(),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "runtime",
+                TerminalDeliveryIdentity {
+                    runtime_id: "changed-runtime".to_string(),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "payload",
+                TerminalDeliveryIdentity {
+                    callback_payload_sha256: Some("b".repeat(64)),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "effect",
+                TerminalDeliveryIdentity {
+                    callback_effect_identity: Some(CallbackEffectIdentity::Exact {
+                        effect_id: "changed-effect".to_string(),
+                    }),
+                    ..delivery.clone()
+                },
+            ),
+        ] {
+            let error = service
+                .continue_terminal_delivery(&state, &changed)
+                .await
+                .expect_err("changed recovery identity must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(if field == "transaction" || field == "event" {
+                        "PERSISTED_CALLBACK_FOR_CONTINUATION_NOT_FOUND:"
+                    } else {
+                        "CONTINUATION_DELIVERY_IDENTITY_MISMATCH:"
+                    }),
+                "unexpected {field} identity error: {error}"
+            );
+        }
         assert_eq!(
-            reopened
-                .readback()
-                .expect("readback")
-                .acknowledged_callbacks,
-            1
+            service.sessions.lock().len(),
+            0,
+            "enqueue count before recovery"
         );
+
+        let result = service
+            .continue_terminal_delivery(&state, &delivery)
+            .await
+            .expect("restart finishes ack through formal recovery path");
+        assert_eq!(result["status"], "acknowledged_after_restart");
         assert_eq!(
-            reopened.readback().expect("readback").acknowledged_receipts,
-            1
+            service.sessions.lock().len(),
+            0,
+            "provider/enqueue execution delta"
+        );
+
+        let reopened = lifecycle_store(&commander_session_id).expect("reopen after recovery");
+        let readback = reopened.readback().expect("readback");
+        assert_eq!(readback.acknowledged_callbacks, 1);
+        assert_eq!(readback.acknowledged_receipts, 1);
+        assert!(
+            reopened
+                .callbacks_for_replay()
+                .expect("callback replay")
+                .is_empty()
         );
         assert!(
             reopened
@@ -4021,6 +4152,20 @@ mod tests {
                 .expect("continuation replay")
                 .is_empty()
         );
+        assert_eq!(
+            reopened
+                .prepare_callback_continuation(&continuation)
+                .expect("acknowledged continuation readback"),
+            session_lifecycle::ContinuationWriteOutcome::AlreadyAcknowledged
+        );
+        assert!(
+            service
+                .recover_callback_continuations(&state, &commander_session_id)
+                .await
+                .expect("formal replay after recovery")
+                .is_empty()
+        );
+        assert_eq!(service.sessions.lock().len(), 0, "final enqueue count");
     }
 
     #[test]
