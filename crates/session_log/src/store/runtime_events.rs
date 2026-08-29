@@ -1,16 +1,16 @@
+use super::SessionLogStore;
 use super::helpers::{
     append_session_event, replay_session_events, session_state_text, task_management_value,
 };
-use super::SessionLogStore;
 use anyhow::{Context, Result};
 use lifecycle::{
     RuntimeAggregate, RuntimeEvent, RuntimeQuery, RuntimeState, SessionAggregate, SessionCommand,
     SessionManagement, SessionQuery,
 };
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use session_log_contract::{
-    ActivateRuntimeLeaseRequest, CommitRuntimeEventRequest, RegisterRuntimeRequest,
-    ReplayRuntimeRequest, RuntimeEventCommitOutcome, RuntimeLeaseOutcome,
+    ActivateRuntimeLeaseRequest, CommitRuntimeEventRequest, GetRuntimeLeaseRequest,
+    RegisterRuntimeRequest, ReplayRuntimeRequest, RuntimeEventCommitOutcome, RuntimeLeaseOutcome,
     RuntimeRegistrationOutcome, RuntimeReplay, SessionFeedEvent, SessionMetadata,
 };
 use std::path::{Path, PathBuf};
@@ -52,12 +52,8 @@ impl SessionLogStore {
         }
         let outcome = self.with_workspace_connection(&workspace_db_path, |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some((
-                existing_session_id,
-                existing_fallback_from_id,
-                existing_lifecycle_json,
-            )) = tx
-                .query_row(
+            if let Some((existing_session_id, existing_fallback_from_id, existing_lifecycle_json)) =
+                tx.query_row(
                     "SELECT session_id, fallback_from_id, lifecycle_json
                      FROM runtimes WHERE runtime_id = ?1",
                     params![request.runtime_id],
@@ -383,8 +379,50 @@ impl SessionLogStore {
                 Ok(replay_session_events(conn, &session_id)?.state)
             })?;
             self.update_session_index_lifecycle(&session_id, session_state, updated_at)?;
+            if matches!(&outcome, RuntimeEventCommitOutcome::Applied { projection, .. } if projection.state.is_terminal())
+            {
+                let snapshot = self
+                    .get_runtime_lease(GetRuntimeLeaseRequest {
+                        runtime_id: runtime_id.clone(),
+                        database_path: Some(
+                            std::fs::canonicalize(&workspace_db_path)?
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                    })?
+                    .context("terminal runtime disappeared before global proof projection")?;
+                self.project_terminal_runtime_location(&snapshot, &request.idempotency_key)?;
+            }
         }
         Ok(outcome)
+    }
+
+    pub(super) fn project_terminal_runtime_location(
+        &self,
+        snapshot: &session_log_contract::RuntimeLeaseSnapshot,
+        evidence_id: &str,
+    ) -> Result<()> {
+        if !snapshot.terminal || snapshot.lease_active || evidence_id.trim().is_empty() {
+            anyhow::bail!(
+                "terminal location proof requires terminal=1, lease_active=0, and evidence"
+            );
+        }
+        self.with_index_connection(|conn| {
+            conn.execute(
+                "UPDATE runtime_locations SET terminal_proven = 1,
+                 terminal_revision = ?4, terminal_event_seq = ?5, terminal_evidence_id = ?6
+                 WHERE runtime_id = ?1 AND session_id = ?2 AND workspace_db_path = ?3",
+                params![
+                    snapshot.runtime_id,
+                    snapshot.session_id,
+                    snapshot.database_path,
+                    snapshot.revision,
+                    snapshot.last_event_seq,
+                    evidence_id
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn replay_runtime(&self, request: ReplayRuntimeRequest) -> Result<Option<RuntimeReplay>> {

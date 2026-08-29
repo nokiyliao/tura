@@ -27,7 +27,8 @@ impl SessionLogStore {
             })?;
             let page = bounded_page(request.page, page_size, total, false);
             let mut statement = conn.prepare(
-                "SELECT runtime_id, session_id, workspace_db_path
+                "SELECT runtime_id, session_id, workspace_db_path, terminal_proven,
+                        terminal_revision, terminal_event_seq, terminal_evidence_id
                  FROM runtime_locations
                  ORDER BY runtime_id ASC
                  LIMIT ?1 OFFSET ?2",
@@ -38,6 +39,10 @@ impl SessionLogStore {
                         runtime_id: row.get(0)?,
                         session_id: row.get(1)?,
                         workspace_db_path: row.get(2)?,
+                        terminal_proven: row.get(3)?,
+                        terminal_revision: row.get(4)?,
+                        terminal_event_seq: row.get(5)?,
+                        terminal_evidence_id: row.get(6)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;

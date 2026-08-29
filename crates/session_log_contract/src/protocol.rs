@@ -537,6 +537,14 @@ pub struct RuntimeLocation {
     pub runtime_id: String,
     pub session_id: String,
     pub workspace_db_path: String,
+    #[serde(default)]
+    pub terminal_proven: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_event_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_evidence_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

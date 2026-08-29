@@ -1,7 +1,7 @@
 use super::SessionLogStore;
 use anyhow::{Context, Result};
 use fs2::FileExt;
-use rusqlite::{ffi::ErrorCode, Connection};
+use rusqlite::{Connection, ffi::ErrorCode};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -225,6 +225,7 @@ fn sqlite_init_lock_open_error_is_transient(error: &std::io::Error) -> bool {
 }
 
 pub(super) fn init_index_db(conn: &Connection) -> Result<()> {
+    migrate_runtime_locations(conn)?;
     require_canonical_schema(conn, "index", INDEX_SCHEMA)?;
     conn.execute_batch(
         "
@@ -241,7 +242,11 @@ pub(super) fn init_index_db(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS runtime_locations (
             runtime_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
-            workspace_db_path TEXT NOT NULL
+            workspace_db_path TEXT NOT NULL,
+            terminal_proven INTEGER NOT NULL DEFAULT 0,
+            terminal_revision INTEGER,
+            terminal_event_seq INTEGER,
+            terminal_evidence_id TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_runtime_locations_session
             ON runtime_locations(session_id, runtime_id);
@@ -271,6 +276,29 @@ pub(super) fn init_index_db(conn: &Connection) -> Result<()> {
             ON sessions(workspace, last_user_message_at DESC, session_id);
         ",
     )?;
+    Ok(())
+}
+
+fn migrate_runtime_locations(conn: &Connection) -> Result<()> {
+    if !database_tables(conn)?
+        .iter()
+        .any(|table| table == "runtime_locations")
+    {
+        return Ok(());
+    }
+    let columns = table_columns(conn, "runtime_locations")?;
+    for (column, definition) in [
+        ("terminal_proven", "INTEGER NOT NULL DEFAULT 0"),
+        ("terminal_revision", "INTEGER"),
+        ("terminal_event_seq", "INTEGER"),
+        ("terminal_evidence_id", "TEXT"),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE runtime_locations ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -664,7 +692,15 @@ const INDEX_SCHEMA: &[(&str, &[&str])] = &[
     ),
     (
         "runtime_locations",
-        &["runtime_id", "session_id", "workspace_db_path"],
+        &[
+            "runtime_id",
+            "session_id",
+            "workspace_db_path",
+            "terminal_proven",
+            "terminal_revision",
+            "terminal_event_seq",
+            "terminal_evidence_id",
+        ],
     ),
     (
         "command_checkpoints",

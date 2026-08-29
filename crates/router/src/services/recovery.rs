@@ -12,10 +12,17 @@ use session_log_contract::{
     SessionLogResponse, client::call_service,
 };
 use std::collections::BTreeSet;
+use std::io::ErrorKind;
 
 use crate::app::AppState;
 
 const RECOVERY_PAGE_SIZE: u64 = 100;
+
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeLocationRecoveryState {
+    ActiveActionable,
+    TerminalProven,
+}
 
 pub async fn recover_after_start(state: &AppState) -> Result<Value> {
     let session_db_status = state.session_db.start()?;
@@ -56,7 +63,22 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
             if !seen_runtime_ids.insert(runtime_id.clone()) {
                 continue;
             }
-            let snapshot = read_runtime_snapshot(&location)?;
+            if runtime_location_recovery_state(&location)?
+                == RuntimeLocationRecoveryState::TerminalProven
+            {
+                recovered.push(json!({
+                    "runtime_id": runtime_id,
+                    "recovery_action": "terminal_proven",
+                    "terminal_proven": true,
+                    "effect_authorized": false,
+                }));
+                continue;
+            }
+            let Some(database_path) = checked_runtime_database_path(&location)? else {
+                recovered.push(quarantined_missing_database_result(&location));
+                continue;
+            };
+            let snapshot = read_runtime_snapshot(&location, database_path)?;
             inspected = inspected.saturating_add(1);
             if snapshot.terminal && !snapshot.lease_active {
                 if snapshot.lifecycle.is_some()
@@ -111,7 +133,16 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                 | RecoveryCloseRuntimeOutcome::AlreadyClosed { receipt }
                     if receipt.terminal && !receipt.lease_active =>
                 {
-                    let post_snapshot = read_runtime_snapshot(&location)?;
+                    let post_snapshot = read_runtime_snapshot(
+                        &location,
+                        checked_runtime_database_path(&location)?.ok_or_else(|| {
+                            anyhow!(
+                                "STARTUP_RECOVERY_RUNTIME_DATABASE_DISAPPEARED:{}:{}",
+                                location.runtime_id,
+                                location.workspace_db_path
+                            )
+                        })?,
+                    )?;
                     let delivery = if post_snapshot.lifecycle.is_some() {
                         state
                             .execution
@@ -148,18 +179,20 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
     Ok((inspected, recovered))
 }
 
-fn read_runtime_snapshot(location: &RuntimeLocation) -> Result<RuntimeLeaseSnapshot> {
+fn read_runtime_snapshot(
+    location: &RuntimeLocation,
+    database_path: String,
+) -> Result<RuntimeLeaseSnapshot> {
     let runtime_id = &location.runtime_id;
-    let database_path = canonical_runtime_database_path(location)?;
     match call_service(&SessionLogCommand::GetRuntimeLease(
         GetRuntimeLeaseRequest {
             runtime_id: runtime_id.clone(),
-            database_path: Some(database_path),
+            database_path: Some(database_path.clone()),
         },
     ))? {
         SessionLogResponse::RuntimeLeaseRead {
             runtime: Some(runtime),
-        } => validate_runtime_location(location, runtime),
+        } => validate_runtime_location(location, runtime, &database_path),
         SessionLogResponse::RuntimeLeaseRead { runtime: None } => {
             bail!("STARTUP_RECOVERY_RUNTIME_NOT_FOUND:{runtime_id}")
         }
@@ -168,24 +201,68 @@ fn read_runtime_snapshot(location: &RuntimeLocation) -> Result<RuntimeLeaseSnaps
     }
 }
 
-fn canonical_runtime_database_path(location: &RuntimeLocation) -> Result<String> {
-    std::fs::canonicalize(&location.workspace_db_path)
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(|error| {
-            anyhow!(
-                "STARTUP_RECOVERY_RUNTIME_DATABASE_UNAVAILABLE:{}:{}:{}",
-                location.runtime_id,
-                location.workspace_db_path,
-                error
-            )
-        })
+fn checked_runtime_database_path(location: &RuntimeLocation) -> Result<Option<String>> {
+    match std::fs::metadata(&location.workspace_db_path) {
+        Ok(_) => std::fs::canonicalize(&location.workspace_db_path)
+            .map(|path| path.to_string_lossy().into_owned())
+            .map(Some)
+            .map_err(|error| {
+                anyhow!(
+                    "STARTUP_RECOVERY_RUNTIME_DATABASE_UNAVAILABLE:{}:{}:{}",
+                    location.runtime_id,
+                    location.workspace_db_path,
+                    error
+                )
+            }),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow!(
+            "STARTUP_RECOVERY_RUNTIME_DATABASE_UNAVAILABLE:{}:{}:{}",
+            location.runtime_id,
+            location.workspace_db_path,
+            error
+        )),
+    }
+}
+
+fn runtime_location_recovery_state(
+    location: &RuntimeLocation,
+) -> Result<RuntimeLocationRecoveryState> {
+    let proof_complete = location.terminal_revision.is_some()
+        && location.terminal_event_seq.is_some()
+        && location
+            .terminal_evidence_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    let proof_fields_present = location.terminal_revision.is_some()
+        || location.terminal_event_seq.is_some()
+        || location.terminal_evidence_id.is_some();
+    if location.terminal_proven && proof_complete {
+        return Ok(RuntimeLocationRecoveryState::TerminalProven);
+    }
+    if location.terminal_proven || proof_fields_present {
+        bail!(
+            "STARTUP_RECOVERY_MALFORMED_TERMINAL_PROOF:{}",
+            location.runtime_id
+        );
+    }
+    Ok(RuntimeLocationRecoveryState::ActiveActionable)
+}
+
+fn quarantined_missing_database_result(location: &RuntimeLocation) -> Value {
+    json!({
+        "runtime_id": location.runtime_id,
+        "session_id": location.session_id,
+        "recovery_action": "quarantined_missing_database",
+        "terminal_proven": false,
+        "effect_authorized": false,
+    })
 }
 
 fn validate_runtime_location(
     location: &RuntimeLocation,
     runtime: RuntimeLeaseSnapshot,
+    location_database_path: &str,
 ) -> Result<RuntimeLeaseSnapshot> {
-    let location_database_path = canonical_runtime_database_path(location)?;
     if runtime.runtime_id != location.runtime_id
         || runtime.session_id != location.session_id
         || runtime.database_path != location_database_path
@@ -214,10 +291,24 @@ fn startup_recovery_reason(revision: u64, last_event_seq: u64) -> RecoveryCloseR
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_runtime_database_path, startup_recovery_reason, validate_runtime_location,
+        RuntimeLocationRecoveryState, checked_runtime_database_path,
+        quarantined_missing_database_result, runtime_location_recovery_state,
+        startup_recovery_reason, validate_runtime_location,
     };
     use lifecycle::SessionState;
     use session_log_contract::{RecoveryCloseRuntimeReason, RuntimeLeaseSnapshot, RuntimeLocation};
+
+    fn location(database_path: String) -> RuntimeLocation {
+        RuntimeLocation {
+            runtime_id: "runtime-1".to_string(),
+            session_id: "session-1".to_string(),
+            workspace_db_path: database_path,
+            terminal_proven: false,
+            terminal_revision: None,
+            terminal_event_seq: None,
+            terminal_evidence_id: None,
+        }
+    }
 
     #[test]
     fn startup_recovery_classifies_unborn_and_published_runtime_shapes() {
@@ -241,11 +332,7 @@ mod tests {
             .expect("current test executable")
             .to_string_lossy()
             .into_owned();
-        let location = RuntimeLocation {
-            runtime_id: "runtime-1".to_string(),
-            session_id: "session-1".to_string(),
-            workspace_db_path: database_path.clone(),
-        };
+        let location = location(database_path.clone());
         let runtime = RuntimeLeaseSnapshot {
             database_path: database_path.clone(),
             runtime_id: "runtime-1".to_string(),
@@ -260,7 +347,7 @@ mod tests {
             session_state: SessionState::Running,
             runtime_state: None,
         };
-        let error = validate_runtime_location(&location, runtime)
+        let error = validate_runtime_location(&location, runtime, &database_path)
             .expect_err("identity drift must block startup recovery");
         assert_eq!(
             error.to_string(),
@@ -271,19 +358,62 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_rejects_missing_registered_database() {
-        let location = RuntimeLocation {
-            runtime_id: "runtime-missing".to_string(),
-            session_id: "session-missing".to_string(),
-            workspace_db_path: "/definitely-missing/tura/session_log.sqlite3".to_string(),
-        };
-        let error = canonical_runtime_database_path(&location)
-            .expect_err("missing registered database must block startup recovery");
+    fn startup_recovery_quarantines_missing_registered_database_without_terminal_proof() {
+        let mut location = location("/definitely-missing/tura/session_log.sqlite3".to_string());
+        location.runtime_id = "runtime-missing".to_string();
+        location.session_id = "session-missing".to_string();
+        assert_eq!(
+            checked_runtime_database_path(&location).expect("definite absence is nonblocking"),
+            None
+        );
+        assert_eq!(
+            quarantined_missing_database_result(&location),
+            serde_json::json!({
+                "runtime_id": "runtime-missing",
+                "session_id": "session-missing",
+                "recovery_action": "quarantined_missing_database",
+                "terminal_proven": false,
+                "effect_authorized": false,
+            })
+        );
+    }
+
+    #[test]
+    fn startup_recovery_blocks_database_io_errors() {
+        let location = location(
+            std::env::current_exe()
+                .expect("current test executable")
+                .join("not-a-database")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let error = checked_runtime_database_path(&location)
+            .expect_err("non-not-found metadata errors must block startup recovery");
         assert!(
-            error.to_string().starts_with(
-                "STARTUP_RECOVERY_RUNTIME_DATABASE_UNAVAILABLE:runtime-missing:/definitely-missing/tura/session_log.sqlite3:"
-            ),
-            "unexpected blocker: {error:#}"
+            error
+                .to_string()
+                .starts_with("STARTUP_RECOVERY_RUNTIME_DATABASE_UNAVAILABLE:runtime-1:")
+        );
+    }
+
+    #[test]
+    fn startup_recovery_skips_only_complete_terminal_proof() {
+        let mut location = location("/unused".to_string());
+        location.terminal_proven = true;
+        location.terminal_revision = Some(4);
+        location.terminal_event_seq = Some(9);
+        location.terminal_evidence_id = Some("receipt-4".to_string());
+        assert_eq!(
+            runtime_location_recovery_state(&location).expect("complete proof is skippable"),
+            RuntimeLocationRecoveryState::TerminalProven
+        );
+
+        location.terminal_evidence_id = None;
+        let error = runtime_location_recovery_state(&location)
+            .expect_err("malformed terminal proof must block");
+        assert_eq!(
+            error.to_string(),
+            "STARTUP_RECOVERY_MALFORMED_TERMINAL_PROOF:runtime-1"
         );
     }
 }

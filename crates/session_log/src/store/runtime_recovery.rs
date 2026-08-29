@@ -109,7 +109,7 @@ impl SessionLogStore {
     ) -> Result<RecoveryCloseRuntimeOutcome> {
         validate_request(&request)?;
         let workspace_db_path = exact_database_path(&request.database_path)?;
-        self.with_workspace_connection(&workspace_db_path, |conn| {
+        let outcome = self.with_workspace_connection(&workspace_db_path, |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let canonical_request = serde_json::to_string(&CanonicalRecoveryRequest {
                 database_path: &request.database_path,
@@ -438,7 +438,19 @@ impl SessionLogStore {
             )?;
             tx.commit()?;
             Ok(RecoveryCloseRuntimeOutcome::Closed { receipt })
-        })
+        })?;
+        if let RecoveryCloseRuntimeOutcome::Closed { receipt }
+        | RecoveryCloseRuntimeOutcome::AlreadyClosed { receipt } = &outcome
+        {
+            let snapshot = self
+                .get_runtime_lease(GetRuntimeLeaseRequest {
+                    runtime_id: receipt.runtime_id.clone(),
+                    database_path: Some(workspace_db_path.to_string_lossy().into_owned()),
+                })?
+                .context("terminal recovery runtime disappeared before global proof projection")?;
+            self.project_terminal_runtime_location(&snapshot, &receipt.receipt_id)?;
+        }
+        Ok(outcome)
     }
 }
 
