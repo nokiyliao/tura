@@ -8,7 +8,7 @@ import { startBackendStressEnvironment } from "./full_chain_backend_fixture.mjs"
 
 if (process.env.TURA_P5_HARD_CRASH_E2E !== "1") throw new Error("TURA_P5_HARD_CRASH_E2E=1 is required");
 const fake = path.join(import.meta.dirname, "fake_official_codex_commander.mjs");
-const backend = await startBackendStressEnvironment({ runIdPrefix: "commander-convergence-hard-crash-v5", officialCodexAppServer: fake, sessionModel: "official_codex_app_server/gpt-5.6-sol", config: { workspaces: 1, tasksPerWorkspace: 1, turnsPerSession: 1, liveSessionTarget: 0, ensureBuilds: true, totalTimeoutMs: 240_000 } });
+const backend = await startBackendStressEnvironment({ runIdPrefix: "commander-convergence-hard-crash-v6", officialCodexAppServer: fake, sessionModel: "official_codex_app_server/gpt-5.6-sol", config: { workspaces: 1, tasksPerWorkspace: 1, turnsPerSession: 1, liveSessionTarget: 0, ensureBuilds: true, totalTimeoutMs: 240_000 } });
 try {
   const parent = backend.targetSession;
   const statePath = path.join(parent.workspace, ".tura", "p5-fake-commander-state.json");

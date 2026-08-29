@@ -715,18 +715,21 @@ impl ExecutionService {
                     request.runtime_id
                 ));
             }
-            matching.first().and_then(|record| {
-                let binding = commander_continuation_binding(record).ok()?;
-                let snapshot = read_session_snapshot(&request.session_id).ok().flatten()?;
-                terminal_commander_convergence_recovery_evidence(
-                    std::path::Path::new(&snapshot.metadata.session_directory),
-                    &request.session_id,
-                    &request.runtime_id,
-                    &binding,
-                )
-                .ok()
-                .flatten()
-            })
+            match matching.first() {
+                Some(record) => {
+                    let binding = commander_continuation_binding(record)?;
+                    match read_session_snapshot(&request.session_id)? {
+                        Some(snapshot) => terminal_commander_convergence_recovery_evidence(
+                            std::path::Path::new(&snapshot.metadata.session_directory),
+                            &request.session_id,
+                            &request.runtime_id,
+                            &binding,
+                        )?,
+                        None => None,
+                    }
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -3402,14 +3405,15 @@ mod tests {
     use super::{
         EnqueueTurnRequest, ExecutionService, RetryRuntimeIdentity,
         RouterRecoveryCloseRuntimeRequest, RuntimeLease, TerminalDeliveryIdentity,
-        commander_convergence_proof_from_runtime, complete_and_ack_callback_continuation,
+        commander_continuation_binding, commander_convergence_proof_from_runtime,
+        complete_and_ack_callback_continuation,
         failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
         is_historical_terminal_runtime, payload_to_run_agent_request,
         publish_terminal_failure_callback_from_store, replay_terminal_callbacks_from_store,
         require_successful_runtime_dispatch, runtime_lease_from_snapshot,
         runtime_terminal_state_from_snapshot, terminal_runtime_is_current,
         validate_child_runtime_identity, validate_delegated_input_digest,
-        validate_terminalization_identity,
+        terminal_commander_convergence_recovery_evidence, validate_terminalization_identity,
     };
     use crate::{build_state, services::manager::ServiceManager};
     use chrono::Utc;
@@ -5032,6 +5036,67 @@ mod tests {
                 .expect_err("final answer hash mismatch must fail at Router replay")
                 .to_string()
                 .contains("COMMANDER_CONVERGENCE_FINAL_ASSISTANT_HASH_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn startup_convergence_evidence_distinguishes_absence_from_loader_errors() {
+        let receipt = callback_receipt(TerminalState::Completed);
+        let mut callback = DurableCallbackRecord::new(
+            &receipt,
+            json!("child result"),
+            json!({"kind": "gateway.callback"}),
+            "a".repeat(64),
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            CallbackEffectIdentity::Exact {
+                effect_id: "message-1".to_string(),
+            },
+        )
+        .expect("callback");
+        callback.commander_thread_id = Some("commander-thread-1".to_string());
+        let record = ContinuationDispatchRecord::from_callback(&callback).expect("continuation");
+        let binding = commander_continuation_binding(&record).expect("binding");
+
+        let absent = tempfile::tempdir().expect("absent ledger root");
+        assert!(
+            terminal_commander_convergence_recovery_evidence(
+                absent.path(),
+                &record.commander_session_id,
+                &record.runtime_id,
+                &binding,
+            )
+            .expect("true absence")
+            .is_none()
+        );
+
+        let malformed = tempfile::tempdir().expect("malformed ledger root");
+        let ledger_root = malformed.path().join(".tura/run/effect_ledgers");
+        std::fs::create_dir_all(&ledger_root).expect("ledger directory");
+        std::fs::write(ledger_root.join("malformed.json"), b"{").expect("malformed ledger");
+        assert!(
+            terminal_commander_convergence_recovery_evidence(
+                malformed.path(),
+                &record.commander_session_id,
+                &record.runtime_id,
+                &binding,
+            )
+            .is_err()
+        );
+
+        let overfull = tempfile::tempdir().expect("overfull ledger root");
+        let ledger_root = overfull.path().join(".tura/run/effect_ledgers");
+        std::fs::create_dir_all(&ledger_root).expect("ledger directory");
+        for index in 0..257 {
+            std::fs::write(ledger_root.join(format!("{index:03}.json")), b"{}").expect("ledger");
+        }
+        assert!(
+            terminal_commander_convergence_recovery_evidence(
+                overfull.path(),
+                &record.commander_session_id,
+                &record.runtime_id,
+                &binding,
+            )
+            .is_err()
         );
     }
 
