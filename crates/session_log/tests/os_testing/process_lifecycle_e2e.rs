@@ -7,11 +7,12 @@
 #[path = "../support/typed_session.rs"]
 mod typed_session;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use lifecycle::{SessionCommand, SessionState, TaskPlan};
 use session_log_contract::{
-    GetSessionRequest, ListSessionRecordsRequest, ListSessionsRequest, SessionLogCommand,
-    SessionLogResponse,
+    ActivateRuntimeLeaseRequest, GetRuntimeLeaseRequest, GetSessionRequest,
+    ListSessionRecordsRequest, ListSessionsRequest, ReadSessionFeedRequest, RegisterRuntimeRequest,
+    RuntimeLeaseOutcome, RuntimeRegistrationOutcome, SessionLogCommand, SessionLogResponse,
 };
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -168,8 +169,7 @@ fn session_db_single_owner_bad_input_idempotent_delta_and_shutdown() -> Result<(
 }
 
 #[test]
-fn session_db_restart_after_crash_marks_running_sessions_interrupted_and_keeps_history(
-) -> Result<()> {
+fn session_db_restart_preserves_running_session_with_active_runtime_lease() -> Result<()> {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let root = temp_root("session-db-crash-restart")?;
     let home = root.join("home");
@@ -196,6 +196,37 @@ fn session_db_restart_after_crash_marks_running_sessions_interrupted_and_keeps_h
         "before crash",
     )?;
     typed_session::execute_via_service(&session_id, SessionCommand::StartUserTurn)?;
+    let runtime_id = format!("runtime-{session_id}");
+    let lease_id = format!("lease-{session_id}");
+    assert!(matches!(
+        session_log_contract::client::call_service(&SessionLogCommand::RegisterRuntime(
+            RegisterRuntimeRequest {
+                runtime_id: runtime_id.clone(),
+                session_id: session_id.clone(),
+                fallback_from_id: None,
+                lifecycle: None,
+            }
+        ))?,
+        SessionLogResponse::RuntimeRegistered {
+            result: RuntimeRegistrationOutcome::Registered { .. }
+        }
+    ));
+    assert!(matches!(
+        session_log_contract::client::call_service(&SessionLogCommand::ActivateRuntimeLease(
+            ActivateRuntimeLeaseRequest {
+                runtime_id: runtime_id.clone(),
+                lease_id: lease_id.clone(),
+            }
+        ))?,
+        SessionLogResponse::RuntimeLeaseActivated {
+            result: RuntimeLeaseOutcome::Activated
+        }
+    ));
+    let before_runtime = runtime_snapshot(&runtime_id)?;
+    let before_feed = session_feed(&session_id)?;
+    assert_eq!(before_runtime.session_state, SessionState::Running);
+    assert!(before_runtime.lease_active);
+    assert!(!before_runtime.terminal);
 
     first.kill_and_wait(Duration::from_secs(10))?;
     assert!(
@@ -203,11 +234,16 @@ fn session_db_restart_after_crash_marks_running_sessions_interrupted_and_keeps_h
         "crashed endpoint should be detected as stale and removed"
     );
 
+    let restart_started = Instant::now();
     let mut second = ServiceGuard::start(&home)?;
     wait_until(
-        Duration::from_secs(30),
+        Duration::from_secs(5),
         session_log_contract::client::service_is_running,
     )?;
+    assert!(
+        restart_started.elapsed() < Duration::from_secs(5),
+        "session_db restart should become reachable without a scan-sized timeout"
+    );
     assert_ne!(
         std::fs::read_to_string(service_addr_path(&home))?,
         first_endpoint,
@@ -222,12 +258,9 @@ fn session_db_restart_after_crash_marks_running_sessions_interrupted_and_keeps_h
         SessionLogResponse::Session { session } => {
             let session = session.ok_or_else(|| anyhow!("expected recovered session"))?;
             assert_eq!(session.session_id, session_id);
-            assert_eq!(
-                session.lifecycle_projection.state,
-                SessionState::Interrupted
-            );
-            assert_eq!(session.lifecycle_projection.state.ui_status(), "error");
-            assert_eq!(session.management.state, SessionState::Interrupted);
+            assert_eq!(session.lifecycle_projection.state, SessionState::Running);
+            assert_eq!(session.lifecycle_projection.state.ui_status(), "busy");
+            assert_eq!(session.management.state, SessionState::Running);
             assert_eq!(session.message_count, 1);
         }
         other => bail!("unexpected get response after restart: {other:?}"),
@@ -248,12 +281,57 @@ fn session_db_restart_after_crash_marks_running_sessions_interrupted_and_keeps_h
         other => bail!("unexpected records response after restart: {other:?}"),
     }
 
+    let after_runtime = runtime_snapshot(&runtime_id)?;
+    assert_eq!(after_runtime.session_id, session_id);
+    assert_eq!(after_runtime.lease_id.as_deref(), Some(lease_id.as_str()));
+    assert!(after_runtime.lease_active);
+    assert!(!after_runtime.terminal);
+    assert_eq!(after_runtime.session_state, SessionState::Running);
+    assert_eq!(after_runtime.revision, before_runtime.revision);
+    assert_eq!(after_runtime.last_event_seq, before_runtime.last_event_seq);
+    assert_eq!(
+        after_runtime.session_event_seq,
+        before_runtime.session_event_seq
+    );
+    assert_eq!(
+        session_feed(&session_id)?,
+        before_feed,
+        "session_db restart must not append an interrupt receipt or feed event"
+    );
+
     assert!(matches!(
         session_log_contract::client::call_service(&SessionLogCommand::Shutdown)?,
         SessionLogResponse::Ok
     ));
     second.wait_for_exit(Duration::from_secs(10))?;
     Ok(())
+}
+
+fn runtime_snapshot(runtime_id: &str) -> Result<session_log_contract::RuntimeLeaseSnapshot> {
+    match session_log_contract::client::call_service(&SessionLogCommand::GetRuntimeLease(
+        GetRuntimeLeaseRequest {
+            runtime_id: runtime_id.to_string(),
+            database_path: None,
+        },
+    ))? {
+        SessionLogResponse::RuntimeLeaseRead {
+            runtime: Some(runtime),
+        } => Ok(runtime),
+        other => bail!("unexpected runtime lease response: {other:?}"),
+    }
+}
+
+fn session_feed(session_id: &str) -> Result<Vec<session_log_contract::SessionFeedEntry>> {
+    match session_log_contract::client::call_service(&SessionLogCommand::ReadSessionFeed(
+        ReadSessionFeedRequest {
+            session_id: session_id.to_string(),
+            after_cursor: 0,
+            limit: 100,
+        },
+    ))? {
+        SessionLogResponse::SessionFeed { entries, .. } => Ok(entries),
+        other => bail!("unexpected session feed response: {other:?}"),
+    }
 }
 
 #[test]

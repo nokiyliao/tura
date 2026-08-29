@@ -8,23 +8,19 @@ use fs2::FileExt;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
-use crate::{file_queue, ipc, SessionLogStore};
+use crate::{SessionLogStore, file_queue, ipc};
 use session_log_contract::client::session_db_owner_lock_path;
 
-/// Run the session_db process: boot the owned store, mark interrupted sessions,
-/// start the durable file-queue drain, then serve until the process exits.
+/// Run the session_db process: boot the owned store, start the durable file-queue
+/// drain, then serve until the process exits.
 pub fn run_socket_service() -> Result<()> {
     let _lock = SessionDbOwnerLock::acquire()?;
     let store = SessionLogStore::open_default()?;
-    let interrupted = store.mark_running_sessions_interrupted()?;
-    tracing::info!(
-        interrupted_running_sessions = interrupted,
-        "session_db service starting"
-    );
+    tracing::info!("session_db service starting");
     let feed_hub = ipc::SessionFeedHub::default();
     let drain = FileQueueDrainThread::start(store.clone(), feed_hub.clone());
     let result = ipc::serve_blocking_with_feed_hub(store, feed_hub);
