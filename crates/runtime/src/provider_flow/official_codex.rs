@@ -1,7 +1,7 @@
 use chrono::Utc;
 use lifecycle::{RuntimeAggregate, RuntimeState};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::provider_flow::call::flush_runtime_events;
@@ -9,10 +9,10 @@ use crate::provider_flow::errors::finish_runtime_failure_with_retry_policy;
 use crate::provider_flow::provider_response::apply_provider_response;
 use crate::runtime_event_writer::RuntimeEventWriter;
 use tura_llm_rust::official_codex_app_server::{
-    run_official_codex_turn, CodexAppServerExecutable, CodexExecutionLedger,
-    CodexObservedCommandAccess, CodexReadOnlyCommandObservation, CodexReadOnlyEffectObservation,
-    OfficialCodexServerRequest, OfficialCodexServerRequestFuture,
-    OfficialCodexServerRequestHandler, OfficialCodexTurnRequest,
+    run_official_codex_turn, CodexAppServerExecutable, CodexCommandRunCommandObservation,
+    CodexCommandRunEffectObservation, CodexExecutionLedger, CodexObservedCommandAccess,
+    CodexReadOnlyCommandObservation, CodexReadOnlyEffectObservation, OfficialCodexServerRequest,
+    OfficialCodexServerRequestFuture, OfficialCodexServerRequestHandler, OfficialCodexTurnRequest,
 };
 
 pub(crate) struct OfficialCodexRuntimeInput {
@@ -219,6 +219,103 @@ impl OfficialCodexServerRequestHandler for RuntimeOfficialCodexHandler {
 
     fn persist_execution_ledger(&mut self, ledger: &CodexExecutionLedger) -> Result<(), String> {
         self.write_execution_ledger(ledger)
+    }
+
+    fn observe_command_run_effect(
+        &mut self,
+        request: &OfficialCodexServerRequest,
+        runtime_id: &str,
+    ) -> Result<Option<CodexCommandRunEffectObservation>, String> {
+        if request.method != "item/tool/call" {
+            return Ok(None);
+        }
+        let tool_name = request
+            .params
+            .get("tool")
+            .or_else(|| request.params.get("name"))
+            .or_else(|| request.params.get("toolName"))
+            .and_then(Value::as_str)
+            .unwrap_or("command_run");
+        if tool_name != "command_run" {
+            return Ok(None);
+        }
+        if runtime_id.is_empty() {
+            return Err("command_run runtime identity is unavailable".to_string());
+        }
+
+        let tool_call_id = request
+            .params
+            .get("callId")
+            .or_else(|| request.params.get("call_id"))
+            .or_else(|| request.params.get("id"))
+            .and_then(Value::as_str)
+            .filter(|tool_call_id| !tool_call_id.is_empty())
+            .ok_or_else(|| "command_run tool call ID is unavailable".to_string())?
+            .to_string();
+        let execution_id = format!("{runtime_id}:{tool_call_id}");
+        let arguments = governed_dynamic_tool_arguments(&request.params, &execution_id)?;
+        let commands = arguments
+            .get("commands")
+            .and_then(Value::as_array)
+            .filter(|commands| !commands.is_empty())
+            .ok_or_else(|| "command_run commands are unavailable".to_string())?;
+        let mut observations = Vec::with_capacity(commands.len());
+        let mut claim_identities = HashSet::new();
+        for (enumerated_index, command) in commands.iter().enumerate() {
+            let normalized = code_tools::command_run::normalize_command_value_for_execution(
+                command.clone(),
+                enumerated_index,
+            )?;
+            let command_type = normalized
+                .get("command_type")
+                .and_then(Value::as_str)
+                .filter(|command_type| !command_type.is_empty())
+                .ok_or_else(|| {
+                    format!("command_run command {enumerated_index} omitted command_type")
+                })?
+                .to_string();
+            let binding_present = ["id", "command_id", "commandId", "result_id"]
+                .iter()
+                .any(|key| normalized.get(*key).is_some());
+            let binding_id = explicit_binding_id(&normalized).map(str::to_string);
+            if binding_present && binding_id.is_none() {
+                return Err(format!(
+                    "command_run command {enumerated_index} has an invalid binding identity"
+                ));
+            }
+            let effective_step = normalized
+                .get("step")
+                .and_then(Value::as_u64)
+                .filter(|step| *step > 0)
+                .ok_or_else(|| {
+                    format!("command_run command {enumerated_index} omitted effective step")
+                })?;
+            let claim_identity = command_call_id(
+                &execution_id,
+                binding_id.as_deref(),
+                effective_step,
+                enumerated_index,
+            );
+            if !claim_identities.insert(claim_identity.clone()) {
+                return Err(format!(
+                    "command_run command {enumerated_index} duplicated receipt identity {claim_identity}"
+                ));
+            }
+            observations.push(CodexCommandRunCommandObservation {
+                command_type,
+                enumerated_index,
+                effective_step,
+                binding_id,
+                claim_identity,
+            });
+        }
+
+        Ok(Some(CodexCommandRunEffectObservation {
+            runtime_id: runtime_id.to_string(),
+            tool_call_id,
+            execution_id,
+            commands: observations,
+        }))
     }
 
     fn observe_read_only_effect(
@@ -945,6 +1042,110 @@ mod tests {
                 .expect("invalid step observation");
             assert!(rejected.is_none(), "invalid step {step} was admitted");
         }
+    }
+
+    #[test]
+    fn command_run_observation_uses_executor_normalization_and_runtime_identity() {
+        let mut handler = RuntimeOfficialCodexHandler {
+            session_directory: Path::new(".").to_path_buf(),
+            session_id: "session-current".to_string(),
+            runtime_id: "runtime-current".to_string(),
+            allowed_command_run_commands: None,
+            disable_permission_restrictions: false,
+            jspace_contract: None,
+        };
+        let observation = handler
+            .observe_command_run_effect(
+                &OfficialCodexServerRequest {
+                    method: "item/tool/call".to_string(),
+                    params: serde_json::json!({
+                        "callId": "call-original",
+                        "tool": "command_run",
+                        "arguments": {
+                            "commands": [
+                                {"command_type": "zsh", "command_line": "pwd"},
+                                {"command_type": "zsh", "command_line": "pwd"},
+                                {
+                                    "command_type": "zsh",
+                                    "command_line": "pwd",
+                                    "step": "7",
+                                    "command_id": "result-two"
+                                },
+                                {
+                                    "command_type": "zsh",
+                                    "command_line": "pwd",
+                                    "step": 0,
+                                    "commandId": "result-three"
+                                },
+                                {
+                                    "command_type": "zsh",
+                                    "command_line": "pwd",
+                                    "result_id": "result-four"
+                                },
+                                {
+                                    "command_type": "zsh",
+                                    "command_line": "pwd",
+                                    "id": "result-five"
+                                }
+                            ]
+                        }
+                    }),
+                },
+                "runtime-original",
+            )
+            .expect("command identity observation")
+            .expect("command_run observation");
+
+        assert_eq!(observation.runtime_id, "runtime-original");
+        assert_eq!(observation.execution_id, "runtime-original:call-original");
+        assert_eq!(observation.commands[0].effective_step, 1);
+        assert_eq!(observation.commands[1].effective_step, 2);
+        assert_eq!(observation.commands[2].effective_step, 7);
+        assert_eq!(observation.commands[3].effective_step, 1);
+        assert_eq!(observation.commands[4].effective_step, 5);
+        assert_eq!(
+            observation.commands[1].claim_identity,
+            "runtime-original:call-original:step:2:index:1"
+        );
+        assert_eq!(
+            observation.commands[2].claim_identity,
+            "runtime-original:call-original:result-two"
+        );
+        assert_eq!(
+            observation.commands[5].claim_identity,
+            "runtime-original:call-original:result-five"
+        );
+    }
+
+    #[test]
+    fn command_run_observation_rejects_duplicate_receipt_identity() {
+        let mut handler = RuntimeOfficialCodexHandler {
+            session_directory: Path::new(".").to_path_buf(),
+            session_id: "session-current".to_string(),
+            runtime_id: "runtime-current".to_string(),
+            allowed_command_run_commands: None,
+            disable_permission_restrictions: false,
+            jspace_contract: None,
+        };
+        let error = handler
+            .observe_command_run_effect(
+                &OfficialCodexServerRequest {
+                    method: "item/tool/call".to_string(),
+                    params: serde_json::json!({
+                        "callId": "call-original",
+                        "tool": "command_run",
+                        "arguments": {
+                            "commands": [
+                                {"command_type": "zsh", "command_line": "pwd", "id": "same"},
+                                {"command_type": "zsh", "command_line": "pwd", "commandId": "same"}
+                            ]
+                        }
+                    }),
+                },
+                "runtime-original",
+            )
+            .expect_err("duplicate binding must fail before execution");
+        assert!(error.contains("duplicated receipt identity"));
     }
 
     #[test]

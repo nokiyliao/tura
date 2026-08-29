@@ -5,9 +5,10 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use tura_llm_rust::official_codex_app_server::{
     load_thread_association, run_official_codex_turn, CodexAppServerExecutable,
-    CodexExecutionLedger, CodexObservedCommandAccess, CodexObservedToolEffectState,
-    CodexReadOnlyCommandObservation, CodexReadOnlyEffectObservation, OfficialCodexServerRequest,
-    OfficialCodexServerRequestFuture, OfficialCodexServerRequestHandler, OfficialCodexTurnRequest,
+    CodexCommandRunCommandObservation, CodexCommandRunEffectObservation, CodexExecutionLedger,
+    CodexObservedCommandAccess, CodexObservedToolEffectState, CodexReadOnlyCommandObservation,
+    CodexReadOnlyEffectObservation, OfficialCodexServerRequest, OfficialCodexServerRequestFuture,
+    OfficialCodexServerRequestHandler, OfficialCodexTurnRequest,
 };
 
 const UNCLAIMED_READ_ONLY_COMMAND_LINE: &str = r#"rg -n -A18 -B6 "struct TurnRequestContext|TurnRequestContext \{" crates/provider/src/official_codex_app_server.rs"#;
@@ -548,13 +549,32 @@ async fn run_interrupted_effect_recovery() {
     .await
     .expect_err("provider transport must lose the durable batch response");
     assert_eq!(execution_count(&durable_batch_count), 1);
-    let interrupted_batch = load_only_execution_ledger(&durable_batch_directory);
+    let mut interrupted_batch = load_only_execution_ledger(&durable_batch_directory);
     assert_eq!(interrupted_batch.effects.len(), 1);
     assert_eq!(
         interrupted_batch.effects[0].state,
         CodexObservedToolEffectState::Observed
     );
     assert!(interrupted_batch.effects[0].response.is_none());
+    assert_eq!(
+        interrupted_batch.effects[0].runtime_id.as_deref(),
+        Some("runtime-official-1")
+    );
+    assert_eq!(
+        interrupted_batch.effects[0]
+            .command_run_observation
+            .as_ref()
+            .expect("persisted command identities")
+            .commands
+            .len(),
+        6
+    );
+
+    // Existing interrupted ledgers predate effect-scoped runtime and command identities.
+    // A single owned runtime remains unambiguous and may be normalized from the request.
+    interrupted_batch.effects[0].runtime_id = None;
+    interrupted_batch.effects[0].command_run_observation = None;
+    persist_only_execution_ledger(&durable_batch_directory, &interrupted_batch);
 
     let durable_batch_recovery_capture = root.path().join("durable-batch-effect-recover.jsonl");
     let durable_batch_recovered = run_official_codex_turn(
@@ -600,6 +620,9 @@ async fn run_interrupted_effect_recovery() {
     );
     assert!(recovered_output.contains("\"exit_code\":2"));
     assert!(recovered_output.contains("\"success\":false"));
+    assert!(recovered_output.contains("runtime-official-1:call-original:step:2:index:1"));
+    assert!(recovered_output.contains("runtime-official-1:call-original:result-two"));
+    assert!(recovered_output.contains("runtime-official-1:call-original:result-five"));
 
     let unclaimed_directory = root.path().join("unclaimed-read-only-session");
     fs::create_dir_all(&unclaimed_directory).expect("unclaimed read-only session directory");
@@ -825,6 +848,7 @@ struct ReceiptHandler {
     drop_response_after_receipt: bool,
     policy_denial: bool,
     durable_batch: bool,
+    command_run_observation: Option<CodexCommandRunEffectObservation>,
 }
 
 impl ReceiptHandler {
@@ -839,6 +863,7 @@ impl ReceiptHandler {
             drop_response_after_receipt: false,
             policy_denial: false,
             durable_batch: false,
+            command_run_observation: None,
         }
     }
 
@@ -853,6 +878,7 @@ impl ReceiptHandler {
             drop_response_after_receipt: false,
             policy_denial: false,
             durable_batch: false,
+            command_run_observation: None,
         }
     }
 
@@ -867,6 +893,7 @@ impl ReceiptHandler {
             drop_response_after_receipt: false,
             policy_denial: false,
             durable_batch: false,
+            command_run_observation: None,
         }
     }
 
@@ -881,6 +908,7 @@ impl ReceiptHandler {
             drop_response_after_receipt: true,
             policy_denial: false,
             durable_batch: false,
+            command_run_observation: None,
         }
     }
 
@@ -895,6 +923,7 @@ impl ReceiptHandler {
             drop_response_after_receipt: false,
             policy_denial: true,
             durable_batch: false,
+            command_run_observation: None,
         }
     }
 
@@ -909,6 +938,7 @@ impl ReceiptHandler {
             drop_response_after_receipt: false,
             policy_denial: false,
             durable_batch: true,
+            command_run_observation: None,
         }
     }
 }
@@ -940,6 +970,72 @@ impl OfficialCodexServerRequestHandler for ReceiptHandler {
             serde_json::to_vec_pretty(ledger).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())
+    }
+
+    fn observe_command_run_effect(
+        &mut self,
+        request: &OfficialCodexServerRequest,
+        runtime_id: &str,
+    ) -> Result<Option<CodexCommandRunEffectObservation>, String> {
+        if request.method != "item/tool/call"
+            || request.params.get("tool").and_then(Value::as_str) != Some("command_run")
+        {
+            return Ok(None);
+        }
+        let tool_call_id = request
+            .params
+            .get("callId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "command_run tool call ID is unavailable".to_string())?
+            .to_string();
+        let commands = request
+            .params
+            .get("arguments")
+            .and_then(|arguments| arguments.get("commands"))
+            .and_then(Value::as_array)
+            .filter(|commands| !commands.is_empty())
+            .ok_or_else(|| "command_run commands are unavailable".to_string())?;
+        let execution_id = format!("{runtime_id}:{tool_call_id}");
+        let mut observed = Vec::with_capacity(commands.len());
+        for (enumerated_index, command) in commands.iter().enumerate() {
+            let command_type = command
+                .get("command_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "command_type is unavailable".to_string())?;
+            let binding_id = ["id", "command_id", "commandId", "result_id"]
+                .iter()
+                .find_map(|key| command.get(*key).and_then(Value::as_str))
+                .map(str::to_string);
+            let effective_step = command
+                .get("step")
+                .and_then(|step| {
+                    step.as_u64()
+                        .or_else(|| step.as_str().and_then(|step| step.parse::<u64>().ok()))
+                })
+                .unwrap_or(enumerated_index as u64 + 1)
+                .max(1);
+            let claim_identity = read_only_claim_identity(
+                &execution_id,
+                effective_step,
+                enumerated_index,
+                binding_id.as_deref(),
+            );
+            observed.push(CodexCommandRunCommandObservation {
+                command_type: command_type.to_string(),
+                enumerated_index,
+                effective_step,
+                binding_id,
+                claim_identity,
+            });
+        }
+        let observation = CodexCommandRunEffectObservation {
+            runtime_id: runtime_id.to_string(),
+            tool_call_id,
+            execution_id,
+            commands: observed,
+        };
+        self.command_run_observation = Some(observation.clone());
+        Ok(Some(observation))
     }
 
     fn observe_read_only_effect(
@@ -1146,9 +1242,13 @@ impl OfficialCodexServerRequestHandler for ReceiptHandler {
                 .join("command_receipts");
             fs::create_dir_all(&receipt_directory).expect("receipt directory");
             if self.durable_batch {
-                for index in 0..6 {
-                    let call_id = format!("runtime-official-1:call-original:step:1:index:{index}");
-                    let failed = index == 5;
+                let observation = self
+                    .command_run_observation
+                    .as_ref()
+                    .expect("durable batch command identities");
+                for (index, command) in observation.commands.iter().enumerate() {
+                    let call_id = command.claim_identity.clone();
+                    let failed = index + 1 == observation.commands.len();
                     let receipt = json!({
                         "schema_version": "tura_command_terminal_receipt_v1",
                         "call_id": call_id,
@@ -1492,15 +1592,34 @@ fn fake_app_server(args: &[String]) {
                         continue;
                     }
                     let commands = if mode.contains("durable-batch-") {
-                        (0..6)
-                            .map(|index| {
-                                json!({
-                                    "command_type": "zsh",
-                                    "command_line": format!("command-{index}"),
-                                    "step": 1
-                                })
-                            })
-                            .collect::<Vec<_>>()
+                        vec![
+                            json!({"command_type": "zsh", "command_line": "command-0"}),
+                            json!({"command_type": "zsh", "command_line": "command-1"}),
+                            json!({
+                                "command_type": "zsh",
+                                "command_line": "command-2",
+                                "step": "7",
+                                "command_id": "result-two"
+                            }),
+                            json!({
+                                "command_type": "zsh",
+                                "command_line": "command-3",
+                                "step": 0,
+                                "commandId": "result-three"
+                            }),
+                            json!({
+                                "command_type": "zsh",
+                                "command_line": "command-4",
+                                "step": 9,
+                                "result_id": "result-four"
+                            }),
+                            json!({
+                                "command_type": "zsh",
+                                "command_line": "command-5",
+                                "step": 11,
+                                "id": "result-five"
+                            }),
+                        ]
                     } else {
                         vec![json!({
                             "command_type": "zsh",

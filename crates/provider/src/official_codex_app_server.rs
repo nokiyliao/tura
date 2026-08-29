@@ -91,8 +91,27 @@ pub struct CodexReadOnlyEffectObservation {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CodexCommandRunCommandObservation {
+    pub command_type: String,
+    pub enumerated_index: usize,
+    pub effective_step: u64,
+    pub binding_id: Option<String>,
+    pub claim_identity: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CodexCommandRunEffectObservation {
+    pub runtime_id: String,
+    pub tool_call_id: String,
+    pub execution_id: String,
+    pub commands: Vec<CodexCommandRunCommandObservation>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CodexObservedToolEffect {
     pub request_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_params: Option<Value>,
     pub original_request_id: Value,
@@ -102,6 +121,8 @@ pub struct CodexObservedToolEffect {
     pub replay_request_id: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only_observation: Option<CodexReadOnlyEffectObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_run_observation: Option<CodexCommandRunEffectObservation>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -254,6 +275,14 @@ pub trait OfficialCodexServerRequestHandler: Send {
         &mut self,
         _request: &OfficialCodexServerRequest,
     ) -> Result<Option<CodexReadOnlyEffectObservation>, String> {
+        Ok(None)
+    }
+
+    fn observe_command_run_effect(
+        &mut self,
+        _request: &OfficialCodexServerRequest,
+        _runtime_id: &str,
+    ) -> Result<Option<CodexCommandRunEffectObservation>, String> {
         Ok(None)
     }
 
@@ -570,6 +599,7 @@ async fn identify_executable(
 
 struct TurnRequestContext<'a> {
     session_directory: &'a Path,
+    runtime_id: &'a str,
     execution_ledger: &'a mut CodexExecutionLedger,
 }
 
@@ -767,6 +797,7 @@ async fn run_protocol(
         let turn_response = {
             let mut context = TurnRequestContext {
                 session_directory: &request.session_directory,
+                runtime_id: &request.runtime_id,
                 execution_ledger,
             };
             rpc_request(
@@ -1184,6 +1215,7 @@ async fn run_protocol(
         if message.get("id").is_some() {
             let mut context = TurnRequestContext {
                 session_directory: &request.session_directory,
+                runtime_id: &request.runtime_id,
                 execution_ledger: &mut execution_ledger,
             };
             handle_server_request(&message, stdin, request_handler, Some(&mut context)).await?;
@@ -1350,6 +1382,31 @@ async fn handle_server_request(
         .to_string();
     let params = message.get("params").cloned().unwrap_or(Value::Null);
     let effect_identity = server_effect_identity(&params, &id);
+    let command_run_observation = if method == "item/tool/call" {
+        let Some(context) = turn_context.as_deref() else {
+            return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index: 0,
+                reason: "command_run effect omitted its runtime context".to_string(),
+            });
+        };
+        match request_handler.as_deref_mut() {
+            Some(handler) => handler
+                .observe_command_run_effect(
+                    &OfficialCodexServerRequest {
+                        method: method.clone(),
+                        params: params.clone(),
+                    },
+                    context.runtime_id,
+                )
+                .map_err(|reason| OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index: context.execution_ledger.effects.len(),
+                    reason: format!("runtime command identity normalization failed: {reason}"),
+                })?,
+            None => None,
+        }
+    } else {
+        None
+    };
     let read_only_observation = if method == "item/tool/call"
         && turn_context
             .as_deref()
@@ -1382,6 +1439,7 @@ async fn handle_server_request(
             &params,
             &effect_identity,
             read_only_observation,
+            command_run_observation,
         )?
     } else {
         ToolEffectDisposition::Execute(None)
@@ -1476,6 +1534,7 @@ fn prepare_tool_effect(
     params: &Value,
     effect_identity: &Value,
     read_only_observation: Option<CodexReadOnlyEffectObservation>,
+    command_run_observation: Option<CodexCommandRunEffectObservation>,
 ) -> Result<ToolEffectDisposition, OfficialCodexAppServerError> {
     if method != "item/tool/call" {
         return Ok(ToolEffectDisposition::Execute(None));
@@ -1583,6 +1642,7 @@ fn prepare_tool_effect(
         .effects
         .push(CodexObservedToolEffect {
             request_sha256,
+            runtime_id: Some(context.runtime_id.to_string()),
             request_params: Some(params.clone()),
             original_request_id: effect_identity.clone(),
             state: CodexObservedToolEffectState::Observed,
@@ -1590,6 +1650,7 @@ fn prepare_tool_effect(
             command_receipts: Vec::new(),
             replay_request_id: None,
             read_only_observation,
+            command_run_observation,
         });
     Ok(ToolEffectDisposition::Execute(Some(effect_index)))
 }
@@ -1617,6 +1678,57 @@ fn command_claim_identity(
     } else {
         format!("{execution_id}:step:{effective_step}:index:{enumerated_index}")
     }
+}
+
+fn validate_command_run_observation(
+    effect_index: usize,
+    observation: &CodexCommandRunEffectObservation,
+) -> Result<(), OfficialCodexAppServerError> {
+    let expected_execution_id = format!("{}:{}", observation.runtime_id, observation.tool_call_id);
+    if observation.runtime_id.is_empty()
+        || observation.runtime_id.len() > MAX_OBSERVED_IDENTITY_BYTES
+        || observation.tool_call_id.is_empty()
+        || observation.tool_call_id.len() > MAX_OBSERVED_IDENTITY_BYTES
+        || observation.execution_id != expected_execution_id
+        || observation.execution_id.len() > MAX_OBSERVED_IDENTITY_BYTES
+        || observation.commands.is_empty()
+        || observation.commands.len() > MAX_SYNTHETIC_READ_ONLY_COMMANDS
+    {
+        return Err(OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "persisted command_run observation is malformed or oversized".to_string(),
+        });
+    }
+
+    let mut claim_identities = HashSet::new();
+    let mut encoded_identities = HashSet::new();
+    for (enumerated_index, command) in observation.commands.iter().enumerate() {
+        let expected_claim_identity = command_claim_identity(
+            &observation.execution_id,
+            command.binding_id.as_deref(),
+            command.effective_step,
+            enumerated_index,
+        );
+        if command.command_type.is_empty()
+            || command.command_type.len() > MAX_OBSERVED_IDENTITY_BYTES
+            || command.enumerated_index != enumerated_index
+            || command.effective_step == 0
+            || command.binding_id.as_ref().is_some_and(|binding_id| {
+                binding_id.is_empty() || binding_id.len() > MAX_OBSERVED_IDENTITY_BYTES
+            })
+            || command.claim_identity != expected_claim_identity
+            || command.claim_identity.len() > MAX_OBSERVED_IDENTITY_BYTES
+            || !claim_identities.insert(command.claim_identity.as_str())
+            || !encoded_identities.insert(encode_command_receipt_identity(&command.claim_identity))
+        {
+            return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: "persisted command_run command or exact receipt identity is invalid"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_read_only_observation(
@@ -1922,19 +2034,10 @@ fn reconcile_durable_command_run_effects(
     execution_ledger: &mut CodexExecutionLedger,
     request_handler: &mut Option<&mut dyn OfficialCodexServerRequestHandler>,
 ) -> Result<(), OfficialCodexAppServerError> {
-    let original_runtime_id = execution_ledger
-        .runtime_ids
-        .first()
-        .cloned()
-        .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
-            effect_index: 0,
-            reason: "execution ledger omitted its original runtime identity".to_string(),
-        })?;
     for effect_index in 0..execution_ledger.effects.len() {
-        let (call_id, commands) = {
+        let (runtime_id, params, persisted_observation) = {
             let effect = &execution_ledger.effects[effect_index];
-            if effect.read_only_observation.is_some()
-                || effect.state != CodexObservedToolEffectState::Observed
+            if effect.state != CodexObservedToolEffectState::Observed
                 || effect.response.is_some()
                 || !effect.command_receipts.is_empty()
                 || effect.replay_request_id.is_some()
@@ -1947,47 +2050,87 @@ fn reconcile_durable_command_run_effects(
             if params.get("tool").and_then(Value::as_str) != Some("command_run") {
                 continue;
             }
-            let call_id = params
-                .get("callId")
-                .and_then(Value::as_str)
-                .filter(|call_id| !call_id.is_empty())
-                .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
-                    effect_index,
-                    reason: "observed command_run omitted callId".to_string(),
-                })?;
-            let commands = params
-                .get("arguments")
-                .and_then(|arguments| arguments.get("commands"))
-                .and_then(Value::as_array)
-                .filter(|commands| {
-                    !commands.is_empty() && commands.len() <= MAX_SYNTHETIC_READ_ONLY_COMMANDS
-                })
-                .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
-                    effect_index,
-                    reason: "observed command_run omitted a bounded command list".to_string(),
-                })?;
-            (call_id.to_string(), commands.clone())
+            let runtime_id = match effect.runtime_id.as_deref() {
+                Some(runtime_id)
+                    if execution_ledger
+                        .runtime_ids
+                        .iter()
+                        .any(|candidate| candidate == runtime_id) =>
+                {
+                    runtime_id.to_string()
+                }
+                Some(_) => {
+                    return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                        effect_index,
+                        reason: "effect runtime identity is not owned by its execution ledger"
+                            .to_string(),
+                    });
+                }
+                None if execution_ledger.runtime_ids.len() == 1 => {
+                    execution_ledger.runtime_ids[0].clone()
+                }
+                None => {
+                    return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                        effect_index,
+                        reason: "legacy effect runtime identity is ambiguous".to_string(),
+                    });
+                }
+            };
+            (
+                runtime_id,
+                params.clone(),
+                effect.command_run_observation.clone(),
+            )
         };
 
-        let execution_id = format!("{original_runtime_id}:{call_id}");
-        let mut results = Vec::with_capacity(commands.len());
-        for (enumerated_index, command) in commands.iter().enumerate() {
-            let command_type = command
-                .get("command_type")
-                .and_then(Value::as_str)
-                .filter(|command_type| !command_type.is_empty())
+        let observation = match persisted_observation {
+            Some(observation) => observation,
+            None => request_handler
+                .as_deref_mut()
                 .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
                     effect_index,
-                    reason: format!("command {enumerated_index} omitted command_type"),
-                })?;
-            let effective_step = command
-                .get("step")
-                .and_then(Value::as_u64)
-                .unwrap_or(1)
-                .max(1);
-            let binding_id = command.get("id").and_then(Value::as_str);
-            let claim_identity =
-                command_claim_identity(&execution_id, binding_id, effective_step, enumerated_index);
+                    reason: "runtime command identity normalizer is unavailable".to_string(),
+                })?
+                .observe_command_run_effect(
+                    &OfficialCodexServerRequest {
+                        method: "item/tool/call".to_string(),
+                        params: params.clone(),
+                    },
+                    &runtime_id,
+                )
+                .map_err(|reason| OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: format!("runtime command identity normalization failed: {reason}"),
+                })?
+                .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: "runtime did not produce a command_run identity observation".to_string(),
+                })?,
+        };
+        validate_command_run_observation(effect_index, &observation)?;
+        let raw_call_id = params
+            .get("callId")
+            .or_else(|| params.get("call_id"))
+            .or_else(|| params.get("id"))
+            .and_then(Value::as_str)
+            .filter(|call_id| !call_id.is_empty())
+            .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: "observed command_run omitted its tool call identity".to_string(),
+            })?;
+        if observation.runtime_id != runtime_id || observation.tool_call_id != raw_call_id {
+            return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: "command_run observation changed its effect or tool call identity"
+                    .to_string(),
+            });
+        }
+
+        let mut results = Vec::with_capacity(observation.commands.len());
+        let mut canonical_paths = HashSet::new();
+        let mut receipt_digests = HashSet::new();
+        for command in &observation.commands {
+            let claim_identity = &command.claim_identity;
             let receipt_path = session_directory
                 .join(".tura")
                 .join("run")
@@ -1996,7 +2139,24 @@ fn reconcile_durable_command_run_effects(
                     "{}.json",
                     encode_command_receipt_identity(&claim_identity)
                 ));
-            let bytes = std::fs::read(&receipt_path).map_err(|error| {
+            let absolute_path = std::fs::canonicalize(&receipt_path).map_err(|error| {
+                OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: format!(
+                        "terminal receipt for command {claim_identity} cannot be canonicalized: {error}"
+                    ),
+                }
+            })?;
+            if !canonical_paths.insert(absolute_path.clone()) {
+                return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: format!(
+                        "multiple commands resolved to terminal receipt {}",
+                        absolute_path.display()
+                    ),
+                });
+            }
+            let bytes = std::fs::read(&absolute_path).map_err(|error| {
                 OfficialCodexAppServerError::UncertainToolEffect {
                     effect_index,
                     reason: format!(
@@ -2004,6 +2164,14 @@ fn reconcile_durable_command_run_effects(
                     ),
                 }
             })?;
+            let receipt_sha256 = format!("{:x}", Sha256::digest(&bytes));
+            if !receipt_digests.insert(receipt_sha256) {
+                return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: "multiple command outcomes shared one terminal receipt digest"
+                        .to_string(),
+                });
+            }
             let receipt: Value = serde_json::from_slice(&bytes).map_err(|error| {
                 OfficialCodexAppServerError::UncertainToolEffect {
                     effect_index,
@@ -2022,18 +2190,10 @@ fn reconcile_durable_command_run_effects(
             }
             let command_succeeded = receipt.get("exit_code").and_then(Value::as_i64) == Some(0);
             validate_terminal_receipt(effect_index, &receipt, command_succeeded)?;
-            let absolute_path = std::fs::canonicalize(&receipt_path).map_err(|error| {
-                OfficialCodexAppServerError::UncertainToolEffect {
-                    effect_index,
-                    reason: format!(
-                        "terminal receipt for command {claim_identity} cannot be canonicalized: {error}"
-                    ),
-                }
-            })?;
             results.push(json!({
-                "command_type": command_type,
+                "command_type": command.command_type,
                 "command_id": claim_identity,
-                "step": effective_step,
+                "step": command.effective_step,
                 "success": command_succeeded,
                 "output": {
                     "exit_code": receipt.get("exit_code").cloned().unwrap_or(Value::Null),
@@ -2051,13 +2211,15 @@ fn reconcile_durable_command_run_effects(
         });
         let evidence =
             extract_command_receipt_references(session_directory, effect_index, &response)?;
-        if !evidence.replayable || evidence.references.len() != commands.len() {
+        if !evidence.replayable || evidence.references.len() != observation.commands.len() {
             return Err(OfficialCodexAppServerError::UncertainToolEffect {
                 effect_index,
                 reason: "durable command_run result was incomplete or unsettled".to_string(),
             });
         }
         let effect = &mut execution_ledger.effects[effect_index];
+        effect.runtime_id = Some(runtime_id);
+        effect.command_run_observation = Some(observation);
         effect.response = Some(response);
         effect.command_receipts = evidence.references;
         effect.state = CodexObservedToolEffectState::Reconciled;
@@ -2868,6 +3030,7 @@ mod interrupted_read_only_reconciliation_tests {
             runtime_ids: vec!["runtime-test".to_string()],
             effects: vec![CodexObservedToolEffect {
                 request_sha256: "request-sha".to_string(),
+                runtime_id: Some("runtime-test".to_string()),
                 request_params: None,
                 original_request_id: json!("call-test"),
                 state: CodexObservedToolEffectState::Observed,
@@ -2875,6 +3038,7 @@ mod interrupted_read_only_reconciliation_tests {
                 command_receipts: Vec::new(),
                 replay_request_id: None,
                 read_only_observation: Some(observation),
+                command_run_observation: None,
             }],
             interrupted_recovery: None,
             terminal_status: None,
@@ -2981,6 +3145,47 @@ mod interrupted_read_only_reconciliation_tests {
             error,
             OfficialCodexAppServerError::UncertainToolEffect { effect_index: 0, .. }
         ));
+    }
+
+    #[test]
+    fn legacy_command_effect_with_multiple_runtime_candidates_fails_closed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut execution_ledger = CodexExecutionLedger {
+            schema_version: CODEX_EXECUTION_LEDGER_SCHEMA_VERSION,
+            tura_session_id: "tura-test".to_string(),
+            canonical_input_sha256: "a".repeat(64),
+            runtime_ids: vec!["runtime-first".to_string(), "runtime-second".to_string()],
+            effects: vec![CodexObservedToolEffect {
+                request_sha256: "request-sha".to_string(),
+                runtime_id: None,
+                request_params: Some(json!({
+                    "callId": "call-test",
+                    "tool": "command_run",
+                    "arguments": {
+                        "commands": [{"command_type": "zsh", "command_line": "pwd"}]
+                    }
+                })),
+                original_request_id: json!("call-test"),
+                state: CodexObservedToolEffectState::Observed,
+                response: None,
+                command_receipts: Vec::new(),
+                replay_request_id: None,
+                read_only_observation: None,
+                command_run_observation: None,
+            }],
+            interrupted_recovery: None,
+            terminal_status: None,
+        };
+        let mut handler = IdentityOnlyVerifier::default();
+        let mut request_handler =
+            Some(&mut handler as &mut dyn OfficialCodexServerRequestHandler);
+        let error = reconcile_durable_command_run_effects(
+            root.path(),
+            &mut execution_ledger,
+            &mut request_handler,
+        )
+        .expect_err("legacy multi-runtime effect must not guess its receipt owner");
+        assert!(error.to_string().contains("legacy effect runtime identity is ambiguous"));
     }
 
     fn receipt_directory(session_directory: &Path) -> PathBuf {
