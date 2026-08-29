@@ -3,7 +3,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import { GatewayClient } from "../gateway/client.js";
 import { sameDirectory } from "../gateway/directory.js";
 import { normalizeEvent } from "../gateway/events.js";
-import { GatewayUnavailableError, type CliContext, type OutputMode } from "../types/common.js";
+import {
+  GatewayUnavailableError,
+  RuntimeTerminalizationError,
+  type CliContext,
+  type OutputMode,
+} from "../types/common.js";
 import {
   hasUserFacingAssistantText,
   sessionStatusText,
@@ -111,7 +116,14 @@ async function runPromptWithShellEnv(context: CliContext, options: RunOptions): 
   if (options.output === "json") printRunJson(result);
   if (options.output === "ndjson") ndjson?.completed(result);
   if (options.output === "text") human?.final(result);
+  throwIfCliRunFailed(result, options.source);
   return result;
+}
+
+export function throwIfCliRunFailed(result: RunResult, source: RunOptions["source"]): void {
+  if (source === "cli" && result.status === "failed") {
+    throw new RuntimeTerminalizationError(result.sessionID);
+  }
 }
 
 export async function resolveExistingRunSession(

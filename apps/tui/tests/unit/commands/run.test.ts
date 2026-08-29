@@ -3,10 +3,31 @@ import test from "node:test";
 import type { GatewayClient } from "../../../src/gateway/client.js";
 import {
   resolveExistingRunSession,
+  throwIfCliRunFailed,
   waitByPolling,
   waitWithEvents,
 } from "../../../src/commands/run.js";
-import type { Message, Session } from "../../../src/types/session.js";
+import type { Message, RunResult, Session } from "../../../src/types/session.js";
+
+function runResult(status: RunResult["status"]): RunResult {
+  return {
+    sessionID: "terminal-session",
+    status,
+    finalText: "",
+    messages: [],
+    usage: null,
+    metadata: {
+      input_token_usage: 0,
+      input_token_cache: 0,
+      provider_time_ms: 0,
+      total_time_ms: 0,
+      commands: 0,
+      failed_commands: 0,
+      tps: 0,
+      turns: 0,
+    },
+  };
+}
 
 test("existing run applies an explicit permission override before the prompt", async () => {
   const updates: Array<{ sessionID: string; payload: Partial<Session> }> = [];
@@ -172,4 +193,20 @@ test("stream transport returns a failed cancellation before assistant output", a
   assert.equal(result.sessionID, session.id);
   assert.equal(result.finalText, "");
   assert.equal(streamReturnCount, 1);
+});
+
+test("CLI surfaces durable terminal failures as a typed nonzero result", () => {
+  assert.throws(
+    () => throwIfCliRunFailed(runResult("failed"), "cli"),
+    (error: unknown) =>
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      "exitCode" in error &&
+      error.code === "TURA_RUNTIME_TERMINAL_FAILURE" &&
+      error.exitCode === 1,
+  );
+  assert.doesNotThrow(() => throwIfCliRunFailed(runResult("completed"), "cli"));
+  assert.doesNotThrow(() => throwIfCliRunFailed(runResult("detached"), "cli"));
+  assert.doesNotThrow(() => throwIfCliRunFailed(runResult("failed"), "tui"));
 });

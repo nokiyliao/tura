@@ -32,3 +32,12 @@ export class GatewayUnavailableError extends Error {
 export class TimeoutError extends Error {
   exitCode = 4;
 }
+
+export class RuntimeTerminalizationError extends Error {
+  code = "TURA_RUNTIME_TERMINAL_FAILURE";
+  exitCode = 1;
+
+  constructor(sessionID: string) {
+    super(`TURA_RUNTIME_TERMINAL_FAILURE: session=${sessionID}`);
+  }
+}
