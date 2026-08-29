@@ -214,6 +214,8 @@ async fn handle_socket_connection(
         state.lifecycle.mark_activity();
         let active_runtime = enqueue_turn_identity(&parsed);
         let abort_on_disconnect = should_abort_request_on_connection_close(&parsed);
+        let retain_terminal_forwarder =
+            parsed.method == router_contract::METHOD_REGISTER_CHILD_SESSION;
         let state_for_task = state.clone();
         let write_for_task = Arc::clone(&write);
         let feed_forwarder = if let Some(identity) = active_runtime.as_ref() {
@@ -241,7 +243,11 @@ async fn handle_socket_connection(
         let handle = tokio::spawn(async move {
             let response = handle_ipc_request(&state_for_task, parsed).await;
             if let Some(forwarder) = feed_forwarder {
-                forwarder.stop().await;
+                if retain_terminal_forwarder && response.ok {
+                    forwarder.detach();
+                } else {
+                    forwarder.stop().await;
+                }
             }
             if let Ok(encoded) = serde_json::to_string(&response) {
                 let mut writer = write_for_task.lock().await;
@@ -353,6 +359,12 @@ impl SessionRoundForwarder {
             let _ = writer.await;
         }
     }
+
+    fn detach(mut self) {
+        self.cancellation.take();
+        self.reader.take();
+        self.writer.take();
+    }
 }
 
 impl Drop for SessionRoundForwarder {
@@ -381,9 +393,11 @@ async fn start_session_round_forwarder(
     let reader = tokio::task::spawn_blocking(move || {
         let mut subscription = subscription;
         let mut terminal_gate = TerminalCallbackGate::default();
+        let mut replayed_terminal = false;
         match execution.replay_terminal_callbacks(&commander_session_id, &session_id, &request_id) {
             Ok(replays) => {
                 for (callback, delivery) in replays {
+                    replayed_terminal = true;
                     terminal_gate.mark_completed(delivery.runtime_id.clone());
                     if sender
                         .blocking_send((vec![callback], Some(delivery)))
@@ -397,6 +411,9 @@ async fn start_session_round_forwarder(
                 eprintln!("router durable terminal callback replay blocked: {error:#}");
                 return;
             }
+        }
+        if replayed_terminal {
+            return;
         }
         while let Ok(Some(entry)) = subscription.next_entry() {
             let terminal_callback = agent_message_is_terminal(&entry);
@@ -423,6 +440,7 @@ async fn start_session_round_forwarder(
                             {
                                 return;
                             }
+                            return;
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -446,6 +464,7 @@ async fn start_session_round_forwarder(
                                 {
                                     return;
                                 }
+                                return;
                             }
                             Ok(None) => match terminal_gate.accept_delivery(delivery) {
                                 Ok(Some((callback, delivery))) => {
@@ -466,6 +485,7 @@ async fn start_session_round_forwarder(
                                     {
                                         return;
                                     }
+                                    return;
                                 }
                                 Ok(None) => {}
                                 Err(error) => {
@@ -982,6 +1002,42 @@ mod tests {
         let (write_result, continuation_result) = delivery.await.expect("delivery task");
         assert!(write_result.is_ok());
         assert!(continuation_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn detached_public_child_forwarder_finishes_its_terminal_tasks_once() {
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader_release = std::sync::Arc::clone(&release);
+        let reader_completed = std::sync::Arc::clone(&completed);
+        let reader = tokio::spawn(async move {
+            reader_release.notified().await;
+            reader_completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let writer_release = std::sync::Arc::clone(&release);
+        let writer_completed = std::sync::Arc::clone(&completed);
+        let writer = tokio::spawn(async move {
+            writer_release.notified().await;
+            writer_completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        tokio::task::yield_now().await;
+
+        SessionRoundForwarder {
+            cancellation: None,
+            reader: Some(reader),
+            writer: Some(writer),
+        }
+        .detach();
+        release.notify_waiters();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while completed.load(std::sync::atomic::Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached forwarder tasks must finish after terminal notification");
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     fn terminal_delivery(runtime_id: &str) -> crate::services::execution::TerminalDeliveryIdentity {

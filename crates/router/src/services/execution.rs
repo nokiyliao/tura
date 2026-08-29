@@ -1270,35 +1270,13 @@ impl ExecutionService {
                 )
             })?
             .to_string();
-        let admission = store
-            .child_admission(&receipt.child_session_id)?
-            .ok_or_else(|| {
-                anyhow!(
-                    "TERMINAL_CALLBACK_CHILD_ADMISSION_NOT_DURABLE:{}",
-                    receipt.child_session_id
-                )
-            })?;
-        {
-            if admission.parent_session_id != receipt.commander_session_id
-                || admission.parent_mission_revision_sha256 != parent_mission_revision_sha256
-                || admission.child_runtime_id != receipt.runtime_id
-                || admission.child_transaction_id != receipt.transaction_id
-                || admission.child_lease_id != receipt.lease_id
-                || admission.callback_request_id != receipt.transaction_id
-                || admission.delegated_input_sha256 != delegated_input_sha256
-            {
-                return Err(anyhow!(
-                    "TERMINAL_CALLBACK_ADMISSION_IDENTITY_MISMATCH:{}",
-                    receipt.child_session_id
-                ));
-            }
-            if admission.effect_id != effect_id {
-                return Err(anyhow!(
-                    "TERMINAL_CALLBACK_EFFECT_IDENTITY_CONFLICT:expected={},actual={effect_id}",
-                    admission.effect_id
-                ));
-            }
-        }
+        require_terminal_callback_admission(
+            store,
+            &receipt,
+            parent_mission_revision_sha256,
+            delegated_input_sha256,
+            Some(&effect_id),
+        )?;
         let record = DurableCallbackRecord::new(
             &receipt,
             callback_payload,
@@ -2044,6 +2022,13 @@ fn publish_terminal_failure_callback_from_store(
         .get("delegated_input_sha256")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("DELEGATED_LIFECYCLE_IDENTITY_MISSING:delegated_input_sha256"))?;
+    require_terminal_callback_admission(
+        store,
+        &receipt,
+        parent_mission_revision_sha256,
+        delegated_input_sha256,
+        None,
+    )?;
     let receipt_sha256 = session_lifecycle::terminal_receipt_sha256(&receipt)?;
     let callback_payload = json!({
         "type": "terminal_failure",
@@ -2084,6 +2069,45 @@ fn publish_terminal_failure_callback_from_store(
     delivery.callback_payload_sha256 = Some(record.callback_payload_sha256.clone());
     delivery.callback_effect_identity = Some(record.effect_identity.clone());
     Ok(Some((record.transport_payload, delivery)))
+}
+
+fn require_terminal_callback_admission(
+    store: &SessionLifecycleStore,
+    receipt: &TerminalReceipt,
+    parent_mission_revision_sha256: &str,
+    delegated_input_sha256: &str,
+    exact_effect_id: Option<&str>,
+) -> Result<ChildAdmissionRecord> {
+    let admission = store
+        .child_admission(&receipt.child_session_id)?
+        .ok_or_else(|| {
+            anyhow!(
+                "TERMINAL_CALLBACK_CHILD_ADMISSION_NOT_DURABLE:{}",
+                receipt.child_session_id
+            )
+        })?;
+    if admission.parent_session_id != receipt.commander_session_id
+        || admission.parent_mission_revision_sha256 != parent_mission_revision_sha256
+        || admission.child_runtime_id != receipt.runtime_id
+        || admission.child_transaction_id != receipt.transaction_id
+        || admission.child_lease_id != receipt.lease_id
+        || admission.callback_request_id != receipt.transaction_id
+        || admission.delegated_input_sha256 != delegated_input_sha256
+    {
+        return Err(anyhow!(
+            "TERMINAL_CALLBACK_ADMISSION_IDENTITY_MISMATCH:{}",
+            receipt.child_session_id
+        ));
+    }
+    if let Some(effect_id) = exact_effect_id
+        && admission.effect_id != effect_id
+    {
+        return Err(anyhow!(
+            "TERMINAL_CALLBACK_EFFECT_IDENTITY_CONFLICT:expected={},actual={effect_id}",
+            admission.effect_id
+        ));
+    }
+    Ok(admission)
 }
 
 fn intake_terminal_receipt(
@@ -4102,13 +4126,7 @@ mod tests {
         drop(permit);
     }
 
-    fn durable_callback_fixture(
-        root: &std::path::Path,
-        terminal_state: TerminalState,
-    ) -> (SessionLifecycleStore, TerminalDeliveryIdentity) {
-        let store =
-            SessionLifecycleStore::open(root, "commander-callback", LifecycleConfig::default())
-                .expect("callback store");
+    fn callback_receipt(terminal_state: TerminalState) -> TerminalReceipt {
         let mut receipt = TerminalReceipt::new(
             TerminalReceiptIdentity::new(
                 "transaction-callback",
@@ -4132,23 +4150,60 @@ mod tests {
                 "delegated prompt"
             ))),
         );
+        receipt
+    }
+
+    fn callback_delivery() -> TerminalDeliveryIdentity {
+        TerminalDeliveryIdentity {
+            commander_session_id: "commander-callback".to_string(),
+            transaction_id: "transaction-callback".to_string(),
+            event_id: "event-callback".to_string(),
+            runtime_id: "runtime-callback".to_string(),
+            callback_payload_sha256: None,
+            callback_effect_identity: None,
+        }
+    }
+
+    fn durable_callback_fixture(
+        root: &std::path::Path,
+        terminal_state: TerminalState,
+    ) -> (SessionLifecycleStore, TerminalDeliveryIdentity) {
+        let store =
+            SessionLifecycleStore::open(root, "commander-callback", LifecycleConfig::default())
+                .expect("callback store");
+        let receipt = callback_receipt(terminal_state);
         store
             .write_terminal_receipt(&receipt)
             .expect("terminal receipt");
         store
             .intake("transaction-callback", "event-callback")
             .expect("receipt intake");
-        (
-            store,
-            TerminalDeliveryIdentity {
-                commander_session_id: "commander-callback".to_string(),
-                transaction_id: "transaction-callback".to_string(),
-                event_id: "event-callback".to_string(),
-                runtime_id: "runtime-callback".to_string(),
-                callback_payload_sha256: None,
-                callback_effect_identity: None,
-            },
-        )
+        (store, callback_delivery())
+    }
+
+    fn admit_callback_child(
+        store: &SessionLifecycleStore,
+        parent_mission_revision_sha256: &str,
+    ) -> ChildAdmissionRecord {
+        let admission = ChildAdmissionRecord::new(
+            "commander-callback",
+            parent_mission_revision_sha256,
+            "child-callback",
+            "runtime-callback",
+            "transaction-callback",
+            "lease-callback",
+            "transaction-callback",
+            "runtime-callback.message",
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            session_lifecycle::canonical_value_sha256(&json!({"prompt": "delegated prompt"})),
+            "/tmp/child-callback",
+            "delegated child callback",
+            1_786_845_600_000,
+        );
+        store
+            .admit_child(&admission)
+            .expect("durable child admission");
+        admission
     }
 
     #[test]
@@ -4192,24 +4247,7 @@ mod tests {
             0
         );
 
-        let admission = ChildAdmissionRecord::new(
-            "commander-callback",
-            "a".repeat(64),
-            "child-callback",
-            "runtime-callback",
-            "transaction-callback",
-            "lease-callback",
-            "transaction-callback",
-            "runtime-callback.message",
-            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
-            session_lifecycle::canonical_value_sha256(&json!({"prompt": "delegated prompt"})),
-            "/tmp/child-callback",
-            "delegated child callback",
-            1_786_845_600_000,
-        );
-        store
-            .admit_child(&admission)
-            .expect("durable child admission");
+        admit_callback_child(&store, &"a".repeat(64));
 
         let mut first_delivery = delivery.clone();
         let first = ExecutionService::publish_terminal_callback_from_store(
@@ -4253,6 +4291,84 @@ mod tests {
             .expect_err("changed effect identity must conflict")
             .to_string()
             .contains("TERMINAL_CALLBACK_EFFECT_IDENTITY_CONFLICT")
+        );
+    }
+
+    #[test]
+    fn active_child_replay_after_forwarder_loss_converges_without_second_execution() {
+        let root = tempfile::tempdir().expect("temp lifecycle root");
+        let store = SessionLifecycleStore::open(
+            root.path(),
+            "commander-callback",
+            LifecycleConfig::default(),
+        )
+        .expect("callback store");
+        admit_callback_child(&store, &"a".repeat(64));
+        assert!(store.callbacks_for_replay().expect("active child callbacks").is_empty());
+
+        let original_router = ExecutionService::new();
+        assert!(original_router.sessions.lock().is_empty());
+        drop(original_router);
+
+        let receipt = callback_receipt(TerminalState::Completed);
+        store
+            .write_terminal_receipt(&receipt)
+            .expect("later terminal receipt");
+        store
+            .intake(&receipt.transaction_id, &receipt.event_id)
+            .expect("later terminal intake");
+        let transport = json!({
+            "request_id": "transaction-callback",
+            "kind": "gateway.callback",
+            "method": "session.agent_message",
+            "payload": {"body": {"item": {
+                "id": "runtime-callback.message",
+                "text": "child result"
+            }}}
+        });
+        let mut first_delivery = callback_delivery();
+        ExecutionService::publish_terminal_callback_from_store(
+            &store,
+            &mut first_delivery,
+            transport.clone(),
+        )
+        .expect("replacement forwarder terminal publication");
+        let mut replay_delivery = callback_delivery();
+        ExecutionService::publish_terminal_callback_from_store(
+            &store,
+            &mut replay_delivery,
+            transport,
+        )
+        .expect("identical forwarder replay");
+
+        let callbacks = store.callbacks_for_replay().expect("single callback replay");
+        assert_eq!(callbacks.len(), 1);
+        let continuation =
+            ContinuationDispatchRecord::from_callback(&callbacks[0]).expect("continuation");
+        store
+            .prepare_callback_continuation(&continuation)
+            .expect("prepare continuation");
+        store
+            .mark_callback_continuation_dispatched(&continuation)
+            .expect("dispatch continuation");
+        store
+            .mark_callback_continuation_completed(&continuation)
+            .expect("complete continuation");
+        complete_and_ack_callback_continuation(&store, &continuation).expect("first ack");
+        complete_and_ack_callback_continuation(&store, &continuation).expect("replayed ack");
+
+        let restarted_router = ExecutionService::new();
+        assert!(restarted_router.sessions.lock().is_empty());
+        let readback = store.readback().expect("terminal convergence readback");
+        assert_eq!(readback.intaken_callbacks, 1);
+        assert_eq!(readback.acknowledged_callbacks, 1);
+        assert_eq!(readback.acknowledged_receipts, 1);
+        assert!(store.callbacks_for_replay().expect("post-ack callbacks").is_empty());
+        assert!(
+            store
+                .callback_continuations_for_replay()
+                .expect("post-ack continuations")
+                .is_empty()
         );
     }
 
@@ -4729,26 +4845,49 @@ mod tests {
     }
 
     #[test]
-    fn terminal_failure_without_agent_message_is_durably_intaken_and_unsettled() {
-        let root = tempfile::tempdir().expect("temp lifecycle root");
-        let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Failed);
-        let (transport, delivery) = publish_terminal_failure_callback_from_store(&store, delivery)
-            .expect("failure callback")
-            .expect("delegated failure callback");
+    fn terminal_failure_and_cancellation_require_admission_and_remain_unsettled() {
+        for terminal_state in [TerminalState::Failed, TerminalState::Cancelled] {
+            let root = tempfile::tempdir().expect("temp lifecycle root");
+            let (store, delivery) = durable_callback_fixture(root.path(), terminal_state);
+            assert_eq!(
+                publish_terminal_failure_callback_from_store(&store, delivery.clone())
+                    .expect_err("unadmitted failure must fail closed")
+                    .to_string(),
+                "TERMINAL_CALLBACK_CHILD_ADMISSION_NOT_DURABLE:child-callback"
+            );
+            assert_eq!(store.readback().expect("missing admission readback").intaken_callbacks, 0);
 
-        assert_eq!(transport["method"], "session.terminal_failure");
+            admit_callback_child(&store, &"a".repeat(64));
+            let (transport, delivery) =
+                publish_terminal_failure_callback_from_store(&store, delivery)
+                    .expect("failure callback")
+                    .expect("delegated failure callback");
+
+            assert_eq!(transport["method"], "session.terminal_failure");
+            assert_eq!(
+                transport["payload"]["body"]["item"]["classification"],
+                "UNSETTLED_EFFECT"
+            );
+            assert!(matches!(
+                delivery.callback_effect_identity,
+                Some(CallbackEffectIdentity::UnsettledEffect { .. })
+            ));
+            let readback = store.readback().expect("readback");
+            assert_eq!(readback.pending_callbacks, 0);
+            assert_eq!(readback.intaken_callbacks, 1);
+            assert_eq!(readback.acknowledged_callbacks, 0);
+            assert_eq!(readback.acknowledged_receipts, 0);
+        }
+
+        let root = tempfile::tempdir().expect("mismatched admission root");
+        let (store, delivery) = durable_callback_fixture(root.path(), TerminalState::Failed);
+        admit_callback_child(&store, &"b".repeat(64));
         assert_eq!(
-            transport["payload"]["body"]["item"]["classification"],
-            "UNSETTLED_EFFECT"
+            publish_terminal_failure_callback_from_store(&store, delivery)
+                .expect_err("mismatched admission must fail closed")
+                .to_string(),
+            "TERMINAL_CALLBACK_ADMISSION_IDENTITY_MISMATCH:child-callback"
         );
-        assert!(matches!(
-            delivery.callback_effect_identity,
-            Some(CallbackEffectIdentity::UnsettledEffect { .. })
-        ));
-        let readback = store.readback().expect("readback");
-        assert_eq!(readback.pending_callbacks, 0);
-        assert_eq!(readback.intaken_callbacks, 1);
-        assert_eq!(readback.acknowledged_callbacks, 0);
-        assert_eq!(readback.acknowledged_receipts, 0);
+        assert_eq!(store.readback().expect("mismatch readback").intaken_callbacks, 0);
     }
 }
