@@ -2415,10 +2415,7 @@ fn validate_terminal_receipt(
                 .get("exit_code")
                 .and_then(Value::as_i64)
                 .is_some_and(|exit_code| exit_code != 0)
-            && receipt
-                .get("reconcile_required")
-                .and_then(Value::as_bool)
-                .is_some()
+            && receipt.get("reconcile_required").and_then(Value::as_bool) == Some(true)
     };
     let valid = common_valid && terminal_valid;
     if valid {
@@ -2937,6 +2934,53 @@ mod interrupted_read_only_reconciliation_tests {
             "reconcile_required": false,
             "replay_semantics": "durable_read_only_reconstruction"
         })
+    }
+
+    fn failed_terminal_receipt(call_id: &str, reconcile_required: bool) -> Value {
+        json!({
+            "schema_version": "tura_command_terminal_receipt_v1",
+            "call_id": call_id,
+            "pid": 4242,
+            "terminal_state": "failed",
+            "failure_class": "workload_exit_nonzero",
+            "termination_origin": "workload",
+            "exit_code": 2,
+            "wall_time_ms": 10,
+            "wall_timeout_ms": 300000,
+            "stall_timeout_ms": null,
+            "outcome": "known",
+            "process_reaped": true,
+            "process_group_empty": true,
+            "termination_proven": true,
+            "authority_effect": "none",
+            "authoritative_publication": "unproven",
+            "staging_authority": "none",
+            "retry_safe": false,
+            "auto_retry_allowed": false,
+            "reconcile_required": reconcile_required,
+            "replay_semantics": "durable_failed_command_reconstruction"
+        })
+    }
+
+    #[test]
+    fn failed_terminal_receipt_requires_explicit_reconciliation() {
+        validate_terminal_receipt(
+            0,
+            &failed_terminal_receipt("runtime-test:call-test", true),
+            false,
+        )
+        .expect("known failed receipt with explicit reconciliation is deliverable");
+
+        let error = validate_terminal_receipt(
+            0,
+            &failed_terminal_receipt("runtime-test:call-test", false),
+            false,
+        )
+        .expect_err("failed receipt without reconciliation must remain fail closed");
+        assert!(matches!(
+            error,
+            OfficialCodexAppServerError::UncertainToolEffect { effect_index: 0, .. }
+        ));
     }
 
     fn receipt_directory(session_directory: &Path) -> PathBuf {
