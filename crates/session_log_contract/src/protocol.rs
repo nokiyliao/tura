@@ -1,7 +1,7 @@
 use crate::CommandCheckpoint;
 use lifecycle::{
-    ContextTokenStats, RuntimeAggregate, RuntimeEvent, RuntimeProjection, SessionCommand,
-    RuntimeState, SessionEvent, SessionManagement, SessionManagementDelta, SessionProjection,
+    ContextTokenStats, RuntimeAggregate, RuntimeEvent, RuntimeProjection, RuntimeState,
+    SessionCommand, SessionEvent, SessionManagement, SessionManagementDelta, SessionProjection,
     SessionState, UsageReport,
 };
 use serde::{Deserialize, Serialize};
@@ -334,7 +334,10 @@ impl RuntimeLifecycleIdentity {
             }
         }
         for (name, value) in [("task_id", &self.task_id), ("goal_id", &self.goal_id)] {
-            if value.as_deref().is_some_and(|value| value.trim().is_empty()) {
+            if value
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
                 return Err(format!("{name} must be null or non-empty"));
             }
         }
@@ -517,6 +520,23 @@ pub struct GetRuntimeLeaseRequest {
     pub runtime_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ListRuntimeLocationsRequest {
+    #[serde(default)]
+    pub page: u64,
+    #[serde(default = "default_page_size")]
+    pub page_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLocation {
+    pub runtime_id: String,
+    pub session_id: String,
+    pub workspace_db_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -769,6 +789,7 @@ pub enum SessionLogCommand {
     SubscribeSessionFeed,
     ReplayRuntime(ReplayRuntimeRequest),
     GetRuntimeLease(GetRuntimeLeaseRequest),
+    ListRuntimeLocations(ListRuntimeLocationsRequest),
     RecoveryCloseRuntime(RecoveryCloseRuntimeRequest),
     PersistSessionDelta(Box<PersistSessionDeltaRequest>),
     ReadContextSlice(ReadContextSliceRequest),
@@ -823,6 +844,10 @@ pub enum SessionLogResponse {
     },
     RuntimeLeaseRead {
         runtime: Option<RuntimeLeaseSnapshot>,
+    },
+    RuntimeLocations {
+        page: Page,
+        locations: Vec<RuntimeLocation>,
     },
     RuntimeRecoveryClosed {
         result: RecoveryCloseRuntimeOutcome,
@@ -966,11 +991,13 @@ mod tests {
                 .expect("register runtime round trip"),
             register
         );
-        assert!(serde_json::from_value::<RegisterRuntimeRequest>(json!({
-            "runtime_id": "runtime",
-            "session_id": "session"
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<RegisterRuntimeRequest>(json!({
+                "runtime_id": "runtime",
+                "session_id": "session"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1191,30 +1218,32 @@ mod tests {
 
         let value = serde_json::to_value(create).expect("create json");
         assert!(serde_json::from_value::<CreateSessionRequest>(value).is_ok());
-        assert!(serde_json::from_value::<CreateSessionRequest>(json!({
-            "session_id": "session",
-            "creation_command": {
-                "command": "create_session",
-                "task_plan": lifecycle::TaskPlan::default()
-            },
-            "copy_context": false,
-            "workspace": "C:/workspace",
-            "session_directory": "C:/workspace",
-            "name": "Session",
-            "created_at": 1,
-            "model": null,
-            "agent": null,
-            "session_type": "coding",
-            "kill_processes_on_start": false,
-            "validator_enabled": false,
-            "force_planning": false,
-            "model_variant": null,
-            "model_acceleration_enabled": false,
-            "disable_permission_restrictions": false,
-            "use_last_tool_call_response": false,
-            "auto_session_name": true
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<CreateSessionRequest>(json!({
+                "session_id": "session",
+                "creation_command": {
+                    "command": "create_session",
+                    "task_plan": lifecycle::TaskPlan::default()
+                },
+                "copy_context": false,
+                "workspace": "C:/workspace",
+                "session_directory": "C:/workspace",
+                "name": "Session",
+                "created_at": 1,
+                "model": null,
+                "agent": null,
+                "session_type": "coding",
+                "kill_processes_on_start": false,
+                "validator_enabled": false,
+                "force_planning": false,
+                "model_variant": null,
+                "model_acceleration_enabled": false,
+                "disable_permission_restrictions": false,
+                "use_last_tool_call_response": false,
+                "auto_session_name": true
+            }))
+            .is_err()
+        );
         assert!(
             serde_json::from_value::<ExecuteSessionCommandRequest>(json!({
                 "session_id": "session",
@@ -1231,42 +1260,46 @@ mod tests {
             }))
             .is_err()
         );
-        assert!(serde_json::from_value::<UpdateSessionRequest>(json!({
-            "command_id": "update",
-            "session_id": "session",
-            "metadata": { "extra": true },
-            "task_plan_patch": null
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<SessionFeedEvent>(json!({
-            "event": "session_snapshot_created",
-            "snapshot": {
+        assert!(
+            serde_json::from_value::<UpdateSessionRequest>(json!({
+                "command_id": "update",
                 "session_id": "session",
-                "workspace": "C:/workspace",
-                "name": "Session",
-                "parent_id": null,
-                "created_at": 1,
-                "updated_at": 2,
-                "state": "created",
-                "status": "idle",
-                "message_count": 0,
-                "task_management": {},
-                "lifecycle_projection": {
+                "metadata": { "extra": true },
+                "task_plan_patch": null
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SessionFeedEvent>(json!({
+                "event": "session_snapshot_created",
+                "snapshot": {
                     "session_id": "session",
-                    "state": "created",
+                    "workspace": "C:/workspace",
+                    "name": "Session",
                     "parent_id": null,
-                    "task_plan": {},
-                    "pending_user_inputs": [],
-                    "cancelled": false,
-                    "runtime_ids": [],
-                    "active_runtime_id": null
-                },
-                "management": {},
-                "session": {},
-                "todos": [],
-                "extra": true
-            }
-        }))
-        .is_err());
+                    "created_at": 1,
+                    "updated_at": 2,
+                    "state": "created",
+                    "status": "idle",
+                    "message_count": 0,
+                    "task_management": {},
+                    "lifecycle_projection": {
+                        "session_id": "session",
+                        "state": "created",
+                        "parent_id": null,
+                        "task_plan": {},
+                        "pending_user_inputs": [],
+                        "cancelled": false,
+                        "runtime_ids": [],
+                        "active_runtime_id": null
+                    },
+                    "management": {},
+                    "session": {},
+                    "todos": [],
+                    "extra": true
+                }
+            }))
+            .is_err()
+        );
     }
 }

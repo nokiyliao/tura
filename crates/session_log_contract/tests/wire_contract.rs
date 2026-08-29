@@ -1,10 +1,10 @@
 use lifecycle::{SessionAggregate, SessionInput, SessionManagement, SessionQuery, SessionState};
 use serde_json::json;
 use session_log_contract::{
-    GetRuntimeLeaseRequest, GetSessionRequest, RecoveryCloseRuntimeReason,
-    RecoveryCloseRuntimeRequest, RuntimeRecoveryQuiescenceProof, ServiceEndpoint, SessionFeedEvent,
-    SessionLogCommand, SessionLogResponse, SessionMetadata, SessionMetadataPatch, SessionSnapshot,
-    UpdateSessionRequest, UpdateSessionTodosRequest,
+    GetRuntimeLeaseRequest, GetSessionRequest, ListRuntimeLocationsRequest,
+    RecoveryCloseRuntimeReason, RecoveryCloseRuntimeRequest, RuntimeRecoveryQuiescenceProof,
+    ServiceEndpoint, SessionFeedEvent, SessionLogCommand, SessionLogResponse, SessionMetadata,
+    SessionMetadataPatch, SessionSnapshot, UpdateSessionRequest, UpdateSessionTodosRequest,
 };
 
 fn snapshot_fixture(session_id: &str, workspace: &str) -> SessionSnapshot {
@@ -88,6 +88,20 @@ fn session_feed_subscription_command_shape_is_stable() {
 
 #[test]
 fn runtime_recovery_wire_contract_binds_exact_ledger_identity() {
+    assert_eq!(
+        serde_json::to_value(SessionLogCommand::ListRuntimeLocations(
+            ListRuntimeLocationsRequest {
+                page: 2,
+                page_size: 100,
+            },
+        ))
+        .expect("runtime location list command"),
+        json!({
+            "command": "list_runtime_locations",
+            "page": 2,
+            "page_size": 100
+        })
+    );
     assert_eq!(
         serde_json::to_value(GetRuntimeLeaseRequest {
             runtime_id: "runtime-1".to_string(),
@@ -268,11 +282,13 @@ fn session_snapshot_feed_event_shapes_are_stable() {
         serde_json::to_value(SessionFeedEvent::SessionDeleted {}).expect("deleted feed event"),
         json!({ "event": "session_deleted" })
     );
-    assert!(serde_json::from_value::<SessionFeedEvent>(json!({
-        "event": "session_deleted",
-        "snapshot": snapshot
-    }))
-    .is_err());
+    assert!(
+        serde_json::from_value::<SessionFeedEvent>(json!({
+            "event": "session_deleted",
+            "snapshot": snapshot
+        }))
+        .is_err()
+    );
 }
 
 #[test]

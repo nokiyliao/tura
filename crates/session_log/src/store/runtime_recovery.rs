@@ -1,18 +1,18 @@
+use super::SessionLogStore;
+use super::feed::append_session_feed_event_tx;
 use super::helpers::{append_session_event, replay_session_events};
 use super::runtime_events::{load_session_projection_row, persist_session_projection};
-use super::feed::append_session_feed_event_tx;
-use super::SessionLogStore;
 use anyhow::{Context, Result};
 use lifecycle::{
     RuntimeAggregate, RuntimeError, RuntimeEvent, RuntimeState, SessionCommand, SessionQuery,
     SessionState,
 };
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use session_log_contract::{
-    recovery_terminal_projection_event_id, GetRuntimeLeaseRequest,
-    RecoveryCloseRuntimeOutcome, RecoveryCloseRuntimeReason, RecoveryCloseRuntimeRequest,
-    RuntimeLeaseSnapshot, RuntimeRecoveryReceipt, SessionFeedEvent,
+    GetRuntimeLeaseRequest, RecoveryCloseRuntimeOutcome, RecoveryCloseRuntimeReason,
+    RecoveryCloseRuntimeRequest, RuntimeLeaseSnapshot, RuntimeRecoveryReceipt, SessionFeedEvent,
+    recovery_terminal_projection_event_id,
 };
 use std::path::{Path, PathBuf};
 
@@ -620,9 +620,10 @@ mod tests {
     };
     use session_log_contract::{
         ActivateRuntimeLeaseRequest, CommitRuntimeEventRequest, CreateSessionRequest,
-        ExecuteSessionCommandRequest, GetSessionRequest, MarkSessionInterruptedRequest,
-        ReadSessionFeedRequest, RegisterRuntimeRequest, ReplayRuntimeRequest,
-        RuntimeEventCommitOutcome, RuntimeRecoveryQuiescenceProof, RuntimeRegistrationOutcome,
+        ExecuteSessionCommandRequest, GetSessionRequest, ListRuntimeLocationsRequest,
+        MarkSessionInterruptedRequest, ReadSessionFeedRequest, RegisterRuntimeRequest,
+        ReplayRuntimeRequest, RuntimeEventCommitOutcome, RuntimeRecoveryQuiescenceProof,
+        RuntimeRegistrationOutcome,
     };
 
     #[derive(Debug, PartialEq)]
@@ -756,12 +757,13 @@ mod tests {
         }
 
         fn interrupt(&self) {
-            assert!(self
-                .store
-                .mark_session_interrupted(MarkSessionInterruptedRequest {
-                    session_id: self.session_id.clone(),
-                })
-                .expect("interrupt recovery session"));
+            assert!(
+                self.store
+                    .mark_session_interrupted(MarkSessionInterruptedRequest {
+                        session_id: self.session_id.clone(),
+                    })
+                    .expect("interrupt recovery session")
+            );
         }
 
         fn set_owner_state(&self, state: SessionState) {
@@ -916,6 +918,107 @@ mod tests {
         assert_eq!(snapshot.last_event_seq, 0);
         assert_eq!(snapshot.session_event_seq, 2);
         assert_eq!(snapshot.session_state, SessionState::Running);
+    }
+
+    #[test]
+    fn runtime_location_only_row_is_discovered_and_terminalized_exactly_once() {
+        let fixture = RecoveryFixture::new("location-only");
+        fixture.interrupt();
+        fixture
+            .store
+            .with_index_connection(|conn| {
+                conn.execute(
+                    "DELETE FROM sessions WHERE session_id = ?1",
+                    params![fixture.session_id],
+                )?;
+                Ok(())
+            })
+            .expect("remove derived session index row");
+
+        assert!(
+            fixture
+                .store
+                .list_workspaces()
+                .expect("list workspaces")
+                .is_empty()
+        );
+        let (page, locations) = fixture
+            .store
+            .list_runtime_locations(ListRuntimeLocationsRequest {
+                page: 0,
+                page_size: 1,
+            })
+            .expect("list authoritative runtime registrations");
+        assert_eq!(page.total, 1);
+        assert_eq!(locations.len(), 1);
+        let location = &locations[0];
+        assert_eq!(location.runtime_id, fixture.runtime_id);
+        assert_eq!(location.session_id, fixture.session_id);
+        assert_eq!(
+            std::fs::canonicalize(&location.workspace_db_path)
+                .expect("canonical indexed runtime database")
+                .to_string_lossy(),
+            fixture.database_path
+        );
+
+        let snapshot = fixture
+            .store
+            .get_runtime_lease(GetRuntimeLeaseRequest {
+                runtime_id: location.runtime_id.clone(),
+                database_path: Some(
+                    std::fs::canonicalize(&location.workspace_db_path)
+                        .expect("canonical registered runtime database")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            })
+            .expect("read exact registered runtime")
+            .expect("registered runtime exists");
+        let receipt_id = "runtime-location-only-recovery";
+        let request = fixture.request(
+            receipt_id,
+            RecoveryCloseRuntimeReason::UnbornRuntime,
+            snapshot.revision,
+        );
+        assert!(matches!(
+            fixture
+                .store
+                .recovery_close_runtime(request.clone())
+                .expect("close runtime location-only row"),
+            RecoveryCloseRuntimeOutcome::Closed { ref receipt }
+                if receipt.runtime_id == fixture.runtime_id
+                    && receipt.session_id == fixture.session_id
+                    && receipt.terminal
+                    && !receipt.lease_active
+        ));
+        assert!(matches!(
+            fixture
+                .store
+                .recovery_close_runtime(request)
+                .expect("replay runtime location-only close"),
+            RecoveryCloseRuntimeOutcome::AlreadyClosed { .. }
+        ));
+        assert_eq!(fixture.recovery_receipt_count(receipt_id), 1);
+
+        let (terminal, lease_active, terminal_projection_count) = fixture
+            .store
+            .with_workspace_connection(Path::new(&fixture.database_path), |conn| {
+                let (terminal, lease_active) = conn.query_row(
+                    "SELECT terminal, lease_active FROM runtimes WHERE runtime_id = ?1",
+                    params![fixture.runtime_id],
+                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+                )?;
+                let terminal_projection_count = conn.query_row(
+                    "SELECT COUNT(*) FROM session_feed_events WHERE event_id = ?1",
+                    ["runtime-recovery:runtime-location-only-recovery:session-projection"],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                Ok((terminal, lease_active, terminal_projection_count))
+            })
+            .expect("read exact location-only terminal ledger");
+        assert!(terminal);
+        assert!(!lease_active);
+        assert_eq!(terminal_projection_count, 1);
     }
 
     #[test]
@@ -1106,13 +1209,19 @@ mod tests {
             let terminal_projection_count = feed
                 .iter()
                 .filter(|entry| {
-                    entry.event_id
-                        == format!("runtime-recovery:{receipt_id}:session-projection")
-                        && matches!(entry.event, SessionFeedEvent::SessionProjectionUpdated { .. })
+                    entry.event_id == format!("runtime-recovery:{receipt_id}:session-projection")
+                        && matches!(
+                            entry.event,
+                            SessionFeedEvent::SessionProjectionUpdated { .. }
+                        )
                 })
                 .count();
             assert_eq!(terminal_projection_count, 1, "row={source}");
-            assert_eq!(fixture.recovery_receipt_count(&receipt_id), 1, "row={source}");
+            assert_eq!(
+                fixture.recovery_receipt_count(&receipt_id),
+                1,
+                "row={source}"
+            );
 
             let other_terminal_count = fixture
                 .store
@@ -1135,7 +1244,11 @@ mod tests {
                 RecoveryCloseRuntimeOutcome::AlreadyClosed { ref receipt }
                     if receipt.runtime_id == fixture.runtime_id
             ));
-            assert_eq!(fixture.recovery_receipt_count(&receipt_id), 1, "row={source}");
+            assert_eq!(
+                fixture.recovery_receipt_count(&receipt_id),
+                1,
+                "row={source}"
+            );
         }
     }
 
@@ -1143,13 +1256,15 @@ mod tests {
     fn unborn_runtime_ignores_unrelated_global_activity_but_rejects_target_liveness() {
         let fixture = RecoveryFixture::new("unborn");
         fixture.interrupt();
-        assert!(fixture
-            .store
-            .replay_runtime(ReplayRuntimeRequest {
-                runtime_id: fixture.runtime_id.clone(),
-            })
-            .expect("replay unborn before recovery")
-            .is_none());
+        assert!(
+            fixture
+                .store
+                .replay_runtime(ReplayRuntimeRequest {
+                    runtime_id: fixture.runtime_id.clone(),
+                })
+                .expect("replay unborn before recovery")
+                .is_none()
+        );
         let mut request = fixture.request(
             "recovery-receipt-unborn",
             RecoveryCloseRuntimeReason::UnbornRuntime,
@@ -1182,13 +1297,15 @@ mod tests {
                 .expect("replay unborn recovery"),
             RecoveryCloseRuntimeOutcome::AlreadyClosed { .. }
         ));
-        assert!(fixture
-            .store
-            .replay_runtime(ReplayRuntimeRequest {
-                runtime_id: fixture.runtime_id.clone(),
-            })
-            .expect("replay unborn after recovery")
-            .is_none());
+        assert!(
+            fixture
+                .store
+                .replay_runtime(ReplayRuntimeRequest {
+                    runtime_id: fixture.runtime_id.clone(),
+                })
+                .expect("replay unborn after recovery")
+                .is_none()
+        );
 
         let live = RecoveryFixture::new("target-live");
         live.interrupt();
@@ -1324,22 +1441,26 @@ mod tests {
             })
             .expect("remove stale derived runtime route");
 
-        assert!(fixture
-            .store
-            .get_runtime_lease(GetRuntimeLeaseRequest {
-                runtime_id: fixture.runtime_id.clone(),
-                database_path: None,
-            })
-            .expect("read through missing derived route")
-            .is_none());
-        assert!(fixture
-            .store
-            .get_runtime_lease(GetRuntimeLeaseRequest {
-                runtime_id: fixture.runtime_id.clone(),
-                database_path: Some(fixture.database_path.clone()),
-            })
-            .expect("read through exact recovery path")
-            .is_some());
+        assert!(
+            fixture
+                .store
+                .get_runtime_lease(GetRuntimeLeaseRequest {
+                    runtime_id: fixture.runtime_id.clone(),
+                    database_path: None,
+                })
+                .expect("read through missing derived route")
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .get_runtime_lease(GetRuntimeLeaseRequest {
+                    runtime_id: fixture.runtime_id.clone(),
+                    database_path: Some(fixture.database_path.clone()),
+                })
+                .expect("read through exact recovery path")
+                .is_some()
+        );
         assert!(matches!(
             fixture
                 .store

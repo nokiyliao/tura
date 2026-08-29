@@ -135,6 +135,9 @@ runtime_locations
   session_id
   workspace_db_path
 
+`ListRuntimeLocations` exposes this authoritative registration set through a bounded, read-only
+page. Router startup recovery uses it independently of the derived `sessions` index.
+
 command_checkpoints
   idempotency_key
   session_id

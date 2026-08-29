@@ -15,7 +15,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use crate::SessionLogStore;
@@ -216,6 +216,10 @@ pub(crate) fn execute_command_with_feed(
         SessionLogCommand::GetSession(payload) => SessionLogResponse::Session {
             session: store.get_session(payload)?.map(Box::new),
         },
+        SessionLogCommand::ListRuntimeLocations(payload) => {
+            let (page, locations) = store.list_runtime_locations(payload)?;
+            SessionLogResponse::RuntimeLocations { page, locations }
+        }
         SessionLogCommand::ListSessions(payload) => {
             let (page, sessions) = store.list_sessions(payload)?;
             SessionLogResponse::Sessions { page, sessions }
@@ -1495,10 +1499,12 @@ mod tests {
         write_response_command(&mut client, &command);
         assert!(matches!(read_response(&mut reader), SessionLogResponse::Ok));
         assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
-        assert!(store
-            .get_session(GetSessionRequest { session_id })
-            .expect("read deleted session")
-            .is_none());
+        assert!(
+            store
+                .get_session(GetSessionRequest { session_id })
+                .expect("read deleted session")
+                .is_none()
+        );
         drop(reader);
         drop(client);
         server
@@ -1550,10 +1556,12 @@ mod tests {
             SessionLogResponse::Error { error } if error.contains("session delete rejected")
         ));
         assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
-        assert!(store
-            .get_session(GetSessionRequest { session_id })
-            .expect("read rolled back session")
-            .is_some());
+        assert!(
+            store
+                .get_session(GetSessionRequest { session_id })
+                .expect("read rolled back session")
+                .is_some()
+        );
         drop(reader);
         drop(client);
         server

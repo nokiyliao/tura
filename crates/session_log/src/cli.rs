@@ -1,10 +1,11 @@
 use std::io::Read;
 
-use crate::{file_queue, ipc, SessionLogStore};
+use crate::{SessionLogStore, file_queue, ipc};
 use session_log_contract::client::{call_service, service_is_running};
 use session_log_contract::{
-    DeleteSessionRequest, DeleteWorkspaceRequest, GetSessionRequest, ListSessionRecordsRequest,
-    ListSessionsRequest, MarkSessionInterruptedRequest, SessionLogCommand, SessionLogResponse,
+    DeleteSessionRequest, DeleteWorkspaceRequest, GetSessionRequest, ListRuntimeLocationsRequest,
+    ListSessionRecordsRequest, ListSessionsRequest, MarkSessionInterruptedRequest,
+    SessionLogCommand, SessionLogResponse,
 };
 
 /// Developer query CLI for the session DB.
@@ -23,6 +24,9 @@ pub fn run() -> anyhow::Result<()> {
     let parsed = match command.as_str() {
         "list-workspaces" => SessionLogCommand::ListWorkspaces,
         "get-session" => SessionLogCommand::GetSession(read_json::<GetSessionRequest>()?),
+        "list-runtime-locations" => {
+            SessionLogCommand::ListRuntimeLocations(read_json::<ListRuntimeLocationsRequest>()?)
+        }
         "list-sessions" => SessionLogCommand::ListSessions(read_json::<ListSessionsRequest>()?),
         "list-session-records" => {
             SessionLogCommand::ListSessionRecords(read_json::<ListSessionRecordsRequest>()?)

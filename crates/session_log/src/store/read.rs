@@ -1,21 +1,57 @@
+use super::SessionLogStore;
 use super::connection::{init_workspace_db, with_connection};
 use super::helpers::{bounded_page, parse_json_field};
 use super::payload::{
-    index_session_from_row, load_workspace_session_payload, load_workspace_session_summary_payload,
-    IndexSessionRow,
+    IndexSessionRow, index_session_from_row, load_workspace_session_payload,
+    load_workspace_session_summary_payload,
 };
-use super::SessionLogStore;
 use crate::path::normalize_workspace;
 use anyhow::Result;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use session_log_contract::{
-    ContextSlice, GetSessionRequest, ListSessionRecordsRequest, ListSessionsRequest, Page,
-    ReadContextSliceRequest, SessionContextRecord, SessionRecord, SessionSnapshot, SessionSummary,
-    WorkspaceSummary,
+    ContextSlice, GetSessionRequest, ListRuntimeLocationsRequest, ListSessionRecordsRequest,
+    ListSessionsRequest, Page, ReadContextSliceRequest, RuntimeLocation, SessionContextRecord,
+    SessionRecord, SessionSnapshot, SessionSummary, WorkspaceSummary,
 };
 use std::path::Path;
 
 impl SessionLogStore {
+    pub fn list_runtime_locations(
+        &self,
+        request: ListRuntimeLocationsRequest,
+    ) -> Result<(Page, Vec<RuntimeLocation>)> {
+        let page_size = request.page_size.clamp(1, 500);
+        self.with_index_connection(|conn| {
+            let total = conn.query_row("SELECT COUNT(*) FROM runtime_locations", [], |row| {
+                row.get::<_, u64>(0)
+            })?;
+            let page = bounded_page(request.page, page_size, total, false);
+            let mut statement = conn.prepare(
+                "SELECT runtime_id, session_id, workspace_db_path
+                 FROM runtime_locations
+                 ORDER BY runtime_id ASC
+                 LIMIT ?1 OFFSET ?2",
+            )?;
+            let locations = statement
+                .query_map(params![page_size, page.saturating_mul(page_size)], |row| {
+                    Ok(RuntimeLocation {
+                        runtime_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        workspace_db_path: row.get(2)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok((
+                Page {
+                    page,
+                    page_size,
+                    total,
+                },
+                locations,
+            ))
+        })
+    }
+
     pub fn read_context_slice(&self, request: ReadContextSliceRequest) -> Result<ContextSlice> {
         if request.max_estimated_tokens == 0 {
             anyhow::bail!("context token budget must be greater than zero");
