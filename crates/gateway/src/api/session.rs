@@ -4,13 +4,13 @@ use crate::api::product::current_user_snapshot;
 use crate::contracts::*;
 use crate::mock::global_store;
 use crate::router_client::RouterClient;
-use crate::session::config::{load_config, merge_config, TuraSessionConfig};
-use crate::session::{session_store, MessageRole as SessionMessageRole};
+use crate::session::config::{TuraSessionConfig, load_config, merge_config};
+use crate::session::{MessageRole as SessionMessageRole, session_store};
 use axum::{
+    Json,
     extract::{Path, Query},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -41,13 +41,6 @@ pub async fn list_sessions_value(
         .or(header_directory)
         .or_else(|| global_store().get_current_directory());
 
-    let listed = filter_list_sessions(
-        session_store().list_sessions(),
-        &params,
-        directory.as_deref(),
-    );
-    refresh_busy_session_liveness(&listed).await;
-
     let mut sessions = filter_list_sessions(
         session_store().list_sessions(),
         &params,
@@ -68,83 +61,6 @@ pub async fn list_sessions_value(
     }
 
     sessions
-}
-
-async fn refresh_busy_session_liveness(sessions: &[Session]) {
-    let busy_session_ids = sessions
-        .iter()
-        .filter(|session| session.status == SessionStatus::Busy)
-        .map(|session| session.id.clone())
-        .collect::<Vec<_>>();
-    if busy_session_ids.is_empty() {
-        return;
-    }
-
-    let inactive_session_ids = match RouterClient::global().probe_sessions(&busy_session_ids) {
-        Ok(payload) => inactive_sessions_from_probe(&busy_session_ids, &payload),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                sessions = ?busy_session_ids,
-                "runtime liveness probe failed; marking busy sessions interrupted"
-            );
-            busy_session_ids
-        }
-    };
-
-    for session_id in inactive_session_ids {
-        mark_session_interrupted_from_gateway_probe(&session_id).await;
-    }
-}
-
-fn inactive_sessions_from_probe(
-    expected_session_ids: &[String],
-    payload: &serde_json::Value,
-) -> Vec<String> {
-    let active = payload
-        .get("sessions")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            let session_id = entry
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)?;
-            let active = entry
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| matches!(value, "active" | "queued" | "running"))
-                || entry
-                    .get("active_turn")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-                || entry
-                    .get("worker_alive")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-            active.then_some(session_id.to_string())
-        })
-        .collect::<std::collections::HashSet<_>>();
-
-    expected_session_ids
-        .iter()
-        .filter(|session_id| !active.contains(*session_id))
-        .cloned()
-        .collect()
-}
-
-async fn mark_session_interrupted_from_gateway_probe(session_id: &str) {
-    if let Err(error) = session_store()
-        .execute_canonical_session_command(session_id, SessionCommand::InterruptSession)
-    {
-        tracing::warn!(
-            session_id,
-            error,
-            "failed to apply runtime liveness interruption"
-        );
-        return;
-    }
-    session_store().finish_todos(session_id, false);
 }
 
 fn filter_list_sessions(

@@ -1,19 +1,19 @@
 use super::{
-    api_message_from_store, apply_single_change, config_model_override, filter_list_sessions,
-    first_prompt_part_id, frontend_safe_reply_message, frontend_safe_value,
-    inactive_sessions_from_probe, prompt_command_run_shell, prompt_message_id,
-    prompt_model_acceleration, prompt_model_variant, prompt_text, workspace_key,
-    SessionChangeRecord, SessionListParams,
+    SessionChangeRecord, SessionListParams, api_message_from_store, apply_single_change,
+    config_model_override, filter_list_sessions, first_prompt_part_id, frontend_safe_reply_message,
+    frontend_safe_value, prompt_command_run_shell, prompt_message_id, prompt_model_acceleration,
+    prompt_model_variant, prompt_text, workspace_key,
 };
 use crate::contracts::{Session, SessionContextTokens, SessionStatus};
 use crate::session::config::TuraSessionConfig;
 use crate::session_store;
 use crate::test_support::SessionDbTestService;
 use axum::{
+    Json,
     extract::{Path, Query},
     http::HeaderMap,
-    Json,
 };
+use lifecycle::{SessionCommand, SessionState};
 use std::fs;
 
 async fn create_canonical_test_session(directory: String) -> Session {
@@ -28,6 +28,71 @@ async fn create_canonical_test_session(directory: String) -> Session {
     )
     .await
     .expect("canonical test session should be created")
+}
+
+#[tokio::test]
+async fn session_list_does_not_mutate_running_lifecycle_when_router_is_unavailable() {
+    let _service = SessionDbTestService::start();
+    let directory = std::env::temp_dir()
+        .join(format!(
+            "tura-session-list-observer-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .to_string_lossy()
+        .to_string();
+    let session = create_canonical_test_session(directory.clone()).await;
+    let runtime_id = "runtime-observer-test".to_string();
+
+    session_store()
+        .execute_canonical_session_command(
+            &session.id,
+            SessionCommand::RuntimeStarted {
+                runtime_id: runtime_id.clone(),
+            },
+        )
+        .expect("runtime should start");
+
+    for _ in 0..2 {
+        let listed = super::list_sessions_value(
+            SessionListParams {
+                directory: Some(directory.clone()),
+                include_children: true,
+                ..SessionListParams::default()
+            },
+            None,
+        )
+        .await;
+        assert_eq!(
+            listed
+                .iter()
+                .find(|item| item.id == session.id)
+                .map(|item| item.status.clone()),
+            Some(SessionStatus::Busy)
+        );
+        assert_eq!(
+            session_store()
+                .session_lifecycle_projection(&session.id)
+                .expect("running lifecycle projection")
+                .state,
+            SessionState::Running
+        );
+    }
+
+    session_store()
+        .execute_canonical_session_command(
+            &session.id,
+            SessionCommand::RuntimeCompleted { runtime_id },
+        )
+        .expect("runtime completion should terminalize the running session");
+    assert_eq!(
+        session_store()
+            .session_lifecycle_projection(&session.id)
+            .expect("completed lifecycle projection")
+            .state,
+        SessionState::Completed
+    );
+
+    let _ = fs::remove_dir_all(directory);
 }
 
 #[test]
@@ -585,51 +650,5 @@ fn apply_single_change_reports_target_directory_context() {
     assert!(
         message.contains(&blocking_parent.to_string_lossy().to_string()),
         "error should include the target directory path: {message}"
-    );
-}
-
-#[test]
-fn inactive_sessions_from_probe_keeps_active_sessions() {
-    let expected = vec![
-        "active".to_string(),
-        "queued".to_string(),
-        "running".to_string(),
-        "worker".to_string(),
-    ];
-    let inactive = inactive_sessions_from_probe(
-        &expected,
-        &serde_json::json!({
-            "sessions": [
-                { "session_id": "active", "status": "active" },
-                { "session_id": "queued", "status": "queued" },
-                { "session_id": "running", "status": "running" },
-                { "session_id": "worker", "worker_alive": true }
-            ]
-        }),
-    );
-
-    assert!(inactive.is_empty());
-}
-
-#[test]
-fn inactive_sessions_from_probe_marks_missing_or_inactive_sessions() {
-    let expected = vec![
-        "inactive".to_string(),
-        "missing".to_string(),
-        "active".to_string(),
-    ];
-    let inactive = inactive_sessions_from_probe(
-        &expected,
-        &serde_json::json!({
-            "sessions": [
-                { "session_id": "inactive", "status": "inactive" },
-                { "session_id": "active", "active_turn": true }
-            ]
-        }),
-    );
-
-    assert_eq!(
-        inactive,
-        vec!["inactive".to_string(), "missing".to_string()]
     );
 }
