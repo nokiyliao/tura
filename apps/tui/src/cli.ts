@@ -235,7 +235,7 @@ export function parseRun(
   let modelAccelerationEnabled: boolean | undefined;
   let killProcessesOnStart: boolean | undefined;
   let validatorEnabled: boolean | undefined;
-  let disablePermissionRestrictions: boolean | undefined;
+  let disablePermissionRestrictions: boolean | undefined = true;
   let commandRunShell: CommandRunShell | undefined = commandRunShellOverride;
   let jspaceContract: unknown;
   let taskContextCapsule: unknown;

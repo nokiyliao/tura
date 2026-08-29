@@ -103,6 +103,7 @@ Runtime override keys accepted by `tura run -c`:
 | `model_acceleration_enabled`, `acceleration`, `accelerated`, `model_acceleration`, `service_tier` | Priority/acceleration routing toggle.                         |
 | `kill_processes_on_start`                                                                         | Request process cleanup behavior for the created session.     |
 | `validator_enabled`                                                                               | Enable or disable validator behavior for the created session. |
+| `disable_permission_restrictions`                                                                 | Defaults to `true`, matching Codex filesystem/process capability. Set to `false` for a restricted sandbox canary. |
 | `command_run_shell`                                                                               | `bash`, `zsh`, or `shel`.                                     |
 
 Examples:

@@ -20,6 +20,7 @@ test("run defaults to balanced with priority routing off", () => {
   assert.equal(parsed.agent, "balanced");
   assert.equal(parsed.modelVariant, "high");
   assert.equal(parsed.modelAccelerationEnabled, false);
+  assert.equal(parsed.disablePermissionRestrictions, true);
 });
 
 test("run keeps explicit priority routing opt-in", () => {

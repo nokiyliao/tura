@@ -46,6 +46,26 @@ test("existing run without a permission override preserves session management", 
   assert.equal(updateCount, 0);
 });
 
+test("existing run applies the CLI default permission setting", async () => {
+  const updates: Array<{ sessionID: string; payload: Partial<Session> }> = [];
+  const client = {
+    async getSession(): Promise<Session> {
+      throw new Error("CLI default must update the existing session");
+    },
+    async updateSession(sessionID: string, payload: Partial<Session>): Promise<Session> {
+      updates.push({ sessionID, payload });
+      return { id: sessionID, ...payload };
+    },
+  } as Pick<GatewayClient, "getSession" | "updateSession">;
+
+  const session = await resolveExistingRunSession(client, "session-default", true);
+
+  assert.equal(session.disable_permission_restrictions, true);
+  assert.deepEqual(updates, [
+    { sessionID: "session-default", payload: { disable_permission_restrictions: true } },
+  ]);
+});
+
 test("polling transport detaches without aborting an accepted busy execution", async () => {
   let abortCount = 0;
   const messages: Message[] = [
