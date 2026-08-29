@@ -130,10 +130,16 @@ impl RouterProcess {
 
     pub fn ensure_started(&self) -> Result<()> {
         let _startup_guard = self.startup_lock.lock();
-        if let Some((endpoint, _health)) = self.healthy_owned_router_endpoint()? {
+        if let Some((endpoint, _health)) = self.healthy_current_router_endpoint()? {
             *self.addr.lock() = Some(endpoint.addr);
             *self.last_error.lock() = None;
             return Ok(());
+        }
+
+        if self.managed_router_child_alive() {
+            let error = "ROUTER_ENDPOINT_UNPROVEN_WHILE_MANAGED_CHILD_ALIVE: refusing destructive restart of an identity-bound live child".to_string();
+            *self.last_error.lock() = Some(error.clone());
+            return Err(anyhow!(error));
         }
 
         let startup_budget = router_startup_timeout();
@@ -185,7 +191,7 @@ impl RouterProcess {
     }
 
     pub fn status(&self) -> RouterProcessStatus {
-        match self.healthy_owned_router_endpoint() {
+        match self.healthy_current_router_endpoint() {
             Ok(Some((endpoint, _health))) => {
                 *self.addr.lock() = Some(endpoint.addr);
                 RouterProcessStatus {
@@ -197,7 +203,7 @@ impl RouterProcess {
                 }
             }
             Ok(None) => match self.ensure_started() {
-                Ok(()) => match self.healthy_owned_router_endpoint() {
+                Ok(()) => match self.healthy_current_router_endpoint() {
                     Ok(Some((endpoint, _health))) => {
                         *self.addr.lock() = Some(endpoint.addr);
                         RouterProcessStatus {
@@ -485,6 +491,44 @@ impl RouterProcess {
         self.healthy_owned_router_endpoint_with_timeout(ROUTER_HEALTH_REQUEST_TIMEOUT)
     }
 
+    fn healthy_current_router_endpoint(
+        &self,
+    ) -> Result<Option<(RouterEndpoint, serde_json::Value)>> {
+        if let Some(endpoint) = self.healthy_owned_router_endpoint()? {
+            return Ok(Some(endpoint));
+        }
+        self.healthy_cached_managed_router_endpoint()
+    }
+
+    fn healthy_cached_managed_router_endpoint(
+        &self,
+    ) -> Result<Option<(RouterEndpoint, serde_json::Value)>> {
+        if !self.managed_router_child_alive() {
+            return Ok(None);
+        }
+        let Some(addr) = self.addr.lock().clone() else {
+            return Ok(None);
+        };
+        let request = IpcRequest::health_check(
+            "gateway-cached-health-probe",
+            ROUTER_HEALTH_REQUEST_TIMEOUT.as_millis() as u64,
+        );
+        let Ok(response) = call_router_addr(
+            &addr,
+            &request,
+            Some(ROUTER_HEALTH_REQUEST_TIMEOUT),
+        ) else {
+            return Ok(None);
+        };
+        let Some(endpoint) = router_endpoint_from_health(&addr, &response) else {
+            return Ok(None);
+        };
+        if !self.router_binary_matches(&endpoint)? || !self.owns_router_endpoint(&endpoint) {
+            return Ok(None);
+        }
+        Ok(Some((endpoint, response)))
+    }
+
     fn wait_for_healthy_owned_router(&self, deadline: Instant) -> Result<RouterStartupWait> {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -732,6 +776,36 @@ fn healthy_router_endpoint(
         return Ok(None);
     }
     Ok(Some((endpoint, response)))
+}
+
+fn router_endpoint_from_health(
+    addr: &str,
+    response: &serde_json::Value,
+) -> Option<RouterEndpoint> {
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+        || response.pointer("/payload/status").and_then(serde_json::Value::as_str) != Some("ok")
+    {
+        return None;
+    }
+    let binary_sha256 = response
+        .pointer("/payload/binary_sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| is_lower_sha256(value))?
+        .to_string();
+    let pid = response
+        .pointer("/payload/pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())?;
+    let process_start_time = response
+        .pointer("/payload/process_start_time")
+        .and_then(serde_json::Value::as_u64)?;
+    Some(RouterEndpoint {
+        addr: addr.to_string(),
+        version: tura_path::instance_version(),
+        binary_sha256: Some(binary_sha256),
+        pid: Some(pid),
+        process_start_time: Some(process_start_time),
+    })
 }
 
 fn parse_router_endpoint(raw: &str) -> Result<Option<RouterEndpoint>> {
@@ -1148,6 +1222,94 @@ mod tests {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, serde_json::to_string(&endpoint)?)?;
+        Ok(())
+    }
+
+    fn spawn_router_test_child() -> anyhow::Result<std::process::Child> {
+        Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg("router_process::tests::router_process_test_child_waits")
+            .env("TURA_ROUTER_TEST_CHILD_WAIT", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn router test child")
+    }
+
+    #[test]
+    fn router_process_test_child_waits() {
+        if std::env::var("TURA_ROUTER_TEST_CHILD_WAIT").as_deref() == Ok("1") {
+            thread::sleep(Duration::from_secs(10));
+        }
+    }
+
+    #[test]
+    fn missing_addr_preserves_healthy_identity_bound_managed_router() -> anyhow::Result<()> {
+        let _guard = crate::test_support::env_lock();
+        let home = temp_home("tura-router-cached-owned")?;
+        let _env = EnvGuard::set_home(&home);
+        let router_bin = std::env::current_exe()?;
+        let binary_sha256 = file_sha256(&router_bin)?;
+        let mut child = spawn_router_test_child()?;
+        let child_pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let child_start_time = loop {
+            if let Some(value) = current_process_start_time(child_pid) {
+                break value;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                anyhow::bail!("test child process start time did not become visible");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let addr = listener.local_addr()?.to_string();
+        let health_addr = addr.clone();
+        let server = thread::spawn(move || -> anyhow::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request_line = String::new();
+            std::io::BufRead::read_line(
+                &mut BufReader::new(stream.try_clone()?),
+                &mut request_line,
+            )?;
+            let request: IpcRequest = serde_json::from_str(request_line.trim())?;
+            assert_eq!(request.method, METHOD_HEALTH_CHECK);
+            let response = IpcResponse::ok(
+                request.request_id,
+                json!({
+                    "status": "ok",
+                    "pid": child_pid,
+                    "process_start_time": child_start_time,
+                    "binary_sha256": binary_sha256,
+                }),
+            );
+            std::io::Write::write_all(
+                &mut stream,
+                format!("{}\n", serde_json::to_string(&response)?).as_bytes(),
+            )?;
+            std::io::Write::flush(&mut stream)?;
+            Ok(())
+        });
+        let process = RouterProcess {
+            router_bin: Some(router_bin),
+            addr: ParkingMutex::new(Some(health_addr)),
+            child: ParkingMutex::new(Some(child)),
+            startup_lock: ParkingMutex::new(()),
+            request_seq: AtomicU64::new(1),
+            restart_count: AtomicU64::new(0),
+            last_error: ParkingMutex::new(None),
+        };
+
+        assert!(!router_addr_path().exists());
+        process.ensure_started()?;
+        assert_eq!(process.restart_count.load(Ordering::SeqCst), 0);
+        assert!(process.managed_router_child_alive());
+        assert!(process.kill_managed_router_child());
+        server
+            .join()
+            .map_err(|_| anyhow!("cached health server panicked"))??;
         Ok(())
     }
 

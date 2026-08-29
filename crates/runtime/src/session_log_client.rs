@@ -221,6 +221,7 @@ fn session_log_command_name(command: &SessionLogCommand) -> &'static str {
         SessionLogCommand::SubscribeSessionFeed => "subscribe_session_feed",
         SessionLogCommand::ReplayRuntime(_) => "replay_runtime",
         SessionLogCommand::GetRuntimeLease(_) => "get_runtime_lease",
+        SessionLogCommand::ListRuntimeLocations(_) => "list_runtime_locations",
         SessionLogCommand::RecoveryCloseRuntime(_) => "recovery_close_runtime",
         SessionLogCommand::PersistSessionDelta(_) => "persist_session_delta",
         SessionLogCommand::ReadContextSlice(_) => "read_context_slice",

@@ -52,9 +52,15 @@ impl SessionLogStore {
         }
         let outcome = self.with_workspace_connection(&workspace_db_path, |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some((existing_session_id, existing_fallback_from_id, existing_lifecycle_json)) =
-                tx.query_row(
-                    "SELECT session_id, fallback_from_id, lifecycle_json
+            if let Some((
+                existing_session_id,
+                existing_fallback_from_id,
+                existing_lifecycle_json,
+                lease_active,
+                terminal,
+            )) = tx
+                .query_row(
+                    "SELECT session_id, fallback_from_id, lifecycle_json, lease_active, terminal
                      FROM runtimes WHERE runtime_id = ?1",
                     params![request.runtime_id],
                     |row| {
@@ -62,6 +68,8 @@ impl SessionLogStore {
                             row.get::<_, String>(0)?,
                             row.get::<_, Option<String>>(1)?,
                             row.get::<_, Option<String>>(2)?,
+                            row.get::<_, bool>(3)?,
+                            row.get::<_, bool>(4)?,
                         ))
                     },
                 )
@@ -72,17 +80,32 @@ impl SessionLogStore {
                     .map(serde_json::from_str)
                     .transpose()
                     .context("persisted runtime lifecycle identity is invalid")?;
-                return if existing_session_id == request.session_id
-                    && existing_fallback_from_id == request.fallback_from_id
-                    && existing_lifecycle == request.lifecycle
-                {
+                let identity_matches = existing_session_id == request.session_id
+                    && existing_fallback_from_id == request.fallback_from_id;
+                let lifecycle_matches = existing_lifecycle == request.lifecycle;
+                let may_enrich_lifecycle = identity_matches
+                    && existing_lifecycle.is_none()
+                    && request.lifecycle.is_some()
+                    && !lease_active
+                    && !terminal;
+                return if identity_matches && (lifecycle_matches || may_enrich_lifecycle) {
+                    if may_enrich_lifecycle {
+                        tx.execute(
+                            "UPDATE runtimes SET lifecycle_json = ?2 WHERE runtime_id = ?1",
+                            params![request.runtime_id, lifecycle_json],
+                        )?;
+                    }
                     let (revision, last_event_seq) = runtime_cursor(&tx, &request.runtime_id)?;
                     let aggregate = replay_session_events(&tx, &request.session_id)?;
-                    Ok(RuntimeRegistrationOutcome::AlreadyRegistered {
+                    let outcome = RuntimeRegistrationOutcome::AlreadyRegistered {
                         revision,
                         next_event_seq: last_event_seq + 1,
                         projection: aggregate.query(SessionQuery::Lifecycle),
-                    })
+                    };
+                    if may_enrich_lifecycle {
+                        tx.commit()?;
+                    }
+                    Ok(outcome)
                 } else {
                     Ok(RuntimeRegistrationOutcome::RuntimeIdConflict)
                 };
