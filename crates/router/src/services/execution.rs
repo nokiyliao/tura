@@ -3409,7 +3409,8 @@ mod tests {
         complete_and_ack_callback_continuation,
         failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
         is_historical_terminal_runtime, payload_to_run_agent_request,
-        publish_terminal_failure_callback_from_store, replay_terminal_callbacks_from_store,
+        lifecycle_store, publish_terminal_failure_callback_from_store, read_session_snapshot,
+        register_and_activate_runtime, replay_terminal_callbacks_from_store,
         require_successful_runtime_dispatch, runtime_lease_from_snapshot,
         runtime_terminal_state_from_snapshot, terminal_runtime_is_current,
         validate_child_runtime_identity, validate_delegated_input_digest,
@@ -3425,13 +3426,17 @@ mod tests {
     use serde_json::json;
     use session_lifecycle::{
         CallbackEffectIdentity, ChildAdmissionRecord, ContinuationDispatchRecord,
+        ContinuationDispatchState,
         DurableCallbackRecord, LifecycleConfig, SessionLifecycleStore, TerminalReceipt,
         TerminalReceiptIdentity, TerminalState, commander_store_path,
     };
     use session_log_contract::{
         RuntimeLeaseSnapshot, RuntimeLifecycleIdentity, SessionFeedEntry, SessionFeedEvent,
     };
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant};
+
+    static RECOVERY_ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[test]
     fn failed_session_registration_reuses_exact_latest_runtime_lineage() {
@@ -3545,8 +3550,6 @@ mod tests {
                 .contains("FAILED_SESSION_RETRY_ROOT_INPUT_MISMATCH")
         );
     }
-    use std::sync::Arc;
-
     #[test]
     fn recovery_router_payload_rejects_caller_supplied_quiescence() {
         let request = json!({
@@ -5098,6 +5101,105 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_convergence_ledger_callsite_has_zero_durable_mutation() {
+        let _guard = RECOVERY_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().expect("isolated recovery root");
+        let previous_db = std::env::var_os("SESSION_LOG_DB_ROOT");
+        let previous_project = std::env::var_os("TURA_PROJECT_ROOT");
+        let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().and_then(std::path::Path::parent).expect("project root");
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("SESSION_LOG_DB_ROOT", root.path());
+            std::env::set_var("TURA_PROJECT_ROOT", project);
+        }
+        let state = build_state();
+        state.session_db.start().expect("isolated session db");
+        let session_id = "commander-callback";
+        let directory = root.path().join("workspace");
+        std::fs::create_dir_all(&directory).expect("workspace");
+        let created = session_log_contract::client::call_service(
+            &session_log_contract::SessionLogCommand::CreateSession(Box::new(
+                session_log_contract::CreateSessionRequest {
+                    command_id: "create-callsite".into(), session_id: session_id.into(),
+                    creation_command: lifecycle::SessionCommand::CreateSession { task_plan: lifecycle::TaskPlan::default() },
+                    copy_context: false, workspace: directory.display().to_string(),
+                    session_directory: directory.display().to_string(), name: "callsite".into(),
+                    created_at: 1, model: None, agent: None, session_type: "coding".into(),
+                    kill_processes_on_start: false, validator_enabled: false, force_planning: false,
+                    model_variant: None, model_acceleration_enabled: false,
+                    disable_permission_restrictions: true, use_last_tool_call_response: false,
+                    auto_session_name: false, initial_task_plan_patch: None,
+                },
+            )),
+        ).expect("create session");
+        assert!(matches!(created, session_log_contract::SessionLogResponse::SessionCommandApplied { .. }));
+
+        let receipt = callback_receipt(TerminalState::Completed);
+        let mut callback = DurableCallbackRecord::new(
+            &receipt, json!("child result"), json!({"kind": "gateway.callback"}),
+            "a".repeat(64), session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            CallbackEffectIdentity::Exact { effect_id: "message-1".into() },
+        ).expect("callback");
+        callback.commander_thread_id = Some("commander-thread-1".into());
+        let mut continuation = ContinuationDispatchRecord::from_callback(&callback).expect("continuation");
+        continuation.state = ContinuationDispatchState::Dispatched;
+        let runtime_id = continuation.runtime_id.clone();
+        let lease_id = continuation.lease_id.clone();
+        let store = lifecycle_store(session_id).expect("lifecycle store");
+        store.write_terminal_receipt(&receipt).expect("receipt");
+        store.intake(&receipt.transaction_id, &receipt.event_id).expect("receipt intake");
+        store.publish_callback(&callback).expect("callback publish");
+        store.mark_callback_intaken(&callback.transaction_id, &callback.event_id, &callback.callback_payload_sha256).expect("callback intake");
+        store.prepare_callback_continuation(&continuation).expect("prepare continuation");
+        store.mark_callback_continuation_dispatched(&continuation).expect("dispatch continuation");
+        register_and_activate_runtime(session_id, &runtime_id, &lease_id, None, Some(RuntimeLifecycleIdentity {
+            commander_session_id: session_id.into(), transaction_id: continuation.request_id.clone(),
+            parent_mission_revision_sha256: Some(continuation.parent_mission_revision_sha256.clone()),
+            delegated_input_sha256: Some(continuation.delegated_input_sha256.clone()), task_id: None,
+            goal_id: None, operator_override: false, dispatch_runtime_id: runtime_id.clone(),
+            dispatch_lease_id: lease_id.clone(), receipt_event_seq: 0,
+        })).expect("register runtime");
+        let snapshot = match session_log_contract::client::call_service(
+            &session_log_contract::SessionLogCommand::GetRuntimeLease(session_log_contract::GetRuntimeLeaseRequest {
+                runtime_id: runtime_id.clone(), database_path: None,
+            }),
+        ).expect("lease") {
+            session_log_contract::SessionLogResponse::RuntimeLeaseRead { runtime: Some(runtime) } => runtime,
+            other => panic!("unexpected lease {other:?}"),
+        };
+        let before_runtime = serde_json::to_value(session_log_contract::client::call_service(
+            &session_log_contract::SessionLogCommand::ReplayRuntime(session_log_contract::ReplayRuntimeRequest { runtime_id: runtime_id.clone() }),
+        ).expect("runtime before")).expect("serialize runtime");
+        let before_session = read_session_snapshot(session_id).expect("session before");
+        let lifecycle_before = store.readback().expect("lifecycle before");
+        let ledgers = directory.join(".tura/run/effect_ledgers");
+        std::fs::create_dir_all(&ledgers).expect("ledgers");
+        std::fs::write(ledgers.join("malformed.json"), b"{").expect("malformed ledger");
+        let error = ExecutionService::new().recovery_close_runtime(&state, json!({
+            "receipt_id": "callsite-recovery", "database_path": snapshot.database_path,
+            "runtime_id": runtime_id.clone(), "session_id": session_id, "lease_id": lease_id,
+            "expected_lease_active": true, "expected_revision": snapshot.revision,
+            "expected_last_event_seq": snapshot.last_event_seq,
+            "expected_session_event_seq": snapshot.session_event_seq,
+            "expected_session_state": snapshot.session_state, "reason": "orphaned_runtime"
+        })).await.expect_err("malformed evidence must fail closed");
+        assert!(error.to_string().contains("invalid execution ledger"), "{error}");
+        let after_runtime = serde_json::to_value(session_log_contract::client::call_service(
+            &session_log_contract::SessionLogCommand::ReplayRuntime(session_log_contract::ReplayRuntimeRequest { runtime_id }),
+        ).expect("runtime after")).expect("serialize runtime");
+        assert_eq!(before_runtime, after_runtime);
+        assert_eq!(before_session, read_session_snapshot(session_id).expect("session after"));
+        assert_eq!(lifecycle_before, store.readback().expect("lifecycle after"));
+        state.session_db.shutdown();
+        #[allow(unsafe_code)]
+        unsafe {
+            match previous_db { Some(v) => std::env::set_var("SESSION_LOG_DB_ROOT", v), None => std::env::remove_var("SESSION_LOG_DB_ROOT") }
+            match previous_project { Some(v) => std::env::set_var("TURA_PROJECT_ROOT", v), None => std::env::remove_var("TURA_PROJECT_ROOT") }
+        }
     }
 
     #[test]
