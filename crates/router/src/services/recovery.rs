@@ -247,8 +247,22 @@ async fn recover_parent_continuations(
                 "acknowledged": false,
             })])
         }
+        Err(error) if is_commander_active_writer_pre_submit(&error) => Ok(vec![json!({
+            "status": "deferred_commander_active_writer",
+            "transaction_id": delivery.transaction_id,
+            "event_id": delivery.event_id,
+            "acknowledged": false,
+            "provider_effect_accepted": false,
+        })]),
         Err(error) => Err(error),
     }
+}
+
+fn is_commander_active_writer_pre_submit(error: &anyhow::Error) -> bool {
+    let error = error.to_string();
+    error.starts_with("official Codex App Server returned an error for thread/resume:")
+        && error.contains("\"code\":-32600")
+        && error.contains("already has an active writer")
 }
 
 fn read_runtime_snapshot(
@@ -379,7 +393,8 @@ fn startup_recovery_reason(revision: u64, last_event_seq: u64) -> RecoveryCloseR
 mod tests {
     use super::{
         RuntimeLocationRecoveryState, checked_runtime_database_path,
-        quarantined_missing_database_result, runtime_location_recovery_state,
+        is_commander_active_writer_pre_submit, quarantined_missing_database_result,
+        runtime_location_recovery_state,
         startup_recovery_reason, validate_runtime_location,
     };
     use lifecycle::SessionState;
@@ -411,6 +426,21 @@ mod tests {
             startup_recovery_reason(7, 7),
             RecoveryCloseRuntimeReason::OrphanedRuntime
         );
+    }
+
+    #[test]
+    fn active_commander_writer_is_the_only_deferred_provider_error() {
+        let exact = anyhow::anyhow!(
+            "{}",
+            "official Codex App Server returned an error for thread/resume: {\"code\":-32600,\"message\":\"thread commander-1 already has an active writer\"}"
+        );
+        assert!(is_commander_active_writer_pre_submit(&exact));
+
+        let delivery_unknown = anyhow::anyhow!(
+            "{}",
+            "official Codex App Server returned an error for thread/resume: {\"code\":-32603,\"message\":\"delivery uncertain\"}"
+        );
+        assert!(!is_commander_active_writer_pre_submit(&delivery_unknown));
     }
 
     #[test]

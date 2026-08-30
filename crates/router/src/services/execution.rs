@@ -2123,16 +2123,18 @@ fn commander_convergence_fallback_request(
     };
     if snapshot.lifecycle_projection.state != SessionState::Failed
         || snapshot.lifecycle_projection.active_runtime_id.is_some()
-        || snapshot.lifecycle_projection.runtime_ids.last() != Some(&record.runtime_id)
     {
         return Ok(None);
     }
+    let Some(latest_runtime_id) = snapshot.lifecycle_projection.runtime_ids.last() else {
+        return Ok(None);
+    };
     let response = session_log_contract::client::call_service(&SessionLogCommand::ReplayRuntime(
         ReplayRuntimeRequest {
-            runtime_id: record.runtime_id.clone(),
+            runtime_id: latest_runtime_id.clone(),
         },
     ))?;
-    let original = match response {
+    let attempt = match response {
         SessionLogResponse::RuntimeReplayed {
             runtime: Some(runtime),
         } => runtime.aggregate,
@@ -2140,15 +2142,18 @@ fn commander_convergence_fallback_request(
         SessionLogResponse::Error { error } => return Err(anyhow!(error)),
         other => return Err(anyhow!("unexpected runtime replay response: {other:?}")),
     };
-    if original.runtime_id != record.runtime_id
-        || original.session_id != record.commander_session_id
-        || original.state != RuntimeState::Failed
+    if attempt.runtime_id != *latest_runtime_id
+        || attempt.session_id != record.commander_session_id
+        || attempt.state != RuntimeState::Failed
+        || (attempt.runtime_id != record.runtime_id
+            && attempt.fallback_from_id.as_deref() != Some(record.runtime_id.as_str()))
     {
         return Ok(None);
     }
     let binding = commander_continuation_binding(record)?;
-    let recovery_digest = if original.output.is_none()
-        && original
+    let recovery_digest = if attempt.runtime_id == record.runtime_id
+        && attempt.output.is_none()
+        && attempt
             .error
             .as_ref()
             .and_then(|error| error.error_code.as_deref())
@@ -2176,11 +2181,33 @@ fn commander_convergence_fallback_request(
             "original_runtime_id": record.runtime_id,
             "proof_sha256": proof_sha256,
         }))
-    } else if let Some(evidence_sha256) = pre_provider_zero_effect_failure_evidence(&original) {
+    } else if attempt.runtime_id == record.runtime_id
+        && let Some(evidence_sha256) = pre_provider_zero_effect_failure_evidence(&attempt)
+    {
         canonical_value_sha256(&json!({
             "request_id": record.request_id,
             "original_runtime_id": record.runtime_id,
             "recovery_class": "pre_provider_zero_effect_failure",
+            "evidence_sha256": evidence_sha256,
+        }))
+    } else if let Some(evidence_sha256) =
+        pre_provider_commander_active_writer_evidence(&attempt)
+    {
+        let prior_recovery_attempts = snapshot
+            .lifecycle_projection
+            .runtime_ids
+            .iter()
+            .filter(|runtime_id| runtime_id.starts_with("callback-continuation-recovery-runtime-"))
+            .count();
+        if prior_recovery_attempts >= 3 {
+            return Ok(None);
+        }
+        canonical_value_sha256(&json!({
+            "request_id": record.request_id,
+            "original_runtime_id": record.runtime_id,
+            "failed_attempt_runtime_id": attempt.runtime_id,
+            "recovery_class": "commander_active_writer_pre_submit",
+            "attempt_number": prior_recovery_attempts + 1,
             "evidence_sha256": evidence_sha256,
         }))
     } else {
@@ -2206,6 +2233,25 @@ fn commander_convergence_fallback_request(
 }
 
 fn pre_provider_zero_effect_failure_evidence(runtime: &RuntimeAggregate) -> Option<String> {
+    pre_provider_zero_effect_evidence(runtime, "PROVIDER_ROUTE_ADMISSION_REJECTED")
+}
+
+fn pre_provider_commander_active_writer_evidence(runtime: &RuntimeAggregate) -> Option<String> {
+    let error_text = runtime.error.as_ref()?.error_text.as_deref()?;
+    if runtime.provider.llm_provider_name != "official_codex_app_server"
+        || !error_text.starts_with("official Codex App Server returned an error for thread/resume:")
+        || !error_text.contains("\"code\":-32600")
+        || !error_text.contains("already has an active writer")
+    {
+        return None;
+    }
+    pre_provider_zero_effect_evidence(runtime, "OFFICIAL_CODEX_APP_SERVER_FAILED")
+}
+
+fn pre_provider_zero_effect_evidence(
+    runtime: &RuntimeAggregate,
+    accepted_error_code: &str,
+) -> Option<String> {
     let error = runtime.error.as_ref()?;
     let error_text = error.error_text.as_deref()?;
     let output = runtime.output.as_ref()?.as_object()?;
@@ -2219,7 +2265,7 @@ fn pre_provider_zero_effect_failure_evidence(runtime: &RuntimeAggregate) -> Opti
         || runtime.reasoning_hash.is_some()
         || !runtime.text.is_empty()
         || !runtime.tool_call.is_empty()
-        || error.error_code.as_deref() != Some("PROVIDER_ROUTE_ADMISSION_REJECTED")
+        || error.error_code.as_deref() != Some(accepted_error_code)
         || error.retry_allowed
         || error.fallback_allowed
         || error.fallback_to_id.is_some()
@@ -3468,6 +3514,7 @@ mod tests {
         complete_and_ack_callback_continuation,
         failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
         is_historical_terminal_runtime, payload_to_run_agent_request,
+        pre_provider_commander_active_writer_evidence,
         pre_provider_zero_effect_failure_evidence,
         lifecycle_store, publish_terminal_failure_callback_from_store, read_session_snapshot,
         register_and_activate_runtime, replay_terminal_callbacks_from_store,
@@ -4781,6 +4828,29 @@ mod tests {
             pre_provider_zero_effect_failure_evidence(&runtime),
             Some(evidence),
             "evidence identity must be deterministic"
+        );
+    }
+
+    #[test]
+    fn commander_active_writer_rejection_proves_pre_submit_zero_effect() {
+        let mut runtime = pre_provider_route_admission_failure();
+        runtime.provider.provider_name = "official_codex_app_server/gpt-5.6-sol".to_string();
+        runtime.provider.llm_provider_name = "official_codex_app_server".to_string();
+        let message = "official Codex App Server returned an error for thread/resume: {\"code\":-32600,\"message\":\"thread commander-thread-1 already has an active writer\"}";
+        runtime.output = Some(json!({"error": message}));
+        let error = runtime.error.as_mut().expect("runtime error");
+        error.error_code = Some("OFFICIAL_CODEX_APP_SERVER_FAILED".to_string());
+        error.error_text = Some(message.to_string());
+
+        assert!(
+            pre_provider_commander_active_writer_evidence(&runtime).is_some(),
+            "exact server-side writer rejection is deferred before provider effects"
+        );
+
+        runtime.provider.llm_provider_name = "openai".to_string();
+        assert!(
+            pre_provider_commander_active_writer_evidence(&runtime).is_none(),
+            "a non-official provider must not borrow the writer-busy recovery class"
         );
     }
 
