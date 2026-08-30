@@ -2210,8 +2210,13 @@ fn commander_convergence_fallback_request(
             "recovery_class": "pre_provider_zero_effect_failure",
             "evidence_sha256": evidence_sha256,
         }))
-    } else if let Some(evidence_sha256) =
+    } else if let Some((recovery_class, evidence_sha256)) =
         pre_provider_commander_active_writer_evidence(&attempt)
+            .map(|evidence| ("commander_active_writer_pre_submit", evidence))
+            .or_else(|| {
+                pre_provider_commander_binding_recovery_evidence(&attempt)
+                    .map(|evidence| ("commander_binding_pre_submit", evidence))
+            })
     {
         let prior_recovery_attempts = snapshot
             .lifecycle_projection
@@ -2219,14 +2224,14 @@ fn commander_convergence_fallback_request(
             .iter()
             .filter(|runtime_id| runtime_id.starts_with("callback-continuation-recovery-runtime-"))
             .count();
-        if prior_recovery_attempts >= 3 {
+        if prior_recovery_attempts >= 4 {
             return Ok(None);
         }
         canonical_value_sha256(&json!({
             "request_id": record.request_id,
             "original_runtime_id": record.runtime_id,
             "failed_attempt_runtime_id": attempt.runtime_id,
-            "recovery_class": "commander_active_writer_pre_submit",
+            "recovery_class": recovery_class,
             "attempt_number": prior_recovery_attempts + 1,
             "evidence_sha256": evidence_sha256,
         }))
@@ -2272,6 +2277,16 @@ fn pre_provider_commander_active_writer_evidence(runtime: &RuntimeAggregate) -> 
         || !error_text.starts_with("official Codex App Server returned an error for thread/resume:")
         || !error_text.contains("\"code\":-32600")
         || !error_text.contains("already has an active writer")
+    {
+        return None;
+    }
+    pre_provider_zero_effect_evidence(runtime, "OFFICIAL_CODEX_APP_SERVER_FAILED")
+}
+
+fn pre_provider_commander_binding_recovery_evidence(runtime: &RuntimeAggregate) -> Option<String> {
+    let error_text = runtime.error.as_ref()?.error_text.as_deref()?;
+    if runtime.provider.llm_provider_name != "official_codex_app_server"
+        || error_text != "COMMANDER_CONTINUATION_BINDING_INVALID: runtime/request identity mismatch"
     {
         return None;
     }
@@ -3587,6 +3602,7 @@ mod tests {
         failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
         is_historical_terminal_runtime, payload_to_run_agent_request,
         pre_provider_commander_active_writer_evidence,
+        pre_provider_commander_binding_recovery_evidence,
         pre_provider_zero_effect_failure_evidence,
         lifecycle_store, publish_terminal_failure_callback_from_store, read_session_snapshot,
         register_and_activate_runtime, replay_terminal_callbacks_from_store,
@@ -4923,6 +4939,23 @@ mod tests {
         assert!(
             pre_provider_commander_active_writer_evidence(&runtime).is_none(),
             "a non-official provider must not borrow the writer-busy recovery class"
+        );
+    }
+
+    #[test]
+    fn commander_binding_mismatch_is_pre_submit_zero_effect() {
+        let mut runtime = pre_provider_route_admission_failure();
+        runtime.provider.provider_name = "official_codex_app_server/gpt-5.6-sol".to_string();
+        runtime.provider.llm_provider_name = "official_codex_app_server".to_string();
+        let message = "COMMANDER_CONTINUATION_BINDING_INVALID: runtime/request identity mismatch";
+        runtime.output = Some(json!({"error": message}));
+        let error = runtime.error.as_mut().expect("runtime error");
+        error.error_code = Some("OFFICIAL_CODEX_APP_SERVER_FAILED".to_string());
+        error.error_text = Some(message.to_string());
+
+        assert!(
+            pre_provider_commander_binding_recovery_evidence(&runtime).is_some(),
+            "local binding validation fails before provider submission"
         );
     }
 

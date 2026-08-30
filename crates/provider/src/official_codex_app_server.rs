@@ -644,7 +644,13 @@ pub async fn run_official_codex_turn(
         let runtime_is_original = request.runtime_id == expected_original_runtime_id;
         let runtime_is_bound_fallback =
             request.fallback_from_id.as_deref() == Some(expected_original_runtime_id.as_str());
-        if !runtime_is_original && !runtime_is_bound_fallback {
+        let runtime_is_bounded_recovery_chain = request
+            .runtime_id
+            .starts_with("callback-continuation-recovery-runtime-")
+            && request.fallback_from_id.as_deref().is_some_and(|fallback| {
+                fallback.starts_with("callback-continuation-recovery-runtime-")
+            });
+        if !runtime_is_original && !runtime_is_bound_fallback && !runtime_is_bounded_recovery_chain {
             return Err(
                 OfficialCodexAppServerError::CommanderContinuationBindingInvalid(
                     "runtime/request identity mismatch".to_string(),

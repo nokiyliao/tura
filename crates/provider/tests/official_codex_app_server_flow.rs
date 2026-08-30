@@ -145,12 +145,24 @@ async fn run_commander_target_convergence() {
     let replay = run_official_codex_turn(target.clone(), Some(&mut target_handler))
         .await
         .expect("durable convergence proof replay");
-    assert_eq!(replay.commander_convergence_proof, Some(proof));
+    assert_eq!(replay.commander_convergence_proof, Some(proof.clone()));
     assert_eq!(replay.content, json!("commander converged"));
     assert_eq!(
         captured_messages(&target_capture).len(),
         first_protocol_message_count,
         "durable proof replay must not submit or read another target turn"
+    );
+    let previous_recovery_runtime_id = target.runtime_id.clone();
+    target.runtime_id = "callback-continuation-recovery-runtime-bounded-retry".to_string();
+    target.fallback_from_id = Some(previous_recovery_runtime_id);
+    let bounded_replay = run_official_codex_turn(target.clone(), Some(&mut target_handler))
+        .await
+        .expect("bounded recovery chain proof replay");
+    assert_eq!(bounded_replay.commander_convergence_proof, Some(proof.clone()));
+    assert_eq!(
+        captured_messages(&target_capture).len(),
+        first_protocol_message_count,
+        "bounded recovery proof replay must not submit another target turn"
     );
     let mut wrong_fallback = target;
     wrong_fallback.runtime_id = "callback-continuation-recovery-runtime-wrong".to_string();
