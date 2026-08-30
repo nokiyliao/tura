@@ -234,10 +234,30 @@ impl ExecutionService {
             return Ok(active_turn_conflict(&request.session_id, active));
         }
         state.session_db.start()?;
-        let mut run_request = payload_to_run_agent_request(&request, &lease_id, None)?;
+        let requested_continuation_fallback = request
+            .payload
+            .get("fallback_from_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if requested_continuation_fallback.is_some() && continuation.is_none() {
+            return Err(anyhow!(
+                "CALLBACK_CONTINUATION_FALLBACK_WITHOUT_DURABLE_RECORD:{}",
+                request.runtime_id
+            ));
+        }
+        if let Some(fallback_from_id) = requested_continuation_fallback.as_deref() {
+            validate_continuation_fallback_source(&request.session_id, fallback_from_id)?;
+        }
+        let mut run_request = payload_to_run_agent_request(
+            &request,
+            &lease_id,
+            requested_continuation_fallback.clone(),
+        )?;
         let requested_prompt = run_request.effective_prompt();
-        let fallback_from_id =
-            runtime_registration_fallback(&request.session_id, requested_prompt)?;
+        let fallback_from_id = match requested_continuation_fallback {
+            Some(fallback_from_id) => Some(fallback_from_id),
+            None => runtime_registration_fallback(&request.session_id, requested_prompt)?,
+        };
         run_request.fallback_from_id.clone_from(&fallback_from_id);
         let commander_session_id = run_request
             .parent_session_id
@@ -2215,10 +2235,20 @@ fn commander_convergence_fallback_request(
     };
     let runtime_id = format!("callback-continuation-recovery-runtime-{recovery_digest}");
     let lease_id = format!("callback-continuation-recovery-lease-{recovery_digest}");
+    let mut payload = callback_continuation_payload(record, &snapshot.metadata, Some(&binding))?;
+    payload.as_object_mut().ok_or_else(|| {
+        anyhow!(
+            "CALLBACK_CONTINUATION_PAYLOAD_NOT_OBJECT:{}",
+            record.request_id
+        )
+    })?.insert(
+        "fallback_from_id".to_string(),
+        Value::String(attempt.runtime_id.clone()),
+    );
     let input = json!({
         "runtime_id": runtime_id,
         "session_id": record.commander_session_id,
-        "payload": callback_continuation_payload(record, &snapshot.metadata, Some(&binding))?,
+        "payload": payload,
     });
     Ok(Some((
         IpcRequest {
@@ -2380,7 +2410,13 @@ fn commander_convergence_proof_from_runtime(
     runtime: &RuntimeAggregate,
 ) -> Result<CommanderConvergenceProof> {
     let original_or_bound_fallback = runtime.runtime_id == record.runtime_id
-        || runtime.fallback_from_id.as_deref() == Some(record.runtime_id.as_str());
+        || runtime.fallback_from_id.as_deref() == Some(record.runtime_id.as_str())
+        || (runtime
+            .runtime_id
+            .starts_with("callback-continuation-recovery-runtime-")
+            && runtime.fallback_from_id.as_deref().is_some_and(|fallback| {
+                fallback.starts_with("callback-continuation-recovery-runtime-")
+            }));
     if !original_or_bound_fallback
         || runtime.session_id != record.commander_session_id
         || runtime.state != RuntimeState::Finished
@@ -3353,6 +3389,42 @@ fn runtime_registration_fallback(
         )),
         other => Err(anyhow!(
             "unexpected session_db response while reading session {session_id}: {other:?}"
+        )),
+    }
+}
+
+fn validate_continuation_fallback_source(session_id: &str, fallback_from_id: &str) -> Result<()> {
+    let response = session_log_contract::client::call_service(&SessionLogCommand::GetSession(
+        GetSessionRequest {
+            session_id: session_id.to_string(),
+        },
+    ))?;
+    match response {
+        SessionLogResponse::Session {
+            session: Some(session),
+        } if session.lifecycle_projection.state == SessionState::Failed
+            && session.lifecycle_projection.active_runtime_id.is_none()
+            && session.lifecycle_projection.runtime_ids.last().map(String::as_str)
+                == Some(fallback_from_id) =>
+        {
+            Ok(())
+        }
+        SessionLogResponse::Session {
+            session: Some(session),
+        } => Err(anyhow!(
+            "CALLBACK_CONTINUATION_FALLBACK_SOURCE_NOT_LATEST_FAILED:{}:{}:{:?}:{:?}",
+            session_id,
+            fallback_from_id,
+            session.lifecycle_projection.state,
+            session.lifecycle_projection.runtime_ids.last()
+        )),
+        SessionLogResponse::Session { session: None } => Err(anyhow!(
+            "CALLBACK_CONTINUATION_FALLBACK_SESSION_NOT_FOUND:{}",
+            session_id
+        )),
+        SessionLogResponse::Error { error } => Err(anyhow!(error)),
+        other => Err(anyhow!(
+            "unexpected session_db response while validating callback fallback: {other:?}"
         )),
     }
 }
@@ -5332,6 +5404,15 @@ mod tests {
         assert_eq!(
             commander_convergence_proof_from_runtime(&record, &fallback)
                 .expect("exact fallback proof replay"),
+            proof
+        );
+        let mut bounded_retry = fallback.clone();
+        bounded_retry.runtime_id =
+            "callback-continuation-recovery-runtime-bounded-retry".to_string();
+        bounded_retry.fallback_from_id = Some(fallback.runtime_id.clone());
+        assert_eq!(
+            commander_convergence_proof_from_runtime(&record, &bounded_retry)
+                .expect("bounded continuation retry proof replay"),
             proof
         );
         fallback.fallback_from_id = Some("unrelated-runtime".to_string());
