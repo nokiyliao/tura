@@ -2224,6 +2224,10 @@ fn commander_convergence_fallback_request(
                 pre_provider_commander_binding_recovery_evidence(&attempt)
                     .map(|evidence| ("commander_binding_pre_submit", evidence))
             })
+            .or_else(|| {
+                pre_provider_commander_ledger_chain_evidence(&attempt)
+                    .map(|evidence| ("commander_ledger_chain_pre_submit", evidence))
+            })
     {
         let prior_recovery_attempts = snapshot
             .lifecycle_projection
@@ -2231,7 +2235,7 @@ fn commander_convergence_fallback_request(
             .iter()
             .filter(|runtime_id| runtime_id.starts_with("callback-continuation-recovery-runtime-"))
             .count();
-        if prior_recovery_attempts >= 4 {
+        if prior_recovery_attempts >= 5 {
             return Ok(None);
         }
         canonical_value_sha256(&json!({
@@ -2294,6 +2298,19 @@ fn pre_provider_commander_binding_recovery_evidence(runtime: &RuntimeAggregate) 
     let error_text = runtime.error.as_ref()?.error_text.as_deref()?;
     if runtime.provider.llm_provider_name != "official_codex_app_server"
         || error_text != "COMMANDER_CONTINUATION_BINDING_INVALID: runtime/request identity mismatch"
+    {
+        return None;
+    }
+    pre_provider_zero_effect_evidence(runtime, "OFFICIAL_CODEX_APP_SERVER_FAILED")
+}
+
+fn pre_provider_commander_ledger_chain_evidence(runtime: &RuntimeAggregate) -> Option<String> {
+    let error_text = runtime.error.as_ref()?.error_text.as_deref()?;
+    if runtime.provider.llm_provider_name != "official_codex_app_server"
+        || !error_text.starts_with(
+            "OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT: effect 0 is not durably reconciled:",
+        )
+        || !error_text.ends_with("execution ledger fallback source is not durable")
     {
         return None;
     }
@@ -3610,6 +3627,7 @@ mod tests {
         is_historical_terminal_runtime, payload_to_run_agent_request,
         pre_provider_commander_active_writer_evidence,
         pre_provider_commander_binding_recovery_evidence,
+        pre_provider_commander_ledger_chain_evidence,
         pre_provider_zero_effect_failure_evidence,
         lifecycle_store, publish_terminal_failure_callback_from_store, read_session_snapshot,
         register_and_activate_runtime, replay_terminal_callbacks_from_store,
@@ -4963,6 +4981,23 @@ mod tests {
         assert!(
             pre_provider_commander_binding_recovery_evidence(&runtime).is_some(),
             "local binding validation fails before provider submission"
+        );
+    }
+
+    #[test]
+    fn commander_preledger_chain_rejection_is_pre_submit_zero_effect() {
+        let mut runtime = pre_provider_route_admission_failure();
+        runtime.provider.provider_name = "official_codex_app_server/gpt-5.6-sol".to_string();
+        runtime.provider.llm_provider_name = "official_codex_app_server".to_string();
+        let message = "OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT: effect 0 is not durably reconciled: runtime execution ledger: execution ledger fallback source is not durable";
+        runtime.output = Some(json!({"error": message}));
+        let error = runtime.error.as_mut().expect("runtime error");
+        error.error_code = Some("OFFICIAL_CODEX_APP_SERVER_FAILED".to_string());
+        error.error_text = Some(message.to_string());
+
+        assert!(
+            pre_provider_commander_ledger_chain_evidence(&runtime).is_some(),
+            "the old preledger validator failed before provider submission"
         );
     }
 
