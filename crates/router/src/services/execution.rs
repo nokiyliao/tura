@@ -36,7 +36,7 @@ use session_log_contract::{
     RegisterRuntimeRequest, ReplayRuntimeRequest, RuntimeLeaseOutcome, RuntimeLeaseSnapshot,
     RuntimeLifecycleIdentity, RuntimeRecoveryQuiescenceProof, RuntimeRecoveryReceipt,
     RuntimeRegistrationOutcome, SessionFeedEntry, SessionFeedEvent, SessionLogCommand,
-    SessionLogResponse, SessionSnapshot, recovery_terminal_projection_event_id,
+    SessionLogResponse, SessionMetadata, SessionSnapshot, recovery_terminal_projection_event_id,
 };
 
 #[derive(Clone)]
@@ -1258,31 +1258,26 @@ impl ExecutionService {
             }
             ContinuationWriteOutcome::Prepared | ContinuationWriteOutcome::AlreadyPrepared => {}
         }
-        let prompt = serde_json::to_string(&continuation.parent_input)?;
         let commander_continuation = continuation
             .commander_thread_id
             .as_ref()
             .map(|_| commander_continuation_binding(&continuation))
             .transpose()?;
+        let snapshot =
+            read_session_snapshot(&continuation.commander_session_id)?.ok_or_else(|| {
+                anyhow!(
+                    "CALLBACK_CONTINUATION_PARENT_SESSION_NOT_FOUND:{}",
+                    continuation.commander_session_id
+                )
+            })?;
         let input = json!({
             "runtime_id": continuation.runtime_id,
             "session_id": continuation.commander_session_id,
-            "payload": {
-                "prompt": prompt,
-                "parent_mission_revision_sha256": continuation.parent_mission_revision_sha256,
-                "delegated_input_sha256": continuation.delegated_input_sha256,
-                "lifecycle": {
-                    "transaction_id": continuation.request_id,
-                    "commander_session_id": continuation.commander_session_id,
-                    "parent_mission_revision_sha256": continuation.parent_mission_revision_sha256,
-                    "delegated_input_sha256": continuation.delegated_input_sha256,
-                    "task_id": null,
-                    "goal_id": null,
-                    "operator_override": false,
-                    "commander_continuation": commander_continuation,
-                },
-                "operator_override": false,
-            }
+            "payload": callback_continuation_payload(
+                &continuation,
+                &snapshot.metadata,
+                commander_continuation.as_ref(),
+            )?,
         });
         let request_id = continuation.request_id.clone();
         let internal_request = IpcRequest {
@@ -2182,26 +2177,10 @@ fn commander_convergence_fallback_request(
     }));
     let runtime_id = format!("callback-continuation-recovery-runtime-{recovery_digest}");
     let lease_id = format!("callback-continuation-recovery-lease-{recovery_digest}");
-    let prompt = serde_json::to_string(&record.parent_input)?;
     let input = json!({
         "runtime_id": runtime_id,
         "session_id": record.commander_session_id,
-        "payload": {
-            "prompt": prompt,
-            "parent_mission_revision_sha256": record.parent_mission_revision_sha256,
-            "delegated_input_sha256": record.delegated_input_sha256,
-            "lifecycle": {
-                "transaction_id": record.request_id,
-                "commander_session_id": record.commander_session_id,
-                "parent_mission_revision_sha256": record.parent_mission_revision_sha256,
-                "delegated_input_sha256": record.delegated_input_sha256,
-                "task_id": null,
-                "goal_id": null,
-                "operator_override": false,
-                "commander_continuation": binding,
-            },
-            "operator_override": false,
-        }
+        "payload": callback_continuation_payload(record, &snapshot.metadata, Some(&binding))?,
     });
     Ok(Some((
         IpcRequest {
@@ -2213,6 +2192,33 @@ fn commander_convergence_fallback_request(
         },
         lease_id,
     )))
+}
+
+fn callback_continuation_payload(
+    record: &ContinuationDispatchRecord,
+    parent: &SessionMetadata,
+    commander_continuation: Option<&CommanderContinuationBinding>,
+) -> Result<Value> {
+    Ok(json!({
+        "prompt": serde_json::to_string(&record.parent_input)?,
+        "directory": parent.session_directory,
+        "model": parent.model,
+        "agent": parent.agent,
+        "session_type": parent.session_type,
+        "parent_mission_revision_sha256": record.parent_mission_revision_sha256,
+        "delegated_input_sha256": record.delegated_input_sha256,
+        "lifecycle": {
+            "transaction_id": record.request_id,
+            "commander_session_id": record.commander_session_id,
+            "parent_mission_revision_sha256": record.parent_mission_revision_sha256,
+            "delegated_input_sha256": record.delegated_input_sha256,
+            "task_id": null,
+            "goal_id": null,
+            "operator_override": false,
+            "commander_continuation": commander_continuation,
+        },
+        "operator_override": false,
+    }))
 }
 
 fn require_successful_runtime_dispatch(status: u16, body: &Value) -> Result<()> {
@@ -3405,7 +3411,8 @@ mod tests {
     use super::{
         EnqueueTurnRequest, ExecutionService, RetryRuntimeIdentity,
         RouterRecoveryCloseRuntimeRequest, RuntimeLease, TerminalDeliveryIdentity,
-        commander_continuation_binding, commander_convergence_proof_from_runtime,
+        callback_continuation_payload, commander_continuation_binding,
+        commander_convergence_proof_from_runtime,
         complete_and_ack_callback_continuation,
         failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
         is_historical_terminal_runtime, payload_to_run_agent_request,
@@ -3432,6 +3439,7 @@ mod tests {
     };
     use session_log_contract::{
         RuntimeLeaseSnapshot, RuntimeLifecycleIdentity, SessionFeedEntry, SessionFeedEvent,
+        SessionMetadata,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -4582,6 +4590,80 @@ mod tests {
             ))),
         );
         receipt
+    }
+
+    fn callback_continuation_record() -> ContinuationDispatchRecord {
+        let receipt = callback_receipt(TerminalState::Completed);
+        let mut callback = DurableCallbackRecord::new(
+            &receipt,
+            json!("child result"),
+            json!({"kind": "gateway.callback"}),
+            "a".repeat(64),
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            CallbackEffectIdentity::Exact {
+                effect_id: "message-1".to_string(),
+            },
+        )
+        .expect("callback");
+        callback.commander_thread_id = Some("commander-thread-1".to_string());
+        ContinuationDispatchRecord::from_callback(&callback).expect("continuation")
+    }
+
+    fn callback_parent_metadata() -> SessionMetadata {
+        SessionMetadata {
+            session_directory: "/tmp/parent-official-codex".to_string(),
+            model: Some("official_codex_app_server/gpt-5.6-sol".to_string()),
+            agent: Some("balanced".to_string()),
+            session_type: "coding".to_string(),
+            kill_processes_on_start: false,
+            validator_enabled: false,
+            force_planning: false,
+            model_variant: None,
+            model_acceleration_enabled: false,
+            disable_permission_restrictions: true,
+            use_last_tool_call_response: false,
+            auto_session_name: false,
+            context_tokens: lifecycle::ContextTokenStats::default(),
+            runtime_usage: json!({}),
+        }
+    }
+
+    fn assert_callback_parent_identity(payload: &serde_json::Value) {
+        assert_eq!(payload["directory"], "/tmp/parent-official-codex");
+        assert_eq!(payload["model"], "official_codex_app_server/gpt-5.6-sol");
+        assert_eq!(payload["agent"], "balanced");
+        assert_eq!(payload["session_type"], "coding");
+    }
+
+    #[test]
+    fn callback_continuation_first_dispatch_inherits_parent_provider_identity() {
+        let record = callback_continuation_record();
+        let payload = callback_continuation_payload(&record, &callback_parent_metadata(), None)
+            .expect("first continuation payload");
+
+        assert_callback_parent_identity(&payload);
+        assert_eq!(payload["lifecycle"]["transaction_id"], record.request_id);
+        assert_eq!(
+            payload["lifecycle"]["commander_session_id"],
+            record.commander_session_id
+        );
+        assert!(payload["lifecycle"]["commander_continuation"].is_null());
+    }
+
+    #[test]
+    fn callback_continuation_fallback_inherits_parent_provider_identity() {
+        let record = callback_continuation_record();
+        let binding = commander_continuation_binding(&record).expect("continuation binding");
+        let payload =
+            callback_continuation_payload(&record, &callback_parent_metadata(), Some(&binding))
+                .expect("fallback continuation payload");
+
+        assert_callback_parent_identity(&payload);
+        assert_eq!(
+            payload["lifecycle"]["commander_continuation"],
+            serde_json::to_value(binding).expect("serialized binding")
+        );
+        assert_eq!(payload["lifecycle"]["transaction_id"], record.request_id);
     }
 
     fn callback_delivery() -> TerminalDeliveryIdentity {
