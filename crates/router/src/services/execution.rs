@@ -2235,7 +2235,7 @@ fn commander_convergence_fallback_request(
             .iter()
             .filter(|runtime_id| runtime_id.starts_with("callback-continuation-recovery-runtime-"))
             .count();
-        if prior_recovery_attempts >= 5 {
+        if prior_recovery_attempts >= 7 {
             return Ok(None);
         }
         canonical_value_sha256(&json!({

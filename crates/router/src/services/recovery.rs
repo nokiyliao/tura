@@ -41,6 +41,7 @@ pub async fn recover_after_start(state: &AppState) -> Result<Value> {
 
 async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
     let mut seen_runtime_ids = BTreeSet::new();
+    let mut recovered_parent_sessions = BTreeSet::new();
     let mut inspected = 0_u64;
     let mut recovered = Vec::new();
     let mut after_runtime_id = None;
@@ -108,8 +109,12 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                         Err(error) => return Err(error),
                     }
                 {
-                    let continuation_recovery =
-                        recover_parent_continuations(state, &delivery).await?;
+                    let continuation_recovery = recover_parent_continuations_once(
+                        state,
+                        &delivery,
+                        &mut recovered_parent_sessions,
+                    )
+                    .await?;
                     recovered.push(json!({
                         "runtime_id": snapshot.runtime_id,
                         "session_id": snapshot.session_id,
@@ -194,7 +199,12 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                         None
                     };
                     let continuation_recovery = if let Some(delivery) = delivery.as_ref() {
-                        recover_parent_continuations(state, delivery).await?
+                        recover_parent_continuations_once(
+                            state,
+                            delivery,
+                            &mut recovered_parent_sessions,
+                        )
+                        .await?
                     } else {
                         Vec::new()
                     };
@@ -256,6 +266,22 @@ async fn recover_parent_continuations(
         })]),
         Err(error) => Err(error),
     }
+}
+
+async fn recover_parent_continuations_once(
+    state: &AppState,
+    delivery: &crate::services::execution::TerminalDeliveryIdentity,
+    recovered_parent_sessions: &mut BTreeSet<String>,
+) -> Result<Vec<Value>> {
+    if !recovered_parent_sessions.insert(delivery.commander_session_id.clone()) {
+        return Ok(vec![json!({
+            "status": "already_considered_this_startup",
+            "commander_session_id": delivery.commander_session_id,
+            "acknowledged": false,
+            "provider_attempt_delta": 0,
+        })]);
+    }
+    recover_parent_continuations(state, delivery).await
 }
 
 fn is_commander_active_writer_pre_submit(error: &anyhow::Error) -> bool {
