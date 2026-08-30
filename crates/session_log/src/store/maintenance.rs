@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use lifecycle::{RuntimeEvent, RuntimeState};
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
 use session_log_contract::{
@@ -75,6 +75,9 @@ enum ExpectedRowState {
         terminal_evidence_id: String,
     },
     Absent,
+    Preserved {
+        disposition: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +120,8 @@ enum PreparedState {
     MixedOrDrift,
 }
 
+struct VerifiedDurablePoststate;
+
 impl SessionLogStore {
     pub fn maintain_runtime_locations(
         &self,
@@ -153,6 +158,7 @@ impl SessionLogStore {
         }
 
         self.with_index_connection(|conn| {
+            enable_maintenance_durability(conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let plan = build_plan(&tx, page_size)?;
             let canonical_input_sha256 = digest_json(&plan)?;
@@ -177,8 +183,11 @@ impl SessionLogStore {
             {
                 anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_POSTCONDITION_MISMATCH");
             }
+            verify_exact_postconditions(&tx, &intent)?;
             tx.commit()?;
-            self.finalize_intent(&intent, false)
+            durable_checkpoint(&self.index_db_path, conn)?;
+            let durable_poststate = verify_committed_poststate(conn, &intent)?;
+            self.finalize_intent(&intent, false, durable_poststate)
         })
     }
 
@@ -224,6 +233,7 @@ impl SessionLogStore {
         if receipt != intent.expected_receipt {
             anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_RECEIPT_IDENTITY_CONFLICT");
         }
+        self.verify_final_receipt_poststate(&intent)?;
         Ok(Some(receipt_with_manifest(receipt, &manifest)))
     }
 
@@ -264,11 +274,15 @@ impl SessionLogStore {
         intent: MaintenanceIntent,
     ) -> Result<RuntimeLocationMaintenanceReceipt> {
         self.with_index_connection(|conn| {
+            enable_maintenance_durability(conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             match prepared_state(&tx, &intent)? {
                 PreparedState::AllPost => {
+                    verify_exact_postconditions(&tx, &intent)?;
                     tx.commit()?;
-                    self.finalize_intent(&intent, true)
+                    durable_checkpoint(&self.index_db_path, conn)?;
+                    let durable_poststate = verify_committed_poststate(conn, &intent)?;
+                    self.finalize_intent(&intent, true, durable_poststate)
                 }
                 PreparedState::AllPre => {
                     let current_plan = build_plan(&tx, 500)?;
@@ -290,8 +304,11 @@ impl SessionLogStore {
                     {
                         anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_POSTCONDITION_MISMATCH");
                     }
+                    verify_exact_postconditions(&tx, &intent)?;
                     tx.commit()?;
-                    self.finalize_intent(&intent, false)
+                    durable_checkpoint(&self.index_db_path, conn)?;
+                    let durable_poststate = verify_committed_poststate(conn, &intent)?;
+                    self.finalize_intent(&intent, false, durable_poststate)
                 }
                 PreparedState::MixedOrDrift => {
                     anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_PREPARED_INTENT_MIXED_OR_DRIFT")
@@ -300,10 +317,28 @@ impl SessionLogStore {
         })
     }
 
+    fn verify_final_receipt_poststate(&self, intent: &MaintenanceIntent) -> Result<()> {
+        self.with_index_connection(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            match prepared_state(&tx, intent)? {
+                PreparedState::AllPost => verify_exact_postconditions(&tx, intent)?,
+                PreparedState::AllPre => {
+                    anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_STALE_FINAL_RECEIPT_ALL_PRE")
+                }
+                PreparedState::MixedOrDrift => {
+                    anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_FINAL_RECEIPT_MIXED_OR_DRIFT")
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     fn finalize_intent(
         &self,
         intent: &MaintenanceIntent,
         recovered_without_mutation: bool,
+        _durable_poststate: VerifiedDurablePoststate,
     ) -> Result<RuntimeLocationMaintenanceReceipt> {
         let root = self.receipt_root(&intent.canonical_input_sha256);
         let intent_bytes = read_stable_regular(&root.join("intent.json"))?;
@@ -390,32 +425,43 @@ fn receipt_for_plan(
 fn expected_postconditions(plan: &MaintenancePlan) -> Result<Vec<ExpectedPostcondition>> {
     plan.entries
         .iter()
-        .filter_map(|entry| match entry.disposition.as_str() {
-            "backfill_terminal_event_proof" => Some(
-                entry
-                    .proof
-                    .as_ref()
-                    .context("backfill proof missing")
-                    .map(|proof| ExpectedPostcondition {
-                        runtime_id: entry.row.runtime_id.clone(),
-                        session_id: entry.row.session_id.clone(),
-                        workspace_db_path: entry.row.workspace_db_path.clone(),
-                        expected: ExpectedRowState::BackfilledTerminalProof {
-                            terminal_revision: proof.revision,
-                            terminal_event_seq: proof.event_seq,
-                            terminal_evidence_id: proof.evidence_id.clone(),
-                        },
-                    }),
-            ),
-            "delete_missing_db_session_absent" => Some(Ok(ExpectedPostcondition {
-                runtime_id: entry.row.runtime_id.clone(),
-                session_id: entry.row.session_id.clone(),
-                workspace_db_path: entry.row.workspace_db_path.clone(),
-                expected: ExpectedRowState::Absent,
-            })),
-            _ => None,
-        })
+        .filter_map(expected_postcondition_for_entry)
         .collect()
+}
+
+fn expected_postcondition_for_entry(entry: &PlanEntry) -> Option<Result<ExpectedPostcondition>> {
+    match entry.disposition.as_str() {
+        "backfill_terminal_event_proof" => Some(
+            entry
+                .proof
+                .as_ref()
+                .context("backfill proof missing")
+                .map(|proof| ExpectedPostcondition {
+                    runtime_id: entry.row.runtime_id.clone(),
+                    session_id: entry.row.session_id.clone(),
+                    workspace_db_path: entry.row.workspace_db_path.clone(),
+                    expected: ExpectedRowState::BackfilledTerminalProof {
+                        terminal_revision: proof.revision,
+                        terminal_event_seq: proof.event_seq,
+                        terminal_evidence_id: proof.evidence_id.clone(),
+                    },
+                }),
+        ),
+        "delete_missing_db_session_absent" => Some(Ok(ExpectedPostcondition {
+            runtime_id: entry.row.runtime_id.clone(),
+            session_id: entry.row.session_id.clone(),
+            workspace_db_path: entry.row.workspace_db_path.clone(),
+            expected: ExpectedRowState::Absent,
+        })),
+        _ => Some(Ok(ExpectedPostcondition {
+            runtime_id: entry.row.runtime_id.clone(),
+            session_id: entry.row.session_id.clone(),
+            workspace_db_path: entry.row.workspace_db_path.clone(),
+            expected: ExpectedRowState::Preserved {
+                disposition: entry.disposition.clone(),
+            },
+        })),
+    }
 }
 
 fn intent_for_plan(
@@ -904,6 +950,110 @@ fn prepared_state(tx: &Transaction<'_>, intent: &MaintenanceIntent) -> Result<Pr
     }
 }
 
+fn verify_exact_postconditions(tx: &Transaction<'_>, intent: &MaintenanceIntent) -> Result<()> {
+    if expected_postconditions(&intent.plan)? != intent.expected_postconditions {
+        anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_POSTCONDITION_IDENTITY_CONFLICT");
+    }
+    for entry in &intent.plan.entries {
+        let postcondition_holds = if matches!(
+            entry.disposition.as_str(),
+            "backfill_terminal_event_proof" | "delete_missing_db_session_absent"
+        ) {
+            entry_is_post(tx, entry)?
+        } else {
+            entry_is_pre(tx, entry)?
+        };
+        if !postcondition_holds {
+            anyhow::bail!(
+                "RUNTIME_LOCATION_MAINTENANCE_EXACT_POSTCONDITION_MISMATCH:{}",
+                entry.row.runtime_id
+            );
+        }
+    }
+    let post_incomplete_count = count_incomplete(tx)?;
+    if post_incomplete_count != intent.expected_receipt.post_incomplete_count {
+        anyhow::bail!(
+            "RUNTIME_LOCATION_MAINTENANCE_AGGREGATE_POSTCONDITION_MISMATCH:expected={},actual={post_incomplete_count}",
+            intent.expected_receipt.post_incomplete_count
+        );
+    }
+    Ok(())
+}
+
+fn verify_committed_poststate(
+    conn: &mut Connection,
+    intent: &MaintenanceIntent,
+) -> Result<VerifiedDurablePoststate> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    verify_exact_postconditions(&tx, intent)?;
+    tx.commit()?;
+    Ok(VerifiedDurablePoststate)
+}
+
+fn enable_maintenance_durability(conn: &Connection) -> Result<()> {
+    let journal_mode =
+        conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_JOURNAL_MODE_MISMATCH:{journal_mode}");
+    }
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    let synchronous = conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))?;
+    if synchronous != 2 {
+        anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_DURABILITY_MODE_MISMATCH:{synchronous}");
+    }
+    Ok(())
+}
+
+fn durable_checkpoint(index_path: &Path, conn: &Connection) -> Result<()> {
+    #[cfg(test)]
+    if DURABILITY_CHECKPOINT_FAILURE.with(|failure| failure.replace(false)) {
+        anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_INJECTED_DURABILITY_FAILURE");
+    }
+
+    let (busy, log_frames, checkpointed_frames) =
+        conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+    if busy != 0 || checkpointed_frames < log_frames {
+        anyhow::bail!(
+            "RUNTIME_LOCATION_MAINTENANCE_DURABILITY_CHECKPOINT_INCOMPLETE:busy={busy},log={log_frames},checkpointed={checkpointed_frames}"
+        );
+    }
+    File::open(index_path)?.sync_all()?;
+    let mut wal_path = index_path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    let wal_path = PathBuf::from(wal_path);
+    match std::fs::symlink_metadata(&wal_path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            File::open(&wal_path)?.sync_all()?;
+        }
+        Ok(_) => anyhow::bail!(
+            "RUNTIME_LOCATION_MAINTENANCE_WAL_PATH_INVALID:{}",
+            wal_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(parent) = index_path.parent() {
+        fsync_directory(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static DURABILITY_CHECKPOINT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn inject_durability_checkpoint_failure() {
+    DURABILITY_CHECKPOINT_FAILURE.with(|failure| failure.set(true));
+}
+
 fn apply_exact_plan(tx: &Transaction<'_>, plan: &MaintenancePlan) -> Result<(u64, u64)> {
     let mut backfilled_count = 0_u64;
     let mut deleted_count = 0_u64;
@@ -1078,6 +1228,27 @@ mod tests {
             .expect("prepared intent")
     }
 
+    fn inject_false_final_manifest(store: &SessionLogStore, intent: &MaintenanceIntent) {
+        let root = store.receipt_root(&intent.canonical_input_sha256);
+        let intent_bytes = read_stable_regular(&root.join("intent.json")).expect("intent bytes");
+        let prepared_bytes =
+            read_stable_regular(&root.join("prepared.json")).expect("prepared bytes");
+        let receipt_bytes = serde_json::to_vec(&intent.expected_receipt).expect("receipt bytes");
+        write_immutable(&root.join("receipt.json"), &receipt_bytes).expect("false receipt");
+        let manifest = MaintenanceManifest {
+            schema_version: SCHEMA_VERSION.to_string(),
+            canonical_input_sha256: intent.canonical_input_sha256.clone(),
+            intent_sha256: sha256_bytes(&intent_bytes),
+            prepared_sha256: sha256_bytes(&prepared_bytes),
+            receipt_sha256: sha256_bytes(&receipt_bytes),
+        };
+        write_immutable(
+            &root.join("manifest.json"),
+            &serde_json::to_vec(&manifest).expect("manifest bytes"),
+        )
+        .expect("false manifest");
+    }
+
     fn terminal_proven(store: &SessionLogStore) -> bool {
         store
             .with_index_connection(|conn| {
@@ -1120,11 +1291,19 @@ mod tests {
             ))
             .expect("apply");
         assert_eq!(applied.mutation_count, 1);
-        assert!(
-            applied
-                .manifest_path
-                .as_ref()
-                .is_some_and(|path| Path::new(path).is_file())
+        assert!(applied
+            .manifest_path
+            .as_ref()
+            .is_some_and(|path| Path::new(path).is_file()));
+        let default_synchronous = store
+            .with_index_connection(|conn| {
+                conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                    .map_err(Into::into)
+            })
+            .expect("connection default synchronous mode");
+        assert_eq!(
+            default_synchronous, 1,
+            "FULL must remain maintenance-scoped"
         );
         let replay = store
             .maintain_runtime_locations(request(
@@ -1334,6 +1513,304 @@ mod tests {
     }
 
     #[test]
+    fn after_update_evidence_tamper_fails_exact_postcondition_and_rolls_back() {
+        let (_temp, store, _) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        let dry = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 500))
+            .expect("dry run");
+        store
+            .with_index_connection(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER tamper_maintenance_evidence
+                     AFTER UPDATE OF terminal_proven ON runtime_locations
+                     WHEN NEW.runtime_id = 'r1'
+                     BEGIN
+                       UPDATE runtime_locations SET terminal_evidence_id = 'tampered'
+                       WHERE runtime_id = NEW.runtime_id;
+                     END;",
+                )?;
+                Ok(())
+            })
+            .expect("tamper trigger");
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256.clone()),
+                500,
+            ))
+            .expect_err("post-update tamper must roll back");
+        assert!(error
+            .to_string()
+            .contains("EXACT_POSTCONDITION_MISMATCH:r1"));
+        assert!(!terminal_proven(&store));
+        assert!(!store
+            .receipt_root(&dry.canonical_input_sha256)
+            .join("manifest.json")
+            .exists());
+    }
+
+    #[test]
+    fn final_receipt_with_all_pre_database_is_typed_stale_not_replayed() {
+        let (_temp, store, _) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        let dry = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 500))
+            .expect("dry run");
+        store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256.clone()),
+                500,
+            ))
+            .expect("initial apply");
+        store
+            .with_index_connection(|conn| {
+                conn.execute(
+                    "UPDATE runtime_locations SET terminal_proven = 0,
+                     terminal_revision = NULL, terminal_event_seq = NULL,
+                     terminal_evidence_id = NULL WHERE runtime_id = 'r1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("restore exact all-pre database state");
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256),
+                500,
+            ))
+            .expect_err("final receipt must not override all-pre database");
+        assert!(error.to_string().contains("STALE_FINAL_RECEIPT_ALL_PRE"));
+        assert!(!terminal_proven(&store));
+    }
+
+    #[test]
+    fn final_receipt_with_tampered_evidence_is_typed_drift_not_replayed() {
+        let (_temp, store, _) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        let dry = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 500))
+            .expect("dry run");
+        store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256.clone()),
+                500,
+            ))
+            .expect("initial apply");
+        store
+            .with_index_connection(|conn| {
+                conn.execute(
+                    "UPDATE runtime_locations SET terminal_evidence_id = 'tampered'
+                     WHERE runtime_id = 'r1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("tamper committed evidence");
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256),
+                500,
+            ))
+            .expect_err("tampered final poststate must fail closed");
+        assert!(error.to_string().contains("FINAL_RECEIPT_MIXED_OR_DRIFT"));
+        let evidence = store
+            .with_index_connection(|conn| {
+                conn.query_row(
+                    "SELECT terminal_evidence_id FROM runtime_locations WHERE runtime_id = 'r1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("tampered evidence remains untouched");
+        assert_eq!(evidence, "tampered");
+    }
+
+    #[test]
+    fn final_receipt_with_aggregate_drift_is_not_replayed() {
+        let (temp, store, _) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        let dry = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 500))
+            .expect("dry run");
+        store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256.clone()),
+                500,
+            ))
+            .expect("initial apply");
+        store
+            .with_index_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO runtime_locations(runtime_id,session_id,workspace_db_path)
+                     VALUES ('later','later-session',?1)",
+                    params![temp.path().join("later-missing.sqlite3").to_string_lossy()],
+                )?;
+                Ok(())
+            })
+            .expect("later incomplete location");
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256),
+                500,
+            ))
+            .expect_err("aggregate drift must not replay final receipt");
+        assert!(error
+            .to_string()
+            .contains("AGGREGATE_POSTCONDITION_MISMATCH"));
+    }
+
+    #[test]
+    fn final_receipt_revalidates_preserved_workspace_runtime_fields() {
+        let (_temp, store, workspace) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        store
+            .with_workspace_connection(Path::new(&workspace), |conn| {
+                conn.pragma_update(None, "foreign_keys", "OFF")?;
+                conn.execute(
+                    "INSERT INTO runtimes(runtime_id, session_id, revision,
+                     last_event_seq, terminal, lease_active)
+                     VALUES ('r2','s2',0,0,0,0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("preserved nonterminal runtime");
+        store
+            .with_index_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO runtime_locations(runtime_id,session_id,workspace_db_path)
+                     VALUES ('r2','s2',?1)",
+                    params![workspace],
+                )?;
+                Ok(())
+            })
+            .expect("preserved location");
+        let dry = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 500))
+            .expect("dry run");
+        assert_eq!(dry.dispositions.get("preserve_nonterminal"), Some(&1));
+        store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256.clone()),
+                500,
+            ))
+            .expect("initial apply");
+        store
+            .with_workspace_connection(Path::new(&workspace), |conn| {
+                conn.execute(
+                    "UPDATE runtimes SET terminal = 1 WHERE runtime_id = 'r2'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("drift preserved runtime terminal field");
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256),
+                500,
+            ))
+            .expect_err("preserved runtime drift must invalidate replay");
+        assert!(error
+            .to_string()
+            .contains("EXACT_POSTCONDITION_MISMATCH:r2"));
+    }
+
+    #[test]
+    fn injected_manifest_before_database_poststate_is_rejected() {
+        let (_temp, store, _) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        let intent = prepare_without_commit(&store);
+        inject_false_final_manifest(&store, &intent);
+        assert!(!terminal_proven(&store));
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(intent.canonical_input_sha256),
+                500,
+            ))
+            .expect_err("manifest without database poststate must fail closed");
+        assert!(error.to_string().contains("STALE_FINAL_RECEIPT_ALL_PRE"));
+    }
+
+    #[test]
+    fn durability_checkpoint_failure_never_publishes_final_and_recovers_all_post() {
+        let (_temp, store, _) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        let dry = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 500))
+            .expect("dry run");
+        inject_durability_checkpoint_failure();
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256.clone()),
+                500,
+            ))
+            .expect_err("injected durability checkpoint failure");
+        assert!(error.to_string().contains("INJECTED_DURABILITY_FAILURE"));
+        assert!(terminal_proven(&store));
+        let root = store.receipt_root(&dry.canonical_input_sha256);
+        assert!(!root.join("receipt.json").exists());
+        assert!(!root.join("manifest.json").exists());
+
+        let recovered = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256),
+                500,
+            ))
+            .expect("recover durable all-post state");
+        assert!(recovered.replayed_receipt);
+        assert_eq!(recovered.mutation_count, 0);
+        assert!(root.join("manifest.json").is_file());
+    }
+
+    #[test]
     fn terminal_event_bytes_are_bound_into_the_dry_run_digest() {
         let (_temp, store, workspace) = fixture(
             RuntimeEvent::RuntimeFinished {
@@ -1430,12 +1907,10 @@ mod tests {
         assert_eq!(applied.mutation_count, 1);
         assert!(!applied.replayed_receipt);
         assert!(terminal_proven(&store));
-        assert!(
-            applied
-                .manifest_path
-                .as_ref()
-                .is_some_and(|path| Path::new(path).is_file())
-        );
+        assert!(applied
+            .manifest_path
+            .as_ref()
+            .is_some_and(|path| Path::new(path).is_file()));
     }
 
     #[test]
@@ -1538,12 +2013,10 @@ mod tests {
             ))
             .expect_err("mixed state must fail closed");
         assert!(error.to_string().contains("MIXED_OR_DRIFT"));
-        assert!(
-            !store
-                .receipt_root(&intent.canonical_input_sha256)
-                .join("manifest.json")
-                .exists()
-        );
+        assert!(!store
+            .receipt_root(&intent.canonical_input_sha256)
+            .join("manifest.json")
+            .exists());
     }
 
     #[test]
@@ -1584,11 +2057,9 @@ mod tests {
         let error = store
             .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 1))
             .expect_err("second maintenance instance must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("RUNTIME_LOCATION_MAINTENANCE_LOCKED")
-        );
+        assert!(error
+            .to_string()
+            .contains("RUNTIME_LOCATION_MAINTENANCE_LOCKED"));
     }
 
     #[test]
