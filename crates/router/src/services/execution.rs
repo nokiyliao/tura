@@ -2143,38 +2143,49 @@ fn commander_convergence_fallback_request(
     if original.runtime_id != record.runtime_id
         || original.session_id != record.commander_session_id
         || original.state != RuntimeState::Failed
-        || original.output.is_some()
-        || original
-            .error
-            .as_ref()
-            .and_then(|error| error.error_code.as_deref())
-            != Some("commander_convergence_proven_before_runtime_output")
     {
         return Ok(None);
     }
     let binding = commander_continuation_binding(record)?;
-    let Some(ledger) = load_terminal_commander_convergence_ledger(
-        std::path::Path::new(&snapshot.metadata.session_directory),
-        &record.commander_session_id,
-        &record.runtime_id,
-        &binding,
-    )
-    .map_err(anyhow::Error::msg)?
-    else {
+    let recovery_digest = if original.output.is_none()
+        && original
+            .error
+            .as_ref()
+            .and_then(|error| error.error_code.as_deref())
+            == Some("commander_convergence_proven_before_runtime_output")
+    {
+        let Some(ledger) = load_terminal_commander_convergence_ledger(
+            std::path::Path::new(&snapshot.metadata.session_directory),
+            &record.commander_session_id,
+            &record.runtime_id,
+            &binding,
+        )
+        .map_err(anyhow::Error::msg)?
+        else {
+            return Ok(None);
+        };
+        let proof = ledger.commander_convergence_proof.as_ref().ok_or_else(|| {
+            anyhow!(
+                "COMMANDER_CONVERGENCE_LEDGER_PROOF_MISSING:{}",
+                record.runtime_id
+            )
+        })?;
+        let proof_sha256 = canonical_value_sha256(&serde_json::to_value(proof)?);
+        canonical_value_sha256(&json!({
+            "request_id": record.request_id,
+            "original_runtime_id": record.runtime_id,
+            "proof_sha256": proof_sha256,
+        }))
+    } else if let Some(evidence_sha256) = pre_provider_zero_effect_failure_evidence(&original) {
+        canonical_value_sha256(&json!({
+            "request_id": record.request_id,
+            "original_runtime_id": record.runtime_id,
+            "recovery_class": "pre_provider_zero_effect_failure",
+            "evidence_sha256": evidence_sha256,
+        }))
+    } else {
         return Ok(None);
     };
-    let proof = ledger.commander_convergence_proof.as_ref().ok_or_else(|| {
-        anyhow!(
-            "COMMANDER_CONVERGENCE_LEDGER_PROOF_MISSING:{}",
-            record.runtime_id
-        )
-    })?;
-    let proof_sha256 = canonical_value_sha256(&serde_json::to_value(proof)?);
-    let recovery_digest = canonical_value_sha256(&json!({
-        "request_id": record.request_id,
-        "original_runtime_id": record.runtime_id,
-        "proof_sha256": proof_sha256,
-    }));
     let runtime_id = format!("callback-continuation-recovery-runtime-{recovery_digest}");
     let lease_id = format!("callback-continuation-recovery-lease-{recovery_digest}");
     let input = json!({
@@ -2192,6 +2203,47 @@ fn commander_convergence_fallback_request(
         },
         lease_id,
     )))
+}
+
+fn pre_provider_zero_effect_failure_evidence(runtime: &RuntimeAggregate) -> Option<String> {
+    let error = runtime.error.as_ref()?;
+    let error_text = error.error_text.as_deref()?;
+    let output = runtime.output.as_ref()?.as_object()?;
+    if runtime.state != RuntimeState::Failed
+        || runtime.called_at.is_none()
+        || runtime.call_finished_at.is_none()
+        || runtime.first_token_at.is_some()
+        || runtime.usage.is_some()
+        || runtime.context_tokens.input != 0
+        || runtime.reasoning.is_some()
+        || runtime.reasoning_hash.is_some()
+        || !runtime.text.is_empty()
+        || !runtime.tool_call.is_empty()
+        || error.error_code.as_deref() != Some("PROVIDER_ROUTE_ADMISSION_REJECTED")
+        || error.retry_allowed
+        || error.fallback_allowed
+        || error.fallback_to_id.is_some()
+        || output.len() != 1
+        || output.get("error").and_then(Value::as_str) != Some(error_text)
+    {
+        return None;
+    }
+    Some(canonical_value_sha256(&json!({
+        "runtime_id": runtime.runtime_id,
+        "session_id": runtime.session_id,
+        "state": runtime.state,
+        "called_at": runtime.called_at,
+        "call_finished_at": runtime.call_finished_at,
+        "error": error,
+        "output": runtime.output,
+        "context_tokens": runtime.context_tokens,
+        "usage": runtime.usage,
+        "first_token_at": runtime.first_token_at,
+        "reasoning": runtime.reasoning,
+        "reasoning_hash": runtime.reasoning_hash,
+        "text": runtime.text,
+        "tool_call": runtime.tool_call,
+    })))
 }
 
 fn callback_continuation_payload(
@@ -3416,6 +3468,7 @@ mod tests {
         complete_and_ack_callback_continuation,
         failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
         is_historical_terminal_runtime, payload_to_run_agent_request,
+        pre_provider_zero_effect_failure_evidence,
         lifecycle_store, publish_terminal_failure_callback_from_store, read_session_snapshot,
         register_and_activate_runtime, replay_terminal_callbacks_from_store,
         require_successful_runtime_dispatch, runtime_lease_from_snapshot,
@@ -3426,8 +3479,8 @@ mod tests {
     use crate::{build_state, services::manager::ServiceManager};
     use chrono::Utc;
     use lifecycle::{
-        ProviderConfig, RuntimeAggregate, RuntimeProviderConfig, RuntimeState, SessionProjection,
-        SessionState, TaskPlan, ToolChoice,
+        ProviderConfig, RuntimeAggregate, RuntimeError, RuntimeProviderConfig, RuntimeState,
+        SessionProjection, SessionState, TaskPlan, ToolChoice,
     };
     use runtime_contract::{CommanderConvergenceProof, RunAgentRequest};
     use serde_json::json;
@@ -4664,6 +4717,118 @@ mod tests {
             serde_json::to_value(binding).expect("serialized binding")
         );
         assert_eq!(payload["lifecycle"]["transaction_id"], record.request_id);
+    }
+
+    fn pre_provider_route_admission_failure() -> RuntimeAggregate {
+        let now = Utc::now();
+        let mut runtime = RuntimeAggregate::new(
+            "callback-continuation-runtime-pre-provider".to_string(),
+            "commander-callback".to_string(),
+            "balanced".to_string(),
+            RuntimeProviderConfig {
+                base: ProviderConfig {
+                    tura_llm_name: "codex".to_string(),
+                    default_model_tier: None,
+                    current_model: Some("gpt-5.6-luna".to_string()),
+                    stream: true,
+                    temperature: 0.0,
+                    max_tokens: 256,
+                    tool_choice: ToolChoice::Auto,
+                    time_out_ms: 1_000,
+                },
+                thinking: false,
+                provider_name: "codex".to_string(),
+                model_name: "gpt-5.6-luna".to_string(),
+                provider_url_name: "local".to_string(),
+                llm_provider_name: "codex".to_string(),
+            },
+            now,
+        );
+        runtime.mark_called(now).expect("call started");
+        runtime
+            .mark_waiting_first_token()
+            .expect("waiting first token");
+        runtime
+            .set_input(json!({"prompt": "continue callback"}))
+            .expect("input captured");
+        let message = "official Codex admission rejected route: config error: legacy provider 'codex' is disabled; use 'official_codex_app_server'";
+        runtime
+            .set_output(json!({"error": message}))
+            .expect("local diagnostic captured");
+        runtime
+            .finish_failure(
+                now,
+                RuntimeError {
+                    error_code: Some("PROVIDER_ROUTE_ADMISSION_REJECTED".to_string()),
+                    error_text: Some(message.to_string()),
+                    retry_allowed: false,
+                    fallback_allowed: false,
+                    fallback_to_id: None,
+                },
+                RuntimeState::Failed,
+                None,
+            )
+            .expect("runtime failed");
+        runtime
+    }
+
+    #[test]
+    fn provider_route_admission_failure_proves_pre_provider_zero_effect() {
+        let runtime = pre_provider_route_admission_failure();
+        let evidence = pre_provider_zero_effect_failure_evidence(&runtime)
+            .expect("exact local admission rejection is recoverable");
+        assert_eq!(
+            pre_provider_zero_effect_failure_evidence(&runtime),
+            Some(evidence),
+            "evidence identity must be deterministic"
+        );
+    }
+
+    #[test]
+    fn ambiguous_or_provider_observed_failure_is_not_recoverable() {
+        let baseline = pre_provider_route_admission_failure();
+        let mut variants = Vec::new();
+
+        let mut first_token = baseline.clone();
+        first_token.first_token_at = Some(Utc::now());
+        variants.push(first_token);
+
+        let mut token_usage = baseline.clone();
+        token_usage.context_tokens.input = 1;
+        variants.push(token_usage);
+
+        let mut assistant_text = baseline.clone();
+        assistant_text.text = "provider output".to_string();
+        variants.push(assistant_text);
+
+        let mut reasoning = baseline.clone();
+        reasoning.reasoning = Some("provider reasoning".to_string());
+        variants.push(reasoning);
+
+        let mut changed_output = baseline.clone();
+        changed_output.output = Some(json!({"error": "different diagnostic"}));
+        variants.push(changed_output);
+
+        let mut extra_output = baseline.clone();
+        extra_output.output = Some(
+            json!({"error": baseline.error.as_ref().and_then(|error| error.error_text.as_deref()), "provider_result": true}),
+        );
+        variants.push(extra_output);
+
+        let mut retryable = baseline;
+        retryable
+            .error
+            .as_mut()
+            .expect("runtime error")
+            .retry_allowed = true;
+        variants.push(retryable);
+
+        for variant in variants {
+            assert!(
+                pre_provider_zero_effect_failure_evidence(&variant).is_none(),
+                "provider-observed or ambiguous failure must remain fail closed"
+            );
+        }
     }
 
     fn callback_delivery() -> TerminalDeliveryIdentity {
