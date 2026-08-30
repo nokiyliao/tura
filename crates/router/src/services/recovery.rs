@@ -41,7 +41,7 @@ pub async fn recover_after_start(state: &AppState) -> Result<Value> {
 
 async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
     let mut seen_runtime_ids = BTreeSet::new();
-    let mut recovered_parent_sessions = BTreeSet::new();
+    let mut recovered_parent_callbacks = BTreeSet::new();
     let mut inspected = 0_u64;
     let mut recovered = Vec::new();
     let mut after_runtime_id = None;
@@ -112,7 +112,7 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                     let continuation_recovery = recover_parent_continuations_once(
                         state,
                         &delivery,
-                        &mut recovered_parent_sessions,
+                        &mut recovered_parent_callbacks,
                     )
                     .await?;
                     recovered.push(json!({
@@ -202,7 +202,7 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                         recover_parent_continuations_once(
                             state,
                             delivery,
-                            &mut recovered_parent_sessions,
+                            &mut recovered_parent_callbacks,
                         )
                         .await?
                     } else {
@@ -235,60 +235,66 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
     Ok((inspected, recovered))
 }
 
-async fn recover_parent_continuations(
-    state: &AppState,
+fn parent_continuation_recovery_status(
     delivery: &crate::services::execution::TerminalDeliveryIdentity,
-) -> Result<Vec<Value>> {
-    match state
-        .execution
-        .recover_callback_continuations(state, &delivery.commander_session_id)
-        .await
-    {
-        Ok(recovered) => Ok(recovered),
-        Err(error)
-            if error
-                .to_string()
-                .starts_with("CONTINUATION_UNSETTLED_EFFECT_BLOCKED:") =>
-        {
-            Ok(vec![json!({
-                "status": "withheld_unsettled_effect",
-                "transaction_id": delivery.transaction_id,
-                "event_id": delivery.event_id,
-                "acknowledged": false,
-            })])
+) -> Vec<Value> {
+    let status = if delivery.callback_payload_sha256.is_none() {
+        "withheld_callback_payload_identity_missing"
+    } else {
+        match delivery.callback_effect_identity.as_ref() {
+            Some(
+                session_lifecycle::CallbackEffectIdentity::Exact { .. }
+                | session_lifecycle::CallbackEffectIdentity::ProvenZeroEffect { .. },
+            ) => "awaiting_commander_recovery_adapter",
+            Some(session_lifecycle::CallbackEffectIdentity::UnsettledEffect { .. }) => {
+                "withheld_unsettled_effect"
+            }
+            None => "withheld_callback_effect_identity_missing",
         }
-        Err(error) if is_commander_active_writer_pre_submit(&error) => Ok(vec![json!({
-            "status": "deferred_commander_active_writer",
-            "transaction_id": delivery.transaction_id,
-            "event_id": delivery.event_id,
-            "acknowledged": false,
-            "provider_effect_accepted": false,
-        })]),
-        Err(error) => Err(error),
-    }
+    };
+    vec![json!({
+        "status": status,
+        "commander_session_id": delivery.commander_session_id,
+        "transaction_id": delivery.transaction_id,
+        "event_id": delivery.event_id,
+        "acknowledged": false,
+        "provider_attempt_delta": 0,
+    })]
+}
+
+fn take_parent_continuation_recovery_status(
+    delivery: &crate::services::execution::TerminalDeliveryIdentity,
+    recovered_parent_callbacks: &mut BTreeSet<(String, String, String)>,
+) -> Option<Vec<Value>> {
+    let callback_identity = (
+        delivery.commander_session_id.clone(),
+        delivery.transaction_id.clone(),
+        delivery.event_id.clone(),
+    );
+    recovered_parent_callbacks
+        .insert(callback_identity)
+        .then(|| parent_continuation_recovery_status(delivery))
 }
 
 async fn recover_parent_continuations_once(
-    state: &AppState,
+    _state: &AppState,
     delivery: &crate::services::execution::TerminalDeliveryIdentity,
-    recovered_parent_sessions: &mut BTreeSet<String>,
+    recovered_parent_callbacks: &mut BTreeSet<(String, String, String)>,
 ) -> Result<Vec<Value>> {
-    if !recovered_parent_sessions.insert(delivery.commander_session_id.clone()) {
+    let Some(status) = take_parent_continuation_recovery_status(
+        delivery,
+        recovered_parent_callbacks,
+    ) else {
         return Ok(vec![json!({
             "status": "already_considered_this_startup",
             "commander_session_id": delivery.commander_session_id,
+            "transaction_id": delivery.transaction_id,
+            "event_id": delivery.event_id,
             "acknowledged": false,
             "provider_attempt_delta": 0,
         })]);
-    }
-    recover_parent_continuations(state, delivery).await
-}
-
-fn is_commander_active_writer_pre_submit(error: &anyhow::Error) -> bool {
-    let error = error.to_string();
-    error.starts_with("official Codex App Server returned an error for thread/resume:")
-        && error.contains("\"code\":-32600")
-        && error.contains("already has an active writer")
+    };
+    Ok(status)
 }
 
 fn read_runtime_snapshot(
@@ -419,12 +425,14 @@ fn startup_recovery_reason(revision: u64, last_event_seq: u64) -> RecoveryCloseR
 mod tests {
     use super::{
         RuntimeLocationRecoveryState, checked_runtime_database_path,
-        is_commander_active_writer_pre_submit, quarantined_missing_database_result,
+        parent_continuation_recovery_status, quarantined_missing_database_result,
         runtime_location_recovery_state,
-        startup_recovery_reason, validate_runtime_location,
+        startup_recovery_reason, take_parent_continuation_recovery_status,
+        validate_runtime_location,
     };
     use lifecycle::SessionState;
     use session_log_contract::{RecoveryCloseRuntimeReason, RuntimeLeaseSnapshot, RuntimeLocation};
+    use std::collections::BTreeSet;
 
     fn location(database_path: String) -> RuntimeLocation {
         RuntimeLocation {
@@ -455,18 +463,106 @@ mod tests {
     }
 
     #[test]
-    fn active_commander_writer_is_the_only_deferred_provider_error() {
-        let exact = anyhow::anyhow!(
-            "{}",
-            "official Codex App Server returned an error for thread/resume: {\"code\":-32600,\"message\":\"thread commander-1 already has an active writer\"}"
+    fn startup_parent_recovery_never_invokes_a_provider_continuation() {
+        let settled = crate::services::execution::TerminalDeliveryIdentity {
+            commander_session_id: "commander-1".to_string(),
+            transaction_id: "transaction-1".to_string(),
+            event_id: "event-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            callback_payload_sha256: Some("a".repeat(64)),
+            callback_effect_identity: Some(session_lifecycle::CallbackEffectIdentity::Exact {
+                effect_id: "message-1".to_string(),
+            }),
+        };
+        let settled_status = parent_continuation_recovery_status(&settled);
+        assert_eq!(
+            settled_status[0]["status"],
+            "awaiting_commander_recovery_adapter"
         );
-        assert!(is_commander_active_writer_pre_submit(&exact));
+        assert_eq!(settled_status[0]["provider_attempt_delta"], 0);
+        assert_eq!(settled_status[0]["acknowledged"], false);
 
-        let delivery_unknown = anyhow::anyhow!(
-            "{}",
-            "official Codex App Server returned an error for thread/resume: {\"code\":-32603,\"message\":\"delivery uncertain\"}"
+        let mut zero_effect = settled.clone();
+        zero_effect.callback_effect_identity = Some(
+            session_lifecycle::CallbackEffectIdentity::ProvenZeroEffect {
+                classification: "pre_provider_zero_effect".to_string(),
+                evidence_sha256: "b".repeat(64),
+            },
         );
-        assert!(!is_commander_active_writer_pre_submit(&delivery_unknown));
+        assert_eq!(
+            parent_continuation_recovery_status(&zero_effect)[0]["status"],
+            "awaiting_commander_recovery_adapter"
+        );
+
+        let mut unsettled = settled.clone();
+        unsettled.callback_effect_identity = Some(
+            session_lifecycle::CallbackEffectIdentity::UnsettledEffect {
+                classification: "receipt_incomplete".to_string(),
+                evidence_sha256: "c".repeat(64),
+            },
+        );
+        let unsettled_status = parent_continuation_recovery_status(&unsettled);
+        assert_eq!(unsettled_status[0]["status"], "withheld_unsettled_effect");
+        assert_eq!(unsettled_status[0]["provider_attempt_delta"], 0);
+        assert_eq!(unsettled_status[0]["acknowledged"], false);
+
+        let mut missing = settled;
+        missing.callback_effect_identity = None;
+        assert_eq!(
+            parent_continuation_recovery_status(&missing)[0]["status"],
+            "withheld_callback_effect_identity_missing"
+        );
+
+        let mut missing_payload = missing;
+        missing_payload.callback_effect_identity = Some(
+            session_lifecycle::CallbackEffectIdentity::Exact {
+                effect_id: "message-2".to_string(),
+            },
+        );
+        missing_payload.callback_payload_sha256 = None;
+        assert_eq!(
+            parent_continuation_recovery_status(&missing_payload)[0]["status"],
+            "withheld_callback_payload_identity_missing"
+        );
+    }
+
+    #[test]
+    fn startup_parent_recovery_preserves_distinct_callbacks_for_one_commander() {
+        let first = crate::services::execution::TerminalDeliveryIdentity {
+            commander_session_id: "commander-1".to_string(),
+            transaction_id: "transaction-1".to_string(),
+            event_id: "event-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            callback_payload_sha256: Some("a".repeat(64)),
+            callback_effect_identity: Some(session_lifecycle::CallbackEffectIdentity::Exact {
+                effect_id: "message-1".to_string(),
+            }),
+        };
+        let mut second = first.clone();
+        second.transaction_id = "transaction-2".to_string();
+        second.event_id = "event-2".to_string();
+        second.runtime_id = "runtime-2".to_string();
+        second.callback_effect_identity = Some(
+            session_lifecycle::CallbackEffectIdentity::ProvenZeroEffect {
+                classification: "pre_provider_zero_effect".to_string(),
+                evidence_sha256: "b".repeat(64),
+            },
+        );
+
+        let mut seen = BTreeSet::new();
+        let first_status = take_parent_continuation_recovery_status(&first, &mut seen)
+            .expect("first callback projection");
+        let second_status = take_parent_continuation_recovery_status(&second, &mut seen)
+            .expect("second callback projection");
+
+        for status in [&first_status[0], &second_status[0]] {
+            assert_eq!(status["status"], "awaiting_commander_recovery_adapter");
+            assert_eq!(status["provider_attempt_delta"], 0);
+            assert_eq!(status["acknowledged"], false);
+        }
+        assert_eq!(first_status[0]["transaction_id"], "transaction-1");
+        assert_eq!(second_status[0]["transaction_id"], "transaction-2");
+        assert!(take_parent_continuation_recovery_status(&first, &mut seen).is_none());
     }
 
     #[test]
