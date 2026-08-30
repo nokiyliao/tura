@@ -19,11 +19,17 @@ use std::time::Duration;
 
 pub async fn health() -> Json<HealthResponse> {
     let projection = crate::session_feed::projection_health();
+    let router_health = if projection.healthy && projection.ready {
+        router_health_truth()
+    } else {
+        Ok(())
+    };
+    let (healthy, ready, status, error) = combined_health_truth(projection, router_health);
     Json(HealthResponse {
-        healthy: projection.healthy,
-        ready: projection.ready,
-        status: projection.status.to_string(),
-        error: projection.error,
+        healthy,
+        ready,
+        status: status.to_string(),
+        error,
         version: env!("CARGO_PKG_VERSION").to_string(),
         root: gateway_identity_root(),
         home: gateway_identity_home(),
@@ -32,6 +38,42 @@ pub async fn health() -> Json<HealthResponse> {
         process_start_time: current_process_start_time(std::process::id()),
         dev_log_path: gateway_dev_log_path(),
     })
+}
+
+fn router_health_truth() -> Result<(), String> {
+    let payload = crate::router_client::RouterClient::global()
+        .health_check()
+        .map_err(|error| format!("router health check failed: {error}"))?;
+    validate_router_health_payload(&payload)
+}
+
+fn validate_router_health_payload(payload: &Value) -> Result<(), String> {
+    if payload.get("status").and_then(Value::as_str) == Some("ok") {
+        Ok(())
+    } else {
+        Err(format!(
+            "router health check returned non-ok payload: {payload}"
+        ))
+    }
+}
+
+fn combined_health_truth(
+    projection: crate::session_feed::ProjectionHealth,
+    router_health: Result<(), String>,
+) -> (bool, bool, &'static str, Option<String>) {
+    if !projection.healthy || !projection.ready {
+        return (
+            projection.healthy,
+            projection.ready,
+            projection.status,
+            projection.error,
+        );
+    }
+
+    match router_health {
+        Ok(()) => (true, true, "ready", None),
+        Err(error) => (false, false, "failed", Some(error)),
+    }
 }
 
 fn current_process_start_time(pid: u32) -> Option<u64> {
@@ -526,12 +568,85 @@ pub async fn upgrade(Json(_payload): Json<UpgradeRequest>) -> Json<UpgradeRespon
 #[cfg(test)]
 mod tests {
     use super::{
-        event_matches_session_filter, event_visible_to_frontend, read_json_config,
-        tura_config_tiers, update_tura_config_tier, TuraConfigUpdate,
+        combined_health_truth, event_matches_session_filter, event_visible_to_frontend,
+        read_json_config, tura_config_tiers, update_tura_config_tier,
+        validate_router_health_payload, TuraConfigUpdate,
     };
     use crate::contracts::{
         GlobalEvent, Message, MessageRole, MessageUpdatedProperties, SessionStatusProperties,
     };
+
+    #[test]
+    fn global_health_requires_projection_and_router_truth() {
+        let projection = crate::session_feed::ProjectionHealth {
+            healthy: true,
+            ready: true,
+            status: "ready",
+            error: None,
+        };
+
+        assert_eq!(
+            combined_health_truth(projection, Ok(())),
+            (true, true, "ready", None)
+        );
+
+        let projection = crate::session_feed::ProjectionHealth {
+            healthy: true,
+            ready: true,
+            status: "ready",
+            error: None,
+        };
+        assert_eq!(
+            combined_health_truth(projection, Err("router unavailable".to_string())),
+            (
+                false,
+                false,
+                "failed",
+                Some("router unavailable".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn global_health_preserves_projection_failure_diagnostics() {
+        let starting = crate::session_feed::ProjectionHealth {
+            healthy: false,
+            ready: false,
+            status: "starting",
+            error: None,
+        };
+        assert_eq!(
+            combined_health_truth(starting, Err("router unavailable".to_string())),
+            (false, false, "starting", None)
+        );
+
+        let failed = crate::session_feed::ProjectionHealth {
+            healthy: false,
+            ready: false,
+            status: "failed",
+            error: Some("projection replay failed".to_string()),
+        };
+        assert_eq!(
+            combined_health_truth(failed, Ok(())),
+            (
+                false,
+                false,
+                "failed",
+                Some("projection replay failed".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn global_health_rejects_non_ok_router_payload() {
+        assert!(validate_router_health_payload(&serde_json::json!({"status": "ok"})).is_ok());
+        let error = validate_router_health_payload(&serde_json::json!({
+            "status": "error",
+            "error": "session db unavailable"
+        }))
+        .expect_err("non-ok Router health must fail closed");
+        assert!(error.contains("non-ok payload"));
+    }
 
     #[test]
     fn read_json_config_reports_missing_path_context() {

@@ -601,16 +601,15 @@ mod tests {
         std::fs::remove_file(&hold_path).expect("release replay hold");
         let started = std::time::Instant::now();
         loop {
-            let health = reqwest::get(format!("http://{addr}/global/health"))
-                .await
-                .expect("health after hold release");
-            let body: serde_json::Value = health.json().await.expect("health json");
-            if body["ready"] == true && body["healthy"] == true {
+            let projection = crate::session_feed::projection_health();
+            if projection.ready && projection.healthy {
                 break;
             }
             assert!(
                 started.elapsed() < Duration::from_secs(10),
-                "projection should become ready after replay hold is released: {body}"
+                "projection should become ready after replay hold is released: status={} error={:?}",
+                projection.status,
+                projection.error
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
