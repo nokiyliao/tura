@@ -101,16 +101,51 @@ mod tests {
         };
 
         let settings = super::load_settings().await.expect("load bundled config");
-        for route in ["thinking", "fast", "embedding_high", "embedding_low"] {
+        for route in [
+            "thinking",
+            "fast",
+            "embedding_high",
+            "embedding_low",
+            "official_codex_app_server",
+        ] {
             assert!(
                 settings.route_by_name(route).is_some(),
                 "missing route {route}"
             );
         }
-        assert_eq!(settings.routes.len(), 4);
-        assert!(settings
-            .configured_model_catalog()
-            .contains_key("openrouter"));
+        assert_eq!(settings.routes.len(), 5);
+        let official_route = settings
+            .route_by_name("official_codex_app_server")
+            .expect("official Codex route");
+        let official_provider = official_route
+            .official_codex_app_server_provider()
+            .expect("official Codex route validation")
+            .expect("official Codex provider");
+        assert_eq!(official_provider.provider, "official_codex_app_server");
+        assert_eq!(official_provider.model, "gpt-5.6-sol");
+        assert_eq!(official_provider.base_url, "stdio://codex-app-server");
+        let legacy_error = settings
+            .route_by_name("thinking")
+            .expect("thinking route")
+            .official_codex_app_server_provider()
+            .expect_err("legacy Codex route must remain disabled");
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("legacy provider 'codex' is disabled")
+        );
+        assert!(settings.route_by_name("unknown-provider").is_none());
+        assert!(
+            settings
+                .configured_model_catalog()
+                .contains_key("openrouter")
+        );
+        assert_eq!(
+            settings
+                .configured_model_catalog()
+                .get("official_codex_app_server"),
+            Some(&vec!["gpt-5.6-sol".to_string()])
+        );
         assert_eq!(
             settings.provider_base_url("mistral").as_deref(),
             Some("https://api.mistral.ai/v1")

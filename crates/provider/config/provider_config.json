@@ -2473,6 +2473,54 @@
         "status": "configured",
         "token_env": null
       },
+      "official_codex_app_server": {
+        "api_docs": null,
+        "api_style": "codex_app_server",
+        "auth_methods": [],
+        "base_url": "stdio://codex-app-server",
+        "capabilities": [
+          "llm.chat",
+          "llm.tool_call"
+        ],
+        "display_name": "Official Codex App Server",
+        "domains": [
+          "llm"
+        ],
+        "env": [],
+        "models": {
+          "thinking": [
+            {
+              "attachment": true,
+              "family": "gpt-5.6",
+              "id": "gpt-5.6-sol",
+              "limit": {
+                "context": 1050000,
+                "input": 1050000,
+                "output": 128000
+              },
+              "modalities": {
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "output": [
+                  "text"
+                ]
+              },
+              "name": "gpt-5.6-sol",
+              "options": {},
+              "reasoning": true,
+              "release_date": "2026-07-10",
+              "status": null,
+              "temperature": true,
+              "tool_call": true
+            }
+          ]
+        },
+        "runtime_provider": "official_codex_app_server",
+        "status": "configured",
+        "token_env": null
+      },
       "openai": {
         "api_docs": null,
         "api_style": "openapi",
@@ -4228,6 +4276,7 @@
     "mistral": "https://api.mistral.ai/v1",
     "notion": "https://api.notion.com/v1",
     "ollama": "http://localhost:11434",
+    "official_codex_app_server": "stdio://codex-app-server",
     "openai": "https://api.openai.com/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "perplexity": "https://api.perplexity.ai",
@@ -4585,6 +4634,15 @@
         {
           "model": "gemini-3.1-pro-preview",
           "provider": "google"
+        }
+      ]
+    },
+    "official_codex_app_server": {
+      "default_temperature": 0.2,
+      "providers": [
+        {
+          "model": "gpt-5.6-sol",
+          "provider": "official_codex_app_server"
         }
       ]
     }
