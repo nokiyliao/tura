@@ -2162,11 +2162,18 @@ fn commander_convergence_fallback_request(
         SessionLogResponse::Error { error } => return Err(anyhow!(error)),
         other => return Err(anyhow!("unexpected runtime replay response: {other:?}")),
     };
+    let attempt_binds_continuation = attempt.runtime_id == record.runtime_id
+        || attempt.fallback_from_id.as_deref() == Some(record.runtime_id.as_str())
+        || (attempt
+            .runtime_id
+            .starts_with("callback-continuation-recovery-runtime-")
+            && attempt.fallback_from_id.as_deref().is_some_and(|fallback| {
+                fallback.starts_with("callback-continuation-recovery-runtime-")
+            }));
     if attempt.runtime_id != *latest_runtime_id
         || attempt.session_id != record.commander_session_id
         || attempt.state != RuntimeState::Failed
-        || (attempt.runtime_id != record.runtime_id
-            && attempt.fallback_from_id.as_deref() != Some(record.runtime_id.as_str()))
+        || !attempt_binds_continuation
     {
         return Ok(None);
     }
