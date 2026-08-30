@@ -22,14 +22,26 @@ impl SessionLogStore {
     ) -> Result<(Page, Vec<RuntimeLocation>)> {
         let page_size = request.page_size.clamp(1, 500);
         self.with_index_connection(|conn| {
-            let total = conn.query_row("SELECT COUNT(*) FROM runtime_locations", [], |row| {
-                row.get::<_, u64>(0)
-            })?;
+            let actionable_predicate = "NOT (terminal_proven = 1
+                       AND terminal_revision IS NOT NULL
+                       AND terminal_event_seq IS NOT NULL
+                       AND terminal_evidence_id IS NOT NULL
+                       AND TRIM(terminal_evidence_id) != '')";
+            let total = conn.query_row(
+                &format!("SELECT COUNT(*) FROM runtime_locations WHERE {actionable_predicate}"),
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
             let page = bounded_page(request.page, page_size, total, false);
             let mut statement = conn.prepare(
                 "SELECT runtime_id, session_id, workspace_db_path, terminal_proven,
                         terminal_revision, terminal_event_seq, terminal_evidence_id
                  FROM runtime_locations
+                 WHERE NOT (terminal_proven = 1
+                            AND terminal_revision IS NOT NULL
+                            AND terminal_event_seq IS NOT NULL
+                            AND terminal_evidence_id IS NOT NULL
+                            AND TRIM(terminal_evidence_id) != '')
                  ORDER BY runtime_id ASC
                  LIMIT ?1 OFFSET ?2",
             )?;
@@ -387,10 +399,16 @@ impl SessionLogStore {
 
     pub(super) fn delete_index_session(&self, session_id: &str) -> Result<()> {
         self.with_index_connection(|conn| {
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM runtime_locations WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            tx.execute(
                 "DELETE FROM sessions WHERE session_id = ?1",
                 params![session_id],
             )?;
+            tx.commit()?;
             Ok(())
         })
     }

@@ -726,10 +726,10 @@ mod tests {
     };
     use session_log_contract::{
         ActivateRuntimeLeaseRequest, CommitRuntimeEventRequest, CreateSessionRequest,
-        ExecuteSessionCommandRequest, GetSessionRequest, ListRuntimeLocationsRequest,
-        MarkSessionInterruptedRequest, ReadSessionFeedRequest, RegisterRuntimeRequest,
-        ReplayRuntimeRequest, RuntimeEventCommitOutcome, RuntimeRecoveryQuiescenceProof,
-        RuntimeRegistrationOutcome,
+        DeleteSessionRequest, DeleteWorkspaceRequest, ExecuteSessionCommandRequest,
+        GetSessionRequest, ListRuntimeLocationsRequest, MarkSessionInterruptedRequest,
+        ReadSessionFeedRequest, RegisterRuntimeRequest, ReplayRuntimeRequest,
+        RuntimeEventCommitOutcome, RuntimeRecoveryQuiescenceProof, RuntimeRegistrationOutcome,
     };
 
     #[derive(Debug, PartialEq)]
@@ -1128,6 +1128,151 @@ mod tests {
         assert!(terminal);
         assert!(!lease_active);
         assert_eq!(terminal_projection_count, 1);
+    }
+
+    #[test]
+    fn runtime_location_listing_filters_complete_terminal_proof_before_pagination() {
+        let fixture = RecoveryFixture::new("bounded-listing");
+        fixture
+            .store
+            .with_index_connection(|conn| {
+                let tx = conn.transaction()?;
+                for index in 0..1_000_u64 {
+                    tx.execute(
+                        "INSERT INTO runtime_locations(
+                            runtime_id, session_id, workspace_db_path, terminal_proven,
+                            terminal_revision, terminal_event_seq, terminal_evidence_id
+                         ) VALUES (?1, ?2, ?3, 1, 1, 1, ?4)",
+                        params![
+                            format!("proven-{index:04}"),
+                            format!("historical-session-{index:04}"),
+                            fixture.database_path,
+                            format!("terminal-proof-{index:04}")
+                        ],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO runtime_locations(
+                        runtime_id, session_id, workspace_db_path, terminal_proven,
+                        terminal_revision, terminal_event_seq, terminal_evidence_id
+                     ) VALUES ('malformed-proof', 'malformed-session', ?1, 1, 1, NULL, 'evidence')",
+                    params![fixture.database_path],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .expect("seed terminal history");
+
+        let (page, locations) = fixture
+            .store
+            .list_runtime_locations(ListRuntimeLocationsRequest {
+                page: 0,
+                page_size: 500,
+            })
+            .expect("list actionable locations");
+        assert_eq!(page.total, 2);
+        assert_eq!(locations.len(), 2);
+        assert!(
+            locations
+                .iter()
+                .any(|location| location.runtime_id == fixture.runtime_id)
+        );
+        assert!(
+            locations
+                .iter()
+                .any(|location| location.runtime_id == "malformed-proof")
+        );
+        assert!(
+            locations
+                .iter()
+                .all(|location| !location.runtime_id.starts_with("proven-"))
+        );
+    }
+
+    #[test]
+    fn deleting_session_removes_only_its_derived_runtime_locations() {
+        let fixture = RecoveryFixture::new("delete-derived-location");
+        fixture
+            .store
+            .with_index_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO runtime_locations(runtime_id, session_id, workspace_db_path)
+                     VALUES ('unrelated-runtime', 'unrelated-session', '/tmp/unrelated.sqlite3')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("seed unrelated location");
+
+        fixture
+            .store
+            .delete_session(DeleteSessionRequest {
+                session_id: fixture.session_id.clone(),
+            })
+            .expect("delete indexed session");
+
+        fixture
+            .store
+            .with_index_connection(|conn| {
+                let target_count = conn.query_row(
+                    "SELECT COUNT(*) FROM runtime_locations WHERE session_id = ?1",
+                    params![fixture.session_id],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                let unrelated_count = conn.query_row(
+                    "SELECT COUNT(*) FROM runtime_locations WHERE runtime_id = 'unrelated-runtime'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                assert_eq!(target_count, 0);
+                assert_eq!(unrelated_count, 1);
+                Ok(())
+            })
+            .expect("verify derived location cleanup");
+    }
+
+    #[test]
+    fn deleting_workspace_removes_only_its_derived_runtime_locations() {
+        let fixture = RecoveryFixture::new("delete-workspace-derived-location");
+        fixture
+            .store
+            .with_index_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO runtime_locations(runtime_id, session_id, workspace_db_path)
+                     VALUES ('unrelated-workspace-runtime', 'unrelated-workspace-session',
+                             '/tmp/unrelated-workspace.sqlite3')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("seed unrelated workspace location");
+
+        fixture
+            .store
+            .delete_workspace(DeleteWorkspaceRequest {
+                workspace: fixture._workspace.path().to_string_lossy().into_owned(),
+            })
+            .expect("delete indexed workspace");
+
+        fixture
+            .store
+            .with_index_connection(|conn| {
+                let target_count = conn.query_row(
+                    "SELECT COUNT(*) FROM runtime_locations WHERE session_id = ?1",
+                    params![fixture.session_id],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                let unrelated_count = conn.query_row(
+                    "SELECT COUNT(*) FROM runtime_locations
+                     WHERE runtime_id = 'unrelated-workspace-runtime'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                assert_eq!(target_count, 0);
+                assert_eq!(unrelated_count, 1);
+                Ok(())
+            })
+            .expect("verify workspace derived location cleanup");
     }
 
     #[test]

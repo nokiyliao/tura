@@ -1,10 +1,10 @@
+use super::SessionLogStore;
 use super::connection::{init_workspace_db, with_connection};
 use super::helpers::{remove_sqlite_files, replay_session_events};
-use super::SessionLogStore;
 use crate::path::normalize_workspace;
 use anyhow::Result;
 use lifecycle::{SessionCommand, SessionState};
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use session_log_contract::{
     CommandCheckpoint, DeleteSessionRequest, DeleteWorkspaceRequest, ExecuteSessionCommandRequest,
     MarkSessionInterruptedRequest, SessionFeedEntry, SessionFeedEvent,
@@ -249,10 +249,17 @@ impl SessionLogStore {
             remove_sqlite_files(Path::new(&path))?;
         }
         self.with_index_connection(|conn| {
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM runtime_locations WHERE session_id IN
+                 (SELECT session_id FROM sessions WHERE workspace = ?1)",
+                params![workspace],
+            )?;
+            tx.execute(
                 "DELETE FROM sessions WHERE workspace = ?1",
                 params![workspace],
             )?;
+            tx.commit()?;
             Ok(())
         })?;
         Ok(DeleteSessionsOutcome { feed_entries })
