@@ -252,12 +252,29 @@ impl CodexExecutionLedger {
                 "execution ledger runtime changed without fallback_from_id".to_string()
             })?;
             if !self.runtime_ids.iter().any(|id| id == fallback_from_id) {
-                return Err("execution ledger fallback source is not durable".to_string());
+                if !is_bounded_commander_recovery_lineage(
+                    &request.runtime_id,
+                    fallback_from_id,
+                    request.commander_continuation.is_some(),
+                ) {
+                    return Err("execution ledger fallback source is not durable".to_string());
+                }
+                self.runtime_ids.push(fallback_from_id.to_string());
             }
             self.runtime_ids.push(request.runtime_id.clone());
         }
         Ok(())
     }
+}
+
+fn is_bounded_commander_recovery_lineage(
+    runtime_id: &str,
+    fallback_from_id: &str,
+    has_commander_binding: bool,
+) -> bool {
+    has_commander_binding
+        && runtime_id.starts_with("callback-continuation-recovery-runtime-")
+        && fallback_from_id.starts_with("callback-continuation-recovery-runtime-")
 }
 
 pub fn load_terminal_commander_convergence_ledger(
@@ -4085,6 +4102,25 @@ mod interrupted_read_only_reconciliation_tests {
             commander_convergence_proof: None,
             commander_convergence_final_assistant: None,
         }
+    }
+
+    #[test]
+    fn only_bound_callback_recovery_may_bridge_a_preledger_fallback() {
+        assert!(is_bounded_commander_recovery_lineage(
+            "callback-continuation-recovery-runtime-next",
+            "callback-continuation-recovery-runtime-previous",
+            true,
+        ));
+        assert!(!is_bounded_commander_recovery_lineage(
+            "callback-continuation-recovery-runtime-next",
+            "unrelated-runtime",
+            true,
+        ));
+        assert!(!is_bounded_commander_recovery_lineage(
+            "callback-continuation-recovery-runtime-next",
+            "callback-continuation-recovery-runtime-previous",
+            false,
+        ));
     }
 
     #[test]
