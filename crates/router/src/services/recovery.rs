@@ -43,25 +43,30 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
     let mut seen_runtime_ids = BTreeSet::new();
     let mut inspected = 0_u64;
     let mut recovered = Vec::new();
-    let mut page = 0_u64;
-    let mut seen_locations = 0_u64;
+    let mut after_runtime_id = None;
     loop {
         let response = call_service(&SessionLogCommand::ListRuntimeLocations(
             ListRuntimeLocationsRequest {
-                page,
+                page: 0,
                 page_size: RECOVERY_PAGE_SIZE,
+                after_runtime_id: after_runtime_id.clone(),
             },
         ))?;
-        let (page_info, locations) = match response {
-            SessionLogResponse::RuntimeLocations { page, locations } => (page, locations),
+        let locations = match response {
+            SessionLogResponse::RuntimeLocations { locations, .. } => locations,
             SessionLogResponse::Error { error } => return Err(anyhow!(error)),
             other => bail!("unexpected list_runtime_locations response during recovery: {other:?}"),
         };
-        let location_count = locations.len() as u64;
+        let Some(next_after_runtime_id) = locations
+            .last()
+            .map(|location| location.runtime_id.clone())
+        else {
+            break;
+        };
         for location in locations {
             let runtime_id = location.runtime_id.clone();
             if !seen_runtime_ids.insert(runtime_id.clone()) {
-                continue;
+                bail!("STARTUP_RECOVERY_RUNTIME_LOCATION_KEYSET_REPEATED:{runtime_id}");
             }
             if runtime_location_recovery_state(&location)?
                 == RuntimeLocationRecoveryState::TerminalProven
@@ -214,11 +219,7 @@ async fn recover_runtime_rows(state: &AppState) -> Result<(u64, Vec<Value>)> {
                 }
             }
         }
-        seen_locations = seen_locations.saturating_add(location_count);
-        if location_count == 0 || seen_locations >= page_info.total {
-            break;
-        }
-        page = page.saturating_add(1);
+        after_runtime_id = Some(next_after_runtime_id);
     }
 
     Ok((inspected, recovered))
@@ -532,5 +533,14 @@ mod tests {
             error.to_string(),
             "STARTUP_RECOVERY_MALFORMED_TERMINAL_PROOF:runtime-1"
         );
+        for evidence_id in ["\t", "\n", "\u{2003}"] {
+            location.terminal_evidence_id = Some(evidence_id.to_string());
+            let error = runtime_location_recovery_state(&location)
+                .expect_err("whitespace-only terminal proof must block");
+            assert_eq!(
+                error.to_string(),
+                "STARTUP_RECOVERY_MALFORMED_TERMINAL_PROOF:runtime-1"
+            );
+        }
     }
 }

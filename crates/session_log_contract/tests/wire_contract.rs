@@ -93,6 +93,7 @@ fn runtime_recovery_wire_contract_binds_exact_ledger_identity() {
             ListRuntimeLocationsRequest {
                 page: 2,
                 page_size: 100,
+                after_runtime_id: None,
             },
         ))
         .expect("runtime location list command"),
@@ -100,6 +101,22 @@ fn runtime_recovery_wire_contract_binds_exact_ledger_identity() {
             "command": "list_runtime_locations",
             "page": 2,
             "page_size": 100
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(SessionLogCommand::ListRuntimeLocations(
+            ListRuntimeLocationsRequest {
+                page: 0,
+                page_size: 100,
+                after_runtime_id: Some("runtime-100".to_string()),
+            },
+        ))
+        .expect("keyset runtime location list command"),
+        json!({
+            "command": "list_runtime_locations",
+            "page": 0,
+            "page_size": 100,
+            "after_runtime_id": "runtime-100"
         })
     );
     assert_eq!(

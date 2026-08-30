@@ -552,6 +552,9 @@ pub struct ListRuntimeLocationsRequest {
     pub page: u64,
     #[serde(default = "default_page_size")]
     pub page_size: u64,
+    /// Stable keyset cursor for recovery scans whose result set may shrink as rows are closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_runtime_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -15,6 +15,15 @@ use session_log_contract::{
 };
 use std::path::Path;
 
+// Rust `str::trim` follows Unicode White_Space. SQLite's one-argument TRIM only removes U+0020,
+// so bind the exact current White_Space set whenever SQL classifies a terminal evidence id.
+const RUST_TRIM_WHITESPACE: &str = "\u{0009}\u{000a}\u{000b}\u{000c}\u{000d}\u{0020}\u{0085}\u{00a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+const COMPLETE_TERMINAL_PROOF_PREDICATE: &str = "terminal_proven = 1
+                       AND terminal_revision IS NOT NULL
+                       AND terminal_event_seq IS NOT NULL
+                       AND terminal_evidence_id IS NOT NULL
+                       AND TRIM(terminal_evidence_id, ?1) != ''";
+
 impl SessionLogStore {
     pub fn list_runtime_locations(
         &self,
@@ -22,42 +31,53 @@ impl SessionLogStore {
     ) -> Result<(Page, Vec<RuntimeLocation>)> {
         let page_size = request.page_size.clamp(1, 500);
         self.with_index_connection(|conn| {
-            let actionable_predicate = "NOT (terminal_proven = 1
-                       AND terminal_revision IS NOT NULL
-                       AND terminal_event_seq IS NOT NULL
-                       AND terminal_evidence_id IS NOT NULL
-                       AND TRIM(terminal_evidence_id) != '')";
             let total = conn.query_row(
-                &format!("SELECT COUNT(*) FROM runtime_locations WHERE {actionable_predicate}"),
-                [],
+                &format!(
+                    "SELECT COUNT(*) FROM runtime_locations WHERE NOT ({COMPLETE_TERMINAL_PROOF_PREDICATE})"
+                ),
+                params![RUST_TRIM_WHITESPACE],
                 |row| row.get::<_, u64>(0),
             )?;
-            let page = bounded_page(request.page, page_size, total, false);
-            let mut statement = conn.prepare(
-                "SELECT runtime_id, session_id, workspace_db_path, terminal_proven,
-                        terminal_revision, terminal_event_seq, terminal_evidence_id
-                 FROM runtime_locations
-                 WHERE NOT (terminal_proven = 1
-                            AND terminal_revision IS NOT NULL
-                            AND terminal_event_seq IS NOT NULL
-                            AND terminal_evidence_id IS NOT NULL
-                            AND TRIM(terminal_evidence_id) != '')
-                 ORDER BY runtime_id ASC
-                 LIMIT ?1 OFFSET ?2",
-            )?;
-            let locations = statement
-                .query_map(params![page_size, page.saturating_mul(page_size)], |row| {
-                    Ok(RuntimeLocation {
-                        runtime_id: row.get(0)?,
-                        session_id: row.get(1)?,
-                        workspace_db_path: row.get(2)?,
-                        terminal_proven: row.get(3)?,
-                        terminal_revision: row.get(4)?,
-                        terminal_event_seq: row.get(5)?,
-                        terminal_evidence_id: row.get(6)?,
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let after_runtime_id = request.after_runtime_id.as_deref();
+            let (page, locations) = if let Some(after_runtime_id) = after_runtime_id {
+                let mut statement = conn.prepare(&format!(
+                    "SELECT runtime_id, session_id, workspace_db_path, terminal_proven,
+                            terminal_revision, terminal_event_seq, terminal_evidence_id
+                     FROM runtime_locations
+                     WHERE NOT ({COMPLETE_TERMINAL_PROOF_PREDICATE})
+                       AND runtime_id > ?2
+                     ORDER BY runtime_id ASC
+                     LIMIT ?3"
+                ))?;
+                let locations = statement
+                    .query_map(
+                        params![RUST_TRIM_WHITESPACE, after_runtime_id, page_size],
+                        runtime_location_from_row,
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                (0, locations)
+            } else {
+                let page = bounded_page(request.page, page_size, total, false);
+                let mut statement = conn.prepare(&format!(
+                    "SELECT runtime_id, session_id, workspace_db_path, terminal_proven,
+                            terminal_revision, terminal_event_seq, terminal_evidence_id
+                     FROM runtime_locations
+                     WHERE NOT ({COMPLETE_TERMINAL_PROOF_PREDICATE})
+                     ORDER BY runtime_id ASC
+                     LIMIT ?2 OFFSET ?3"
+                ))?;
+                let locations = statement
+                    .query_map(
+                        params![
+                            RUST_TRIM_WHITESPACE,
+                            page_size,
+                            page.saturating_mul(page_size)
+                        ],
+                        runtime_location_from_row,
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                (page, locations)
+            };
             Ok((
                 Page {
                     page,
@@ -412,4 +432,16 @@ impl SessionLogStore {
             Ok(())
         })
     }
+}
+
+fn runtime_location_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeLocation> {
+    Ok(RuntimeLocation {
+        runtime_id: row.get(0)?,
+        session_id: row.get(1)?,
+        workspace_db_path: row.get(2)?,
+        terminal_proven: row.get(3)?,
+        terminal_revision: row.get(4)?,
+        terminal_event_seq: row.get(5)?,
+        terminal_evidence_id: row.get(6)?,
+    })
 }

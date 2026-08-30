@@ -1056,6 +1056,7 @@ mod tests {
             .list_runtime_locations(ListRuntimeLocationsRequest {
                 page: 0,
                 page_size: 1,
+                after_runtime_id: None,
             })
             .expect("list authoritative runtime registrations");
         assert_eq!(page.total, 1);
@@ -1158,6 +1159,24 @@ mod tests {
                      ) VALUES ('malformed-proof', 'malformed-session', ?1, 1, 1, NULL, 'evidence')",
                     params![fixture.database_path],
                 )?;
+                for (runtime_id, evidence_id) in [
+                    ("malformed-tab", "\t"),
+                    ("malformed-newline", "\n"),
+                    ("malformed-unicode", "\u{2003}"),
+                ] {
+                    tx.execute(
+                        "INSERT INTO runtime_locations(
+                            runtime_id, session_id, workspace_db_path, terminal_proven,
+                            terminal_revision, terminal_event_seq, terminal_evidence_id
+                         ) VALUES (?1, ?2, ?3, 1, 1, 1, ?4)",
+                        params![
+                            runtime_id,
+                            format!("{runtime_id}-session"),
+                            fixture.database_path,
+                            evidence_id
+                        ],
+                    )?;
+                }
                 tx.commit()?;
                 Ok(())
             })
@@ -1168,10 +1187,11 @@ mod tests {
             .list_runtime_locations(ListRuntimeLocationsRequest {
                 page: 0,
                 page_size: 500,
+                after_runtime_id: None,
             })
             .expect("list actionable locations");
-        assert_eq!(page.total, 2);
-        assert_eq!(locations.len(), 2);
+        assert_eq!(page.total, 5);
+        assert_eq!(locations.len(), 5);
         assert!(
             locations
                 .iter()
@@ -1187,6 +1207,104 @@ mod tests {
                 .iter()
                 .all(|location| !location.runtime_id.starts_with("proven-"))
         );
+        for runtime_id in [
+            "malformed-tab",
+            "malformed-newline",
+            "malformed-unicode",
+        ] {
+            assert!(
+                locations
+                    .iter()
+                    .any(|location| location.runtime_id == runtime_id),
+                "whitespace-only proof {runtime_id} must remain actionable"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_location_keyset_does_not_skip_rows_as_actionable_set_shrinks() {
+        let fixture = RecoveryFixture::new("mutable-keyset");
+        fixture
+            .store
+            .with_index_connection(|conn| {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "UPDATE runtime_locations SET terminal_proven = 1,
+                         terminal_revision = 1, terminal_event_seq = 1,
+                         terminal_evidence_id = 'fixture-proof'
+                     WHERE runtime_id = ?1",
+                    params![fixture.runtime_id],
+                )?;
+                for index in 0..250_u64 {
+                    tx.execute(
+                        "INSERT INTO runtime_locations(runtime_id, session_id, workspace_db_path)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            format!("mutable-{index:04}"),
+                            format!("mutable-session-{index:04}"),
+                            fixture.database_path
+                        ],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .expect("seed mutable actionable rows");
+
+        let mut after_runtime_id = None;
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            let (_, locations) = fixture
+                .store
+                .list_runtime_locations(ListRuntimeLocationsRequest {
+                    page: 0,
+                    page_size: 100,
+                    after_runtime_id: after_runtime_id.clone(),
+                })
+                .expect("list mutable actionable page");
+            let Some(next_after_runtime_id) =
+                locations.last().map(|location| location.runtime_id.clone())
+            else {
+                break;
+            };
+            assert!(locations.len() <= 100);
+            fixture
+                .store
+                .with_index_connection(|conn| {
+                    let tx = conn.transaction()?;
+                    for location in &locations {
+                        assert!(seen.insert(location.runtime_id.clone()));
+                        tx.execute(
+                            "UPDATE runtime_locations SET terminal_proven = 1,
+                                 terminal_revision = 1, terminal_event_seq = 1,
+                                 terminal_evidence_id = ?2
+                             WHERE runtime_id = ?1",
+                            params![
+                                location.runtime_id,
+                                format!("proof:{}", location.runtime_id)
+                            ],
+                        )?;
+                    }
+                    tx.commit()?;
+                    Ok(())
+                })
+                .expect("terminalize mutable page");
+            after_runtime_id = Some(next_after_runtime_id);
+        }
+
+        assert_eq!(seen.len(), 250);
+        assert_eq!(seen.first().map(String::as_str), Some("mutable-0000"));
+        assert_eq!(seen.last().map(String::as_str), Some("mutable-0249"));
+        let (page, remaining) = fixture
+            .store
+            .list_runtime_locations(ListRuntimeLocationsRequest {
+                page: 0,
+                page_size: 500,
+                after_runtime_id: None,
+            })
+            .expect("verify mutable corpus drained");
+        assert_eq!(page.total, 0);
+        assert!(remaining.is_empty());
     }
 
     #[test]
