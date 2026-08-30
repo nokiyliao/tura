@@ -22,3 +22,6 @@ pub mod session_db;
 pub mod user_commands;
 #[path = "services/worker_process.rs"]
 pub mod worker_process;
+
+#[cfg(test)]
+pub(crate) static ROUTER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

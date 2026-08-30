@@ -276,7 +276,9 @@ mod tests {
 
     #[test]
     fn shutdown_is_terminal_for_later_start_and_restart_requests() -> anyhow::Result<()> {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = crate::services::ROUTER_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let home = tempfile::tempdir()?;
         let _env = EnvGuard::set_home(home.path());
         let service = SessionDbService::new();
@@ -296,7 +298,9 @@ mod tests {
 
     #[test]
     fn status_does_not_adopt_socket_that_fails_session_db_health() -> anyhow::Result<()> {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = crate::services::ROUTER_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let home = tempfile::tempdir()?;
         let _env = EnvGuard::set_home(home.path());
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -336,7 +340,9 @@ mod tests {
 
     #[test]
     fn start_adopts_reachable_existing_session_db_endpoint() -> anyhow::Result<()> {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = crate::services::ROUTER_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let home = tempfile::tempdir()?;
         let _env = EnvGuard::set_home(home.path());
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -419,8 +425,6 @@ mod tests {
             None
         );
     }
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvGuard {
         previous: Vec<(&'static str, Option<std::ffi::OsString>)>,

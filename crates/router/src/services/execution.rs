@@ -3433,10 +3433,8 @@ mod tests {
     use session_log_contract::{
         RuntimeLeaseSnapshot, RuntimeLifecycleIdentity, SessionFeedEntry, SessionFeedEvent,
     };
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
-
-    static RECOVERY_ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[test]
     fn failed_session_registration_reuses_exact_latest_runtime_lineage() {
@@ -5103,20 +5101,80 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn malformed_convergence_ledger_callsite_has_zero_durable_mutation() {
-        let _guard = RECOVERY_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let root = tempfile::tempdir().expect("isolated recovery root");
+    struct RecoveryTestEnvGuard {
+        session_db: crate::services::session_db::SessionDbService,
+        previous_db: Option<std::ffi::OsString>,
+        previous_project: Option<std::ffi::OsString>,
+    }
+
+    impl RecoveryTestEnvGuard {
+        fn install(
+            session_db: crate::services::session_db::SessionDbService,
+            db_root: &std::path::Path,
+            project_root: &std::path::Path,
+        ) -> Self {
+            let guard = Self {
+                session_db,
+                previous_db: std::env::var_os("SESSION_LOG_DB_ROOT"),
+                previous_project: std::env::var_os("TURA_PROJECT_ROOT"),
+            };
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var("SESSION_LOG_DB_ROOT", db_root);
+                std::env::set_var("TURA_PROJECT_ROOT", project_root);
+            }
+            guard
+        }
+    }
+
+    impl Drop for RecoveryTestEnvGuard {
+        fn drop(&mut self) {
+            self.session_db.shutdown();
+            #[allow(unsafe_code)]
+            unsafe {
+                match self.previous_db.take() {
+                    Some(value) => std::env::set_var("SESSION_LOG_DB_ROOT", value),
+                    None => std::env::remove_var("SESSION_LOG_DB_ROOT"),
+                }
+                match self.previous_project.take() {
+                    Some(value) => std::env::set_var("TURA_PROJECT_ROOT", value),
+                    None => std::env::remove_var("TURA_PROJECT_ROOT"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_test_env_guard_restores_shared_env_during_unwind() {
+        let _lock = crate::services::ROUTER_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let previous_db = std::env::var_os("SESSION_LOG_DB_ROOT");
         let previous_project = std::env::var_os("TURA_PROJECT_ROOT");
+        let root = tempfile::tempdir().expect("env guard root");
+        let result = std::panic::catch_unwind(|| {
+            let _env = RecoveryTestEnvGuard::install(
+                crate::services::session_db::SessionDbService::new(),
+                root.path(),
+                root.path(),
+            );
+            panic!("injected assertion unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(std::env::var_os("SESSION_LOG_DB_ROOT"), previous_db);
+        assert_eq!(std::env::var_os("TURA_PROJECT_ROOT"), previous_project);
+    }
+
+    #[tokio::test]
+    async fn malformed_convergence_ledger_callsite_has_zero_durable_mutation() {
+        let _lock = crate::services::ROUTER_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().expect("isolated recovery root");
         let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent().and_then(std::path::Path::parent).expect("project root");
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("SESSION_LOG_DB_ROOT", root.path());
-            std::env::set_var("TURA_PROJECT_ROOT", project);
-        }
         let state = build_state();
+        let _env = RecoveryTestEnvGuard::install(state.session_db.clone(), root.path(), project);
         state.session_db.start().expect("isolated session db");
         let session_id = "commander-callback";
         let directory = root.path().join("workspace");
@@ -5194,12 +5252,6 @@ mod tests {
         assert_eq!(before_runtime, after_runtime);
         assert_eq!(before_session, read_session_snapshot(session_id).expect("session after"));
         assert_eq!(lifecycle_before, store.readback().expect("lifecycle after"));
-        state.session_db.shutdown();
-        #[allow(unsafe_code)]
-        unsafe {
-            match previous_db { Some(v) => std::env::set_var("SESSION_LOG_DB_ROOT", v), None => std::env::remove_var("SESSION_LOG_DB_ROOT") }
-            match previous_project { Some(v) => std::env::set_var("TURA_PROJECT_ROOT", v), None => std::env::remove_var("TURA_PROJECT_ROOT") }
-        }
     }
 
     #[test]
