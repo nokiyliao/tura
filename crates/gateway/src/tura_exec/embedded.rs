@@ -3,10 +3,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use runtime_contract::{CallContext, RunAgentRequest, RuntimeWorkerResponse, WorkerEnvelope};
-use session_log_contract::{
-    ActivateRuntimeLeaseRequest, RegisterRuntimeRequest, RuntimeLeaseOutcome,
-    RuntimeRegistrationOutcome, SessionLogCommand, SessionLogResponse,
+use runtime_contract::{
+    CallContext, LifecycleExecutionContext, RunAgentRequest, RuntimeWorkerResponse, WorkerEnvelope,
 };
 
 use super::cli::CliConfig;
@@ -26,26 +24,12 @@ pub(crate) fn run_via_runtime_worker(
     })?;
     let runtime_id = format!("runtime-{}", uuid::Uuid::new_v4());
     let lease_id = format!("lease-{}", uuid::Uuid::new_v4());
-    register_and_activate_runtime(session_id, &runtime_id, &lease_id)?;
-    let request = RunAgentRequest {
-        runtime_id,
-        lease_id,
-        session_id: Some(session_id.to_string()),
-        directory: Some(config.cwd.to_string_lossy().to_string()),
-        model: config.model.clone(),
-        agent: config.agent.clone(),
-        prompt: Some(prompt),
-        planning_mode_override: config.planning_mode,
-        no_op_manual: config.no_op_manual,
-        return_log: config.log || config.json,
-        worker_env: worker_env_from_current_process()
-            .into_iter()
-            .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_string())))
-            .collect(),
-        ..RunAgentRequest::default()
-    };
+    let transaction_id = format!("embedded-{}", uuid::Uuid::new_v4());
+    let lifecycle = embedded_lifecycle_context(session_id, &transaction_id);
+    let request =
+        embedded_run_agent_request(config, session_id, prompt, runtime_id, lease_id, lifecycle);
     let envelope = WorkerEnvelope::call(CallContext {
-        request_id: format!("embedded-{}", uuid::Uuid::new_v4()),
+        request_id: transaction_id,
         method: "POST".to_string(),
         path: format!("/runtime_worker/{session_id}"),
         input: serde_json::to_value(request)
@@ -136,6 +120,34 @@ pub(crate) fn run_via_runtime_worker(
     render_response(config, session_id, response)
 }
 
+fn embedded_run_agent_request(
+    config: &CliConfig,
+    session_id: &str,
+    prompt: String,
+    runtime_id: String,
+    lease_id: String,
+    lifecycle: LifecycleExecutionContext,
+) -> RunAgentRequest {
+    RunAgentRequest {
+        runtime_id,
+        lease_id,
+        lifecycle: Some(lifecycle),
+        session_id: Some(session_id.to_string()),
+        directory: Some(config.cwd.to_string_lossy().to_string()),
+        model: config.model.clone(),
+        agent: config.agent.clone(),
+        prompt: Some(prompt),
+        planning_mode_override: config.planning_mode,
+        no_op_manual: config.no_op_manual,
+        return_log: config.log || config.json,
+        worker_env: worker_env_from_current_process()
+            .into_iter()
+            .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_string())))
+            .collect(),
+        ..RunAgentRequest::default()
+    }
+}
+
 fn embedded_runtime_timeout() -> Duration {
     embedded_runtime_timeout_from(
         std::env::var("TURA_EXEC_EMBEDDED_RUNTIME_TIMEOUT_SECS")
@@ -151,63 +163,16 @@ fn embedded_runtime_timeout_from(raw: Option<&str>) -> Duration {
         .unwrap_or_else(|| Duration::from_secs(14_700))
 }
 
-fn register_and_activate_runtime(
-    session_id: &str,
-    runtime_id: &str,
-    lease_id: &str,
-) -> Result<(), String> {
-    let registered = session_log_contract::client::call_service(
-        &SessionLogCommand::RegisterRuntime(RegisterRuntimeRequest {
-            runtime_id: runtime_id.to_string(),
-            session_id: session_id.to_string(),
-            fallback_from_id: None,
-            lifecycle: None,
-        }),
-    )
-    .map_err(|error| format!("failed to register embedded runtime `{runtime_id}`: {error}"))?;
-    match registered {
-        SessionLogResponse::RuntimeRegistered {
-            result:
-                RuntimeRegistrationOutcome::Registered { .. }
-                | RuntimeRegistrationOutcome::AlreadyRegistered { .. },
-        } => {}
-        SessionLogResponse::RuntimeRegistered { result } => {
-            return Err(format!(
-                "session_db rejected embedded runtime `{runtime_id}` registration: {result:?}"
-            ));
-        }
-        SessionLogResponse::Error { error } => {
-            return Err(format!(
-                "failed to register embedded runtime `{runtime_id}`: {error}"
-            ));
-        }
-        other => {
-            return Err(format!(
-                "unexpected session_db response while registering embedded runtime `{runtime_id}`: {other:?}"
-            ));
-        }
-    }
-
-    let activated = session_log_contract::client::call_service(
-        &SessionLogCommand::ActivateRuntimeLease(ActivateRuntimeLeaseRequest {
-            runtime_id: runtime_id.to_string(),
-            lease_id: lease_id.to_string(),
-        }),
-    )
-    .map_err(|error| format!("failed to activate embedded runtime `{runtime_id}`: {error}"))?;
-    match activated {
-        SessionLogResponse::RuntimeLeaseActivated {
-            result: RuntimeLeaseOutcome::Activated | RuntimeLeaseOutcome::AlreadyActive,
-        } => Ok(()),
-        SessionLogResponse::RuntimeLeaseActivated { result } => Err(format!(
-            "session_db rejected embedded runtime `{runtime_id}` lease: {result:?}"
-        )),
-        SessionLogResponse::Error { error } => Err(format!(
-            "failed to activate embedded runtime `{runtime_id}`: {error}"
-        )),
-        other => Err(format!(
-            "unexpected session_db response while activating embedded runtime `{runtime_id}`: {other:?}"
-        )),
+fn embedded_lifecycle_context(session_id: &str, transaction_id: &str) -> LifecycleExecutionContext {
+    LifecycleExecutionContext {
+        transaction_id: transaction_id.to_string(),
+        commander_session_id: session_id.to_string(),
+        parent_mission_revision_sha256: None,
+        delegated_input_sha256: None,
+        task_id: None,
+        goal_id: None,
+        operator_override: false,
+        commander_continuation: None,
     }
 }
 
@@ -258,7 +223,12 @@ fn resolve_runtime_binary() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::embedded_runtime_timeout_from;
+    use session_log_contract::RuntimeLifecycleIdentity;
+
+    use super::{
+        embedded_lifecycle_context, embedded_run_agent_request, embedded_runtime_timeout_from,
+    };
+    use crate::tura_exec::cli::CliConfig;
 
     #[test]
     fn embedded_runtime_budget_supports_bounded_four_hour_commands() {
@@ -271,6 +241,58 @@ mod tests {
             embedded_runtime_timeout_from(Some("invalid")).as_secs(),
             14_700
         );
+    }
+
+    #[test]
+    fn embedded_worker_request_carries_exact_self_commander_lifecycle() {
+        let session_id = "embedded-session";
+        let runtime_id = "embedded-runtime";
+        let lease_id = "embedded-lease";
+        let transaction_id = "embedded-transaction";
+        let lifecycle = embedded_lifecycle_context(session_id, transaction_id);
+        let config = CliConfig::parse(vec!["--embedded".to_string(), "prompt".to_string()])
+            .expect("embedded config");
+        let request = embedded_run_agent_request(
+            &config,
+            session_id,
+            "prompt".to_string(),
+            runtime_id.to_string(),
+            lease_id.to_string(),
+            lifecycle.clone(),
+        );
+        let request_lifecycle = request.lifecycle.as_ref().expect("request lifecycle");
+        let reconstructed = RuntimeLifecycleIdentity {
+            commander_session_id: request_lifecycle.commander_session_id.clone(),
+            transaction_id: request_lifecycle.transaction_id.clone(),
+            parent_mission_revision_sha256: request_lifecycle
+                .parent_mission_revision_sha256
+                .clone(),
+            delegated_input_sha256: request_lifecycle.delegated_input_sha256.clone(),
+            task_id: request_lifecycle.task_id.clone(),
+            goal_id: request_lifecycle.goal_id.clone(),
+            operator_override: request_lifecycle.operator_override,
+            dispatch_runtime_id: request.runtime_id.clone(),
+            dispatch_lease_id: request.lease_id.clone(),
+            receipt_event_seq: 0,
+        };
+
+        assert_eq!(request.runtime_id, runtime_id);
+        assert_eq!(request.lease_id, lease_id);
+        assert_eq!(request.session_id.as_deref(), Some(session_id));
+        assert_eq!(request.lifecycle, Some(lifecycle));
+        assert_eq!(reconstructed.commander_session_id, session_id);
+        assert_eq!(reconstructed.transaction_id, transaction_id);
+        assert_eq!(reconstructed.parent_mission_revision_sha256, None);
+        assert_eq!(reconstructed.delegated_input_sha256, None);
+        assert_eq!(reconstructed.task_id, None);
+        assert_eq!(reconstructed.goal_id, None);
+        assert!(!reconstructed.operator_override);
+        assert_eq!(reconstructed.dispatch_runtime_id, runtime_id);
+        assert_eq!(reconstructed.dispatch_lease_id, lease_id);
+        assert_eq!(reconstructed.receipt_event_seq, 0);
+        reconstructed
+            .validate()
+            .expect("durable lifecycle identity");
     }
 }
 
