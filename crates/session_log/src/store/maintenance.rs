@@ -1,7 +1,7 @@
 use super::SessionLogStore;
 use anyhow::{Context, Result};
 use fs2::FileExt;
-use lifecycle::RuntimeEvent;
+use lifecycle::{RuntimeEvent, RuntimeState};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
@@ -13,7 +13,10 @@ use session_log_contract::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: &str = "runtime_location_maintenance_v1";
 const RUST_TRIM_WHITESPACE: &str = "\u{0009}\u{000a}\u{000b}\u{000c}\u{000d}\u{0020}\u{0085}\u{00a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
@@ -23,7 +26,7 @@ const INCOMPLETE_PREDICATE: &str = "NOT (terminal_proven = 1
     AND terminal_evidence_id IS NOT NULL
     AND TRIM(terminal_evidence_id, ?1) != '')";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct LocationRow {
     runtime_id: String,
     session_id: String,
@@ -34,24 +37,84 @@ struct LocationRow {
     terminal_evidence_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Proof {
+    workspace_canonical_path: String,
+    runtime_session_id: String,
+    runtime_revision: u64,
+    runtime_last_event_seq: u64,
+    runtime_terminal: bool,
+    runtime_lease_active: bool,
     revision: u64,
     event_seq: u64,
     evidence_id: String,
+    evidence_id_occurrences: u64,
+    event_json: String,
+    event_json_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PlanEntry {
     row: LocationRow,
     disposition: String,
     proof: Option<Proof>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct MaintenancePlan {
     schema_version: String,
     entries: Vec<PlanEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum ExpectedRowState {
+    BackfilledTerminalProof {
+        terminal_revision: u64,
+        terminal_event_seq: u64,
+        terminal_evidence_id: String,
+    },
+    Absent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ExpectedPostcondition {
+    runtime_id: String,
+    session_id: String,
+    workspace_db_path: String,
+    expected: ExpectedRowState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MaintenanceIntent {
+    schema_version: String,
+    canonical_input_sha256: String,
+    plan: MaintenancePlan,
+    expected_postconditions: Vec<ExpectedPostcondition>,
+    expected_receipt: RuntimeLocationMaintenanceReceipt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PreparedMarker {
+    schema_version: String,
+    canonical_input_sha256: String,
+    intent_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MaintenanceManifest {
+    schema_version: String,
+    canonical_input_sha256: String,
+    intent_sha256: String,
+    prepared_sha256: String,
+    receipt_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedState {
+    AllPre,
+    AllPost,
+    MixedOrDrift,
 }
 
 impl SessionLogStore {
@@ -63,126 +126,59 @@ impl SessionLogStore {
         validate_request(&request)?;
 
         let _maintenance_lock = MaintenanceLock::acquire(&self.index_db_path)?;
-        if matches!(request.mode, RuntimeLocationMaintenanceMode::Apply) {
-            let expected = request
-                .expected_dry_run_sha256
-                .as_deref()
-                .context("apply requires expected_dry_run_sha256")?;
-            if let Some(receipt) = self.read_existing_receipt(expected)? {
-                return Ok(RuntimeLocationMaintenanceReceipt {
-                    replayed_receipt: true,
-                    ..receipt
-                });
-            }
+        if matches!(request.mode, RuntimeLocationMaintenanceMode::DryRun) {
+            return self.with_index_connection(|conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+                let plan = build_plan(&tx, page_size)?;
+                let canonical_input_sha256 = digest_json(&plan)?;
+                let receipt = receipt_for_plan(
+                    &plan,
+                    canonical_input_sha256,
+                    RuntimeLocationMaintenanceMode::DryRun,
+                );
+                tx.commit()?;
+                Ok(receipt)
+            });
+        }
+
+        let expected = request
+            .expected_dry_run_sha256
+            .as_deref()
+            .context("apply requires expected_dry_run_sha256")?;
+        if let Some(receipt) = self.read_existing_receipt(expected)? {
+            return Ok(replayed_receipt(receipt));
+        }
+        if let Some(intent) = self.read_or_prepare_intent(expected)? {
+            return self.recover_prepared_intent(intent);
         }
 
         self.with_index_connection(|conn| {
-            let behavior = if matches!(request.mode, RuntimeLocationMaintenanceMode::Apply) {
-                TransactionBehavior::Immediate
-            } else {
-                TransactionBehavior::Deferred
-            };
-            let tx = conn.transaction_with_behavior(behavior)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let plan = build_plan(&tx, page_size)?;
             let canonical_input_sha256 = digest_json(&plan)?;
-            if let Some(expected) = request.expected_dry_run_sha256.as_deref()
-                && expected != canonical_input_sha256
-            {
+            if expected != canonical_input_sha256 {
                 anyhow::bail!(
                     "RUNTIME_LOCATION_MAINTENANCE_DIGEST_MISMATCH: expected {expected}, got {canonical_input_sha256}"
                 );
             }
-            let mut dispositions = BTreeMap::new();
-            for entry in &plan.entries {
-                *dispositions.entry(entry.disposition.clone()).or_insert(0) += 1;
+            let intent = intent_for_plan(plan, canonical_input_sha256)?;
+            if intent.expected_receipt.active_lease_count != 0 {
+                anyhow::bail!(
+                    "RUNTIME_LOCATION_MAINTENANCE_NOT_QUIESCENT: {} active lease(s)",
+                    intent.expected_receipt.active_lease_count
+                );
             }
-            let active_lease_count = dispositions
-                .get("preserve_active_lease")
-                .copied()
-                .unwrap_or(0);
-            let pre_incomplete_count = plan.entries.len() as u64;
-            let mut backfilled_count = 0_u64;
-            let mut deleted_count = 0_u64;
-
-            if matches!(request.mode, RuntimeLocationMaintenanceMode::Apply) {
-                if active_lease_count != 0 {
-                    anyhow::bail!(
-                        "RUNTIME_LOCATION_MAINTENANCE_NOT_QUIESCENT: {active_lease_count} active lease(s)"
-                    );
-                }
-                for entry in &plan.entries {
-                    match entry.disposition.as_str() {
-                        "backfill_terminal_event_proof" => {
-                            let proof = entry.proof.as_ref().context("backfill proof missing")?;
-                            let changed = tx.execute(
-                                "UPDATE runtime_locations SET terminal_proven = 1,
-                                 terminal_revision = ?4, terminal_event_seq = ?5,
-                                 terminal_evidence_id = ?6
-                                 WHERE runtime_id = ?1 AND session_id = ?2
-                                   AND workspace_db_path = ?3 AND terminal_proven = 0
-                                   AND terminal_revision IS NULL AND terminal_event_seq IS NULL
-                                   AND terminal_evidence_id IS NULL",
-                                params![entry.row.runtime_id, entry.row.session_id,
-                                    entry.row.workspace_db_path, proof.revision,
-                                    proof.event_seq, proof.evidence_id],
-                            )?;
-                            if changed != 1 {
-                                anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_CAS_CONFLICT:{}", entry.row.runtime_id);
-                            }
-                            backfilled_count += 1;
-                        }
-                        "delete_missing_db_session_absent" => {
-                            let session_exists = tx.query_row(
-                                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
-                                params![entry.row.session_id], |row| row.get::<_, bool>(0))?;
-                            if session_exists {
-                                anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_CAS_CONFLICT:{}:session_present", entry.row.runtime_id);
-                            }
-                            let changed = tx.execute(
-                                "DELETE FROM runtime_locations WHERE runtime_id = ?1
-                                 AND session_id = ?2 AND workspace_db_path = ?3
-                                 AND terminal_proven = 0 AND terminal_revision IS NULL
-                                 AND terminal_event_seq IS NULL AND terminal_evidence_id IS NULL",
-                                params![entry.row.runtime_id, entry.row.session_id, entry.row.workspace_db_path],
-                            )?;
-                            if changed != 1 {
-                                anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_CAS_CONFLICT:{}", entry.row.runtime_id);
-                            }
-                            deleted_count += 1;
-                        }
-                        _ => {}
-                    }
-                }
+            self.publish_intent(&intent)?;
+            let (backfilled_count, deleted_count) = apply_exact_plan(&tx, &intent.plan)?;
+            let post_incomplete_count = count_incomplete(&tx)?;
+            if post_incomplete_count != intent.expected_receipt.post_incomplete_count
+                || backfilled_count != intent.expected_receipt.backfilled_count
+                || deleted_count != intent.expected_receipt.deleted_count
+            {
+                anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_POSTCONDITION_MISMATCH");
             }
-
-            let post_incomplete_count = if matches!(request.mode, RuntimeLocationMaintenanceMode::Apply) {
-                count_incomplete(&tx)?
-            } else {
-                pre_incomplete_count
-                    .saturating_sub(backfillable_count(&plan))
-                    .saturating_sub(deletable_count(&plan))
-            };
             tx.commit()?;
-
-            let mut receipt = RuntimeLocationMaintenanceReceipt {
-                schema_version: SCHEMA_VERSION.to_string(),
-                mode: request.mode.clone(),
-                canonical_input_sha256: canonical_input_sha256.clone(),
-                pre_incomplete_count,
-                post_incomplete_count,
-                backfilled_count: if matches!(request.mode, RuntimeLocationMaintenanceMode::DryRun) { backfillable_count(&plan) } else { backfilled_count },
-                deleted_count: if matches!(request.mode, RuntimeLocationMaintenanceMode::DryRun) { deletable_count(&plan) } else { deleted_count },
-                mutation_count: backfilled_count + deleted_count,
-                active_lease_count,
-                dispositions,
-                replayed_receipt: false,
-                manifest_path: None,
-            };
-            if matches!(request.mode, RuntimeLocationMaintenanceMode::Apply) {
-                let manifest = self.publish_receipt(&receipt)?;
-                receipt.manifest_path = Some(manifest.to_string_lossy().into_owned());
-            }
-            Ok(receipt)
+            self.finalize_intent(&intent, false)
         })
     }
 
@@ -198,35 +194,136 @@ impl SessionLogStore {
     ) -> Result<Option<RuntimeLocationMaintenanceReceipt>> {
         let root = self.receipt_root(digest);
         let manifest = root.join("manifest.json");
-        if !manifest.is_file() {
+        if !path_is_regular_nonsymlink(&manifest) {
+            if std::fs::symlink_metadata(&manifest).is_ok() {
+                anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_RECEIPT_IDENTITY_CONFLICT");
+            }
             return Ok(None);
         }
-        let receipt_bytes = std::fs::read(root.join("receipt.json"))?;
-        let manifest_value: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
+        let manifest_bytes = read_stable_regular(&manifest)?;
+        let manifest_value: MaintenanceManifest = serde_json::from_slice(&manifest_bytes)?;
+        let intent_bytes = read_stable_regular(&root.join("intent.json"))?;
+        let prepared_bytes = read_stable_regular(&root.join("prepared.json"))?;
+        let receipt_bytes = read_stable_regular(&root.join("receipt.json"))?;
         let receipt: RuntimeLocationMaintenanceReceipt = serde_json::from_slice(&receipt_bytes)?;
-        if receipt.canonical_input_sha256 != digest
+        if serde_json::to_vec(&manifest_value)? != manifest_bytes
+            || serde_json::to_vec(&receipt)? != receipt_bytes
+            || manifest_value.schema_version != SCHEMA_VERSION
+            || receipt.schema_version != SCHEMA_VERSION
+            || receipt.canonical_input_sha256 != digest
             || receipt.mode != RuntimeLocationMaintenanceMode::Apply
-            || manifest_value["canonical_input_sha256"] != digest
-            || manifest_value["receipt_sha256"] != format!("{:x}", Sha256::digest(&receipt_bytes))
+            || manifest_value.canonical_input_sha256 != digest
+            || manifest_value.intent_sha256 != sha256_bytes(&intent_bytes)
+            || manifest_value.prepared_sha256 != sha256_bytes(&prepared_bytes)
+            || manifest_value.receipt_sha256 != sha256_bytes(&receipt_bytes)
         {
             anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_RECEIPT_IDENTITY_CONFLICT");
         }
-        Ok(Some(receipt))
+        let intent = validate_intent_bytes(digest, &intent_bytes)?;
+        validate_prepared_bytes(digest, &intent_bytes, &prepared_bytes)?;
+        if receipt != intent.expected_receipt {
+            anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_RECEIPT_IDENTITY_CONFLICT");
+        }
+        Ok(Some(receipt_with_manifest(receipt, &manifest)))
     }
 
-    fn publish_receipt(&self, receipt: &RuntimeLocationMaintenanceReceipt) -> Result<PathBuf> {
-        let root = self.receipt_root(&receipt.canonical_input_sha256);
-        std::fs::create_dir_all(&root)?;
-        let receipt_bytes = serde_json::to_vec(receipt)?;
-        write_atomic(&root.join("receipt.json"), &receipt_bytes)?;
-        let manifest = serde_json::json!({
-            "schema_version": SCHEMA_VERSION,
-            "canonical_input_sha256": receipt.canonical_input_sha256,
-            "receipt_sha256": format!("{:x}", Sha256::digest(&receipt_bytes)),
-        });
+    fn read_or_prepare_intent(&self, digest: &str) -> Result<Option<MaintenanceIntent>> {
+        let root = self.receipt_root(digest);
+        let intent_path = root.join("intent.json");
+        let prepared_path = root.join("prepared.json");
+        if !path_is_regular_nonsymlink(&intent_path) {
+            if std::fs::symlink_metadata(&intent_path).is_ok()
+                || std::fs::symlink_metadata(&prepared_path).is_ok()
+            {
+                anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_INTENT_IDENTITY_CONFLICT");
+            }
+            return Ok(None);
+        }
+        let intent_bytes = read_stable_regular(&intent_path)?;
+        let intent = validate_intent_bytes(digest, &intent_bytes)?;
+        let prepared = prepared_bytes(digest, &intent_bytes)?;
+        write_immutable(&prepared_path, &prepared)?;
+        validate_prepared_bytes(digest, &intent_bytes, &read_stable_regular(&prepared_path)?)?;
+        Ok(Some(intent))
+    }
+
+    fn publish_intent(&self, intent: &MaintenanceIntent) -> Result<()> {
+        let root = self.receipt_root(&intent.canonical_input_sha256);
+        ensure_receipt_root(&root)?;
+        let intent_bytes = serde_json::to_vec(intent)?;
+        write_immutable(&root.join("intent.json"), &intent_bytes)?;
+        write_immutable(
+            &root.join("prepared.json"),
+            &prepared_bytes(&intent.canonical_input_sha256, &intent_bytes)?,
+        )?;
+        Ok(())
+    }
+
+    fn recover_prepared_intent(
+        &self,
+        intent: MaintenanceIntent,
+    ) -> Result<RuntimeLocationMaintenanceReceipt> {
+        self.with_index_connection(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            match prepared_state(&tx, &intent)? {
+                PreparedState::AllPost => {
+                    tx.commit()?;
+                    self.finalize_intent(&intent, true)
+                }
+                PreparedState::AllPre => {
+                    let current_plan = build_plan(&tx, 500)?;
+                    if current_plan != intent.plan
+                        || digest_json(&current_plan)? != intent.canonical_input_sha256
+                    {
+                        anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_PREPARED_INTENT_DRIFT");
+                    }
+                    if intent.expected_receipt.active_lease_count != 0 {
+                        anyhow::bail!(
+                            "RUNTIME_LOCATION_MAINTENANCE_NOT_QUIESCENT: {} active lease(s)",
+                            intent.expected_receipt.active_lease_count
+                        );
+                    }
+                    let (backfilled, deleted) = apply_exact_plan(&tx, &intent.plan)?;
+                    if backfilled != intent.expected_receipt.backfilled_count
+                        || deleted != intent.expected_receipt.deleted_count
+                        || count_incomplete(&tx)? != intent.expected_receipt.post_incomplete_count
+                    {
+                        anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_POSTCONDITION_MISMATCH");
+                    }
+                    tx.commit()?;
+                    self.finalize_intent(&intent, false)
+                }
+                PreparedState::MixedOrDrift => {
+                    anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_PREPARED_INTENT_MIXED_OR_DRIFT")
+                }
+            }
+        })
+    }
+
+    fn finalize_intent(
+        &self,
+        intent: &MaintenanceIntent,
+        recovered_without_mutation: bool,
+    ) -> Result<RuntimeLocationMaintenanceReceipt> {
+        let root = self.receipt_root(&intent.canonical_input_sha256);
+        let intent_bytes = read_stable_regular(&root.join("intent.json"))?;
+        let prepared_bytes = read_stable_regular(&root.join("prepared.json"))?;
+        let receipt_bytes = serde_json::to_vec(&intent.expected_receipt)?;
+        write_immutable(&root.join("receipt.json"), &receipt_bytes)?;
+        let manifest = MaintenanceManifest {
+            schema_version: SCHEMA_VERSION.to_string(),
+            canonical_input_sha256: intent.canonical_input_sha256.clone(),
+            intent_sha256: sha256_bytes(&intent_bytes),
+            prepared_sha256: sha256_bytes(&prepared_bytes),
+            receipt_sha256: sha256_bytes(&receipt_bytes),
+        };
         let manifest_path = root.join("manifest.json");
-        write_atomic(&manifest_path, &serde_json::to_vec(&manifest)?)?;
-        Ok(manifest_path)
+        write_immutable(&manifest_path, &serde_json::to_vec(&manifest)?)?;
+        let mut receipt = receipt_with_manifest(intent.expected_receipt.clone(), &manifest_path);
+        if recovered_without_mutation {
+            receipt = replayed_receipt(receipt);
+        }
+        Ok(receipt)
     }
 }
 
@@ -251,6 +348,284 @@ fn validate_request(request: &MaintainRuntimeLocationsRequest) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn receipt_for_plan(
+    plan: &MaintenancePlan,
+    canonical_input_sha256: String,
+    mode: RuntimeLocationMaintenanceMode,
+) -> RuntimeLocationMaintenanceReceipt {
+    let mut dispositions = BTreeMap::new();
+    for entry in &plan.entries {
+        *dispositions.entry(entry.disposition.clone()).or_insert(0) += 1;
+    }
+    let backfilled_count = backfillable_count(plan);
+    let deleted_count = deletable_count(plan);
+    let pre_incomplete_count = plan.entries.len() as u64;
+    RuntimeLocationMaintenanceReceipt {
+        schema_version: SCHEMA_VERSION.to_string(),
+        mode: mode.clone(),
+        canonical_input_sha256,
+        pre_incomplete_count,
+        post_incomplete_count: pre_incomplete_count
+            .saturating_sub(backfilled_count)
+            .saturating_sub(deleted_count),
+        backfilled_count,
+        deleted_count,
+        mutation_count: if matches!(mode, RuntimeLocationMaintenanceMode::Apply) {
+            backfilled_count + deleted_count
+        } else {
+            0
+        },
+        active_lease_count: dispositions
+            .get("preserve_active_lease")
+            .copied()
+            .unwrap_or(0),
+        dispositions,
+        replayed_receipt: false,
+        manifest_path: None,
+    }
+}
+
+fn expected_postconditions(plan: &MaintenancePlan) -> Result<Vec<ExpectedPostcondition>> {
+    plan.entries
+        .iter()
+        .filter_map(|entry| match entry.disposition.as_str() {
+            "backfill_terminal_event_proof" => Some(
+                entry
+                    .proof
+                    .as_ref()
+                    .context("backfill proof missing")
+                    .map(|proof| ExpectedPostcondition {
+                        runtime_id: entry.row.runtime_id.clone(),
+                        session_id: entry.row.session_id.clone(),
+                        workspace_db_path: entry.row.workspace_db_path.clone(),
+                        expected: ExpectedRowState::BackfilledTerminalProof {
+                            terminal_revision: proof.revision,
+                            terminal_event_seq: proof.event_seq,
+                            terminal_evidence_id: proof.evidence_id.clone(),
+                        },
+                    }),
+            ),
+            "delete_missing_db_session_absent" => Some(Ok(ExpectedPostcondition {
+                runtime_id: entry.row.runtime_id.clone(),
+                session_id: entry.row.session_id.clone(),
+                workspace_db_path: entry.row.workspace_db_path.clone(),
+                expected: ExpectedRowState::Absent,
+            })),
+            _ => None,
+        })
+        .collect()
+}
+
+fn intent_for_plan(
+    plan: MaintenancePlan,
+    canonical_input_sha256: String,
+) -> Result<MaintenanceIntent> {
+    Ok(MaintenanceIntent {
+        schema_version: SCHEMA_VERSION.to_string(),
+        expected_postconditions: expected_postconditions(&plan)?,
+        expected_receipt: receipt_for_plan(
+            &plan,
+            canonical_input_sha256.clone(),
+            RuntimeLocationMaintenanceMode::Apply,
+        ),
+        canonical_input_sha256,
+        plan,
+    })
+}
+
+fn replayed_receipt(
+    mut receipt: RuntimeLocationMaintenanceReceipt,
+) -> RuntimeLocationMaintenanceReceipt {
+    receipt.replayed_receipt = true;
+    receipt.mutation_count = 0;
+    receipt
+}
+
+fn receipt_with_manifest(
+    mut receipt: RuntimeLocationMaintenanceReceipt,
+    manifest: &Path,
+) -> RuntimeLocationMaintenanceReceipt {
+    receipt.manifest_path = Some(manifest.to_string_lossy().into_owned());
+    receipt
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn path_is_regular_nonsymlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn read_stable_regular(path: &Path) -> Result<Vec<u8>> {
+    let before = std::fs::symlink_metadata(path)?;
+    if !before.file_type().is_file() || before.file_type().is_symlink() {
+        anyhow::bail!(
+            "RUNTIME_LOCATION_MAINTENANCE_MEMBER_PATH_INVALID:{}",
+            path.display()
+        );
+    }
+    let bytes = std::fs::read(path)?;
+    let after = std::fs::symlink_metadata(path)?;
+    if before.len() != after.len()
+        || before.modified()? != after.modified()?
+        || bytes.len() as u64 != after.len()
+    {
+        anyhow::bail!(
+            "RUNTIME_LOCATION_MAINTENANCE_MEMBER_READ_DRIFT:{}",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+fn fsync_directory(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn ensure_receipt_root(root: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = root;
+    loop {
+        match std::fs::symlink_metadata(cursor) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "RUNTIME_LOCATION_MAINTENANCE_RECEIPT_ROOT_INVALID:{}",
+                        cursor.display()
+                    );
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                cursor = cursor
+                    .parent()
+                    .context("maintenance receipt root has no existing ancestor")?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    for directory in missing.into_iter().rev() {
+        std::fs::create_dir(&directory)?;
+        let parent = directory
+            .parent()
+            .context("maintenance receipt directory has no parent")?;
+        fsync_directory(parent)?;
+        fsync_directory(&directory)?;
+    }
+    if let Some(parent) = root.parent() {
+        fsync_directory(parent)?;
+    }
+    fsync_directory(root)?;
+    Ok(())
+}
+
+fn write_immutable(path: &Path, bytes: &[u8]) -> Result<()> {
+    if path_is_regular_nonsymlink(path) {
+        if read_stable_regular(path)? == bytes {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "RUNTIME_LOCATION_MAINTENANCE_MEMBER_IDENTITY_CONFLICT:{}",
+            path.display()
+        );
+    }
+    if std::fs::symlink_metadata(path).is_ok() {
+        anyhow::bail!(
+            "RUNTIME_LOCATION_MAINTENANCE_MEMBER_PATH_INVALID:{}",
+            path.display()
+        );
+    }
+    let parent = path.parent().context("maintenance member parent missing")?;
+    ensure_receipt_root(parent)?;
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}-{nanos}-{counter}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("member"),
+        std::process::id()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        match std::fs::hard_link(&temporary, path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !path_is_regular_nonsymlink(path) || read_stable_regular(path)? != bytes {
+                    anyhow::bail!(
+                        "RUNTIME_LOCATION_MAINTENANCE_MEMBER_IDENTITY_CONFLICT:{}",
+                        path.display()
+                    );
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::remove_file(&temporary)?;
+        fsync_directory(parent)?;
+        if read_stable_regular(path)? != bytes {
+            anyhow::bail!(
+                "RUNTIME_LOCATION_MAINTENANCE_MEMBER_READBACK_MISMATCH:{}",
+                path.display()
+            );
+        }
+        Ok(())
+    })();
+    if temporary.exists() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn prepared_bytes(digest: &str, intent_bytes: &[u8]) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&PreparedMarker {
+        schema_version: SCHEMA_VERSION.to_string(),
+        canonical_input_sha256: digest.to_string(),
+        intent_sha256: sha256_bytes(intent_bytes),
+    })?)
+}
+
+fn validate_prepared_bytes(digest: &str, intent_bytes: &[u8], bytes: &[u8]) -> Result<()> {
+    let value: PreparedMarker = serde_json::from_slice(bytes)?;
+    if serde_json::to_vec(&value)? != bytes
+        || value.schema_version != SCHEMA_VERSION
+        || value.canonical_input_sha256 != digest
+        || value.intent_sha256 != sha256_bytes(intent_bytes)
+    {
+        anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_PREPARED_IDENTITY_CONFLICT");
+    }
+    Ok(())
+}
+
+fn validate_intent_bytes(digest: &str, bytes: &[u8]) -> Result<MaintenanceIntent> {
+    let intent: MaintenanceIntent = serde_json::from_slice(bytes)?;
+    let expected_intent = intent_for_plan(intent.plan.clone(), digest.to_string())?;
+    if serde_json::to_vec(&intent)? != bytes
+        || intent.schema_version != SCHEMA_VERSION
+        || intent.canonical_input_sha256 != digest
+        || digest_json(&intent.plan)? != digest
+        || intent != expected_intent
+    {
+        anyhow::bail!("RUNTIME_LOCATION_MAINTENANCE_INTENT_IDENTITY_CONFLICT");
+    }
+    Ok(intent)
 }
 
 fn build_plan(tx: &Transaction<'_>, page_size: u64) -> Result<MaintenancePlan> {
@@ -333,14 +708,18 @@ fn classify_row(index: &Transaction<'_>, row: LocationRow) -> Result<PlanEntry> 
     if canonical != path {
         return Ok(entry(row, "preserve_path_drift", None));
     }
-    let conn = match Connection::open_with_flags(
+    let mut conn = match Connection::open_with_flags(
         &canonical,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
         Ok(conn) => conn,
         Err(_) => return Ok(entry(row, "preserve_workspace_db_unreadable", None)),
     };
-    let runtime = conn.query_row(
+    let workspace = match conn.transaction_with_behavior(TransactionBehavior::Deferred) {
+        Ok(transaction) => transaction,
+        Err(_) => return Ok(entry(row, "preserve_workspace_db_unreadable", None)),
+    };
+    let runtime = workspace.query_row(
         "SELECT session_id, revision, last_event_seq, terminal, lease_active FROM runtimes WHERE runtime_id = ?1",
         params![row.runtime_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?, r.get::<_, u64>(2)?, r.get::<_, bool>(3)?, r.get::<_, bool>(4)?)))
         .optional()?;
@@ -356,7 +735,7 @@ fn classify_row(index: &Transaction<'_>, row: LocationRow) -> Result<PlanEntry> 
     if !terminal {
         return Ok(entry(row, "preserve_nonterminal", None));
     }
-    let event = conn
+    let event = workspace
         .query_row(
             "SELECT event_seq, revision, idempotency_key, event_json FROM runtime_events
          WHERE runtime_id = ?1 ORDER BY event_seq DESC LIMIT 1",
@@ -374,20 +753,24 @@ fn classify_row(index: &Transaction<'_>, row: LocationRow) -> Result<PlanEntry> 
     let Some((event_seq, event_revision, evidence_id, event_json)) = event else {
         return Ok(entry(row, "preserve_terminal_event_missing", None));
     };
-    let unique = conn.query_row(
+    let evidence_id_occurrences = workspace.query_row(
         "SELECT COUNT(*) FROM runtime_events WHERE idempotency_key = ?1",
         params![evidence_id],
         |r| r.get::<_, u64>(0),
-    )? == 1;
+    )?;
     let parsed = serde_json::from_str::<RuntimeEvent>(&event_json).ok();
     let terminal_kind = matches!(
         parsed,
-        Some(RuntimeEvent::RuntimeFinished { .. } | RuntimeEvent::RuntimeFailed { .. })
+        Some(RuntimeEvent::RuntimeFinished { .. })
+            | Some(RuntimeEvent::RuntimeFailed {
+                state: RuntimeState::Failed | RuntimeState::TimedOut | RuntimeState::Cancelled,
+                ..
+            })
     );
     if revision != event_revision
         || last_event_seq != event_seq
         || evidence_id.trim().is_empty()
-        || !unique
+        || evidence_id_occurrences != 1
         || !terminal_kind
     {
         return Ok(entry(row, "preserve_terminal_event_contradiction", None));
@@ -396,9 +779,18 @@ fn classify_row(index: &Transaction<'_>, row: LocationRow) -> Result<PlanEntry> 
         row,
         "backfill_terminal_event_proof",
         Some(Proof {
+            workspace_canonical_path: canonical.to_string_lossy().into_owned(),
+            runtime_session_id: session_id,
+            runtime_revision: revision,
+            runtime_last_event_seq: last_event_seq,
+            runtime_terminal: terminal,
+            runtime_lease_active: lease_active,
             revision,
             event_seq,
             evidence_id,
+            evidence_id_occurrences,
+            event_json_sha256: sha256_bytes(event_json.as_bytes()),
+            event_json,
         }),
     ))
 }
@@ -409,6 +801,177 @@ fn entry(row: LocationRow, disposition: &str, proof: Option<Proof>) -> PlanEntry
         disposition: disposition.to_string(),
         proof,
     }
+}
+
+fn load_location_row(tx: &Transaction<'_>, runtime_id: &str) -> Result<Option<LocationRow>> {
+    tx.query_row(
+        "SELECT runtime_id, session_id, workspace_db_path, terminal_proven,
+                terminal_revision, terminal_event_seq, terminal_evidence_id
+         FROM runtime_locations WHERE runtime_id = ?1",
+        params![runtime_id],
+        |row| {
+            Ok(LocationRow {
+                runtime_id: row.get(0)?,
+                session_id: row.get(1)?,
+                workspace_db_path: row.get(2)?,
+                terminal_proven: row.get(3)?,
+                terminal_revision: row.get(4)?,
+                terminal_event_seq: row.get(5)?,
+                terminal_evidence_id: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn entry_is_pre(tx: &Transaction<'_>, entry: &PlanEntry) -> Result<bool> {
+    let Some(current) = load_location_row(tx, &entry.row.runtime_id)? else {
+        return Ok(false);
+    };
+    if current != entry.row {
+        return Ok(false);
+    }
+    Ok(classify_row(tx, current)? == *entry)
+}
+
+fn entry_is_post(tx: &Transaction<'_>, entry: &PlanEntry) -> Result<bool> {
+    match entry.disposition.as_str() {
+        "backfill_terminal_event_proof" => {
+            let Some(proof) = entry.proof.as_ref() else {
+                return Ok(false);
+            };
+            let Some(current) = load_location_row(tx, &entry.row.runtime_id)? else {
+                return Ok(false);
+            };
+            if current.runtime_id != entry.row.runtime_id
+                || current.session_id != entry.row.session_id
+                || current.workspace_db_path != entry.row.workspace_db_path
+                || !current.terminal_proven
+                || current.terminal_revision != Some(proof.revision)
+                || current.terminal_event_seq != Some(proof.event_seq)
+                || current.terminal_evidence_id.as_deref() != Some(proof.evidence_id.as_str())
+            {
+                return Ok(false);
+            }
+            Ok(classify_row(tx, entry.row.clone())? == *entry)
+        }
+        "delete_missing_db_session_absent" => {
+            if load_location_row(tx, &entry.row.runtime_id)?.is_some() {
+                return Ok(false);
+            }
+            let session_exists = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
+                params![entry.row.session_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            Ok(!session_exists
+                && matches!(
+                    std::fs::symlink_metadata(&entry.row.workspace_db_path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ))
+        }
+        _ => Ok(true),
+    }
+}
+
+fn prepared_state(tx: &Transaction<'_>, intent: &MaintenanceIntent) -> Result<PreparedState> {
+    let mut pre = 0_u64;
+    let mut post = 0_u64;
+    let mut mutation_entries = 0_u64;
+    for entry in &intent.plan.entries {
+        if !matches!(
+            entry.disposition.as_str(),
+            "backfill_terminal_event_proof" | "delete_missing_db_session_absent"
+        ) {
+            continue;
+        }
+        mutation_entries += 1;
+        if entry_is_pre(tx, entry)? {
+            pre += 1;
+        } else if entry_is_post(tx, entry)? {
+            post += 1;
+        } else {
+            return Ok(PreparedState::MixedOrDrift);
+        }
+    }
+    if mutation_entries == 0 || post == mutation_entries {
+        Ok(PreparedState::AllPost)
+    } else if pre == mutation_entries {
+        Ok(PreparedState::AllPre)
+    } else {
+        Ok(PreparedState::MixedOrDrift)
+    }
+}
+
+fn apply_exact_plan(tx: &Transaction<'_>, plan: &MaintenancePlan) -> Result<(u64, u64)> {
+    let mut backfilled_count = 0_u64;
+    let mut deleted_count = 0_u64;
+    for entry in &plan.entries {
+        match entry.disposition.as_str() {
+            "backfill_terminal_event_proof" => {
+                if !entry_is_pre(tx, entry)? {
+                    anyhow::bail!(
+                        "RUNTIME_LOCATION_MAINTENANCE_CAS_CONFLICT:{}:precondition",
+                        entry.row.runtime_id
+                    );
+                }
+                let proof = entry.proof.as_ref().context("backfill proof missing")?;
+                let changed = tx.execute(
+                    "UPDATE runtime_locations SET terminal_proven = 1,
+                     terminal_revision = ?4, terminal_event_seq = ?5,
+                     terminal_evidence_id = ?6
+                     WHERE runtime_id = ?1 AND session_id = ?2
+                       AND workspace_db_path = ?3 AND terminal_proven = 0
+                       AND terminal_revision IS NULL AND terminal_event_seq IS NULL
+                       AND terminal_evidence_id IS NULL",
+                    params![
+                        entry.row.runtime_id,
+                        entry.row.session_id,
+                        entry.row.workspace_db_path,
+                        proof.revision,
+                        proof.event_seq,
+                        proof.evidence_id
+                    ],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!(
+                        "RUNTIME_LOCATION_MAINTENANCE_CAS_CONFLICT:{}",
+                        entry.row.runtime_id
+                    );
+                }
+                backfilled_count += 1;
+            }
+            "delete_missing_db_session_absent" => {
+                if !entry_is_pre(tx, entry)? {
+                    anyhow::bail!(
+                        "RUNTIME_LOCATION_MAINTENANCE_CAS_CONFLICT:{}:precondition",
+                        entry.row.runtime_id
+                    );
+                }
+                let changed = tx.execute(
+                    "DELETE FROM runtime_locations WHERE runtime_id = ?1
+                     AND session_id = ?2 AND workspace_db_path = ?3
+                     AND terminal_proven = 0 AND terminal_revision IS NULL
+                     AND terminal_event_seq IS NULL AND terminal_evidence_id IS NULL",
+                    params![
+                        entry.row.runtime_id,
+                        entry.row.session_id,
+                        entry.row.workspace_db_path
+                    ],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!(
+                        "RUNTIME_LOCATION_MAINTENANCE_CAS_CONFLICT:{}",
+                        entry.row.runtime_id
+                    );
+                }
+                deleted_count += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok((backfilled_count, deleted_count))
 }
 
 fn count_incomplete(tx: &Transaction<'_>) -> Result<u64> {
@@ -433,14 +996,6 @@ fn deletable_count(plan: &MaintenancePlan) -> u64 {
 }
 fn digest_json(value: &impl Serialize) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    File::open(&tmp)?.sync_all()?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
 }
 
 struct MaintenanceLock(File);
@@ -470,7 +1025,8 @@ impl Drop for MaintenanceLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lifecycle::{RuntimeError, RuntimeState};
+    use lifecycle::RuntimeError;
+    use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
     fn request(
@@ -508,6 +1064,33 @@ mod tests {
         (temp, store, workspace.to_string_lossy().into_owned())
     }
 
+    fn prepare_without_commit(store: &SessionLogStore) -> MaintenanceIntent {
+        store
+            .with_index_connection(|conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let plan = build_plan(&tx, 500)?;
+                let canonical_input_sha256 = digest_json(&plan)?;
+                let intent = intent_for_plan(plan, canonical_input_sha256)?;
+                store.publish_intent(&intent)?;
+                drop(tx);
+                Ok(intent)
+            })
+            .expect("prepared intent")
+    }
+
+    fn terminal_proven(store: &SessionLogStore) -> bool {
+        store
+            .with_index_connection(|conn| {
+                conn.query_row(
+                    "SELECT terminal_proven FROM runtime_locations WHERE runtime_id = 'r1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("terminal proof state")
+    }
+
     #[test]
     fn dry_run_apply_and_replay_terminal_finished_proof() {
         let (_temp, store, _) = fixture(
@@ -522,6 +1105,13 @@ mod tests {
             .expect("dry run");
         assert_eq!(dry.backfilled_count, 1);
         assert_eq!(dry.mutation_count, 0);
+        let same_inputs_different_page = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 500))
+            .expect("stable dry run");
+        assert_eq!(
+            same_inputs_different_page.canonical_input_sha256,
+            dry.canonical_input_sha256
+        );
         let applied = store
             .maintain_runtime_locations(request(
                 RuntimeLocationMaintenanceMode::Apply,
@@ -539,12 +1129,26 @@ mod tests {
         let replay = store
             .maintain_runtime_locations(request(
                 RuntimeLocationMaintenanceMode::Apply,
-                Some(dry.canonical_input_sha256),
+                Some(dry.canonical_input_sha256.clone()),
                 500,
             ))
             .expect("replay");
         assert!(replay.replayed_receipt);
-        assert_eq!(replay.mutation_count, 1);
+        assert_eq!(replay.mutation_count, 0);
+        assert_eq!(replay.backfilled_count, 1);
+
+        let manifest = PathBuf::from(replay.manifest_path.expect("replay manifest"));
+        let mut noncanonical = std::fs::read(&manifest).expect("manifest bytes");
+        noncanonical.push(b'\n');
+        std::fs::write(&manifest, noncanonical).expect("tamper manifest bytes");
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256),
+                500,
+            ))
+            .expect_err("noncanonical final manifest must not be accepted");
+        assert!(error.to_string().contains("RECEIPT_IDENTITY_CONFLICT"));
     }
 
     #[test]
@@ -727,5 +1331,299 @@ mod tests {
             .expect("locations")
             .1;
         assert_eq!(still_incomplete.len(), 1);
+    }
+
+    #[test]
+    fn terminal_event_bytes_are_bound_into_the_dry_run_digest() {
+        let (_temp, store, workspace) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        let first = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 500))
+            .expect("first dry run");
+        let changed = RuntimeEvent::RuntimeFailed {
+            finished_at: chrono::Utc::now(),
+            error: RuntimeError {
+                error_code: Some("cancelled".to_string()),
+                error_text: Some("cancelled by test".to_string()),
+                retry_allowed: false,
+                fallback_allowed: false,
+                fallback_to_id: None,
+            },
+            state: RuntimeState::Cancelled,
+            usage: None,
+        };
+        store
+            .with_workspace_connection(Path::new(&workspace), |conn| {
+                conn.execute(
+                    "UPDATE runtime_events SET event_json = ?1
+                     WHERE runtime_id = 'r1' AND event_seq = 9",
+                    params![serde_json::to_string(&changed)?],
+                )?;
+                Ok(())
+            })
+            .expect("change authoritative terminal event bytes");
+        let second = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 500))
+            .expect("second dry run");
+        assert_ne!(first.canonical_input_sha256, second.canonical_input_sha256);
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(first.canonical_input_sha256),
+                500,
+            ))
+            .expect_err("stale event-bound digest must fail");
+        assert!(error.to_string().contains("DIGEST_MISMATCH"));
+        assert!(!terminal_proven(&store));
+    }
+
+    #[test]
+    fn runtime_failed_cancelled_is_accepted_as_canonical_terminal_proof() {
+        let (_temp, store, _) = fixture(
+            RuntimeEvent::RuntimeFailed {
+                finished_at: chrono::Utc::now(),
+                error: RuntimeError {
+                    error_code: Some("cancelled".to_string()),
+                    error_text: Some("cancelled by operator".to_string()),
+                    retry_allowed: false,
+                    fallback_allowed: false,
+                    fallback_to_id: None,
+                },
+                state: RuntimeState::Cancelled,
+                usage: None,
+            },
+            false,
+        );
+        let dry = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 500))
+            .expect("cancelled dry run");
+        assert_eq!(dry.backfilled_count, 1);
+        assert_eq!(
+            dry.dispositions.get("backfill_terminal_event_proof"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn prepared_intent_before_index_commit_reexecutes_exact_all_pre_plan() {
+        let (_temp, store, _) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        let intent = prepare_without_commit(&store);
+        assert!(!terminal_proven(&store));
+        let applied = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(intent.canonical_input_sha256),
+                500,
+            ))
+            .expect("recover all-pre intent");
+        assert_eq!(applied.mutation_count, 1);
+        assert!(!applied.replayed_receipt);
+        assert!(terminal_proven(&store));
+        assert!(
+            applied
+                .manifest_path
+                .as_ref()
+                .is_some_and(|path| Path::new(path).is_file())
+        );
+    }
+
+    #[test]
+    fn final_receipt_io_failure_after_commit_is_recoverable_without_second_mutation() {
+        let (_temp, store, _) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        let dry = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 500))
+            .expect("dry run");
+        let root = store.receipt_root(&dry.canonical_input_sha256);
+        std::fs::create_dir_all(root.join("receipt.json")).expect("force final receipt collision");
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256.clone()),
+                500,
+            ))
+            .expect_err("final receipt publication must fail after commit");
+        assert!(error.to_string().contains("MEMBER_PATH_INVALID"));
+        assert!(terminal_proven(&store));
+        assert!(!root.join("manifest.json").exists());
+
+        std::fs::remove_dir(root.join("receipt.json")).expect("remove injected collision");
+        let recovered = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(dry.canonical_input_sha256),
+                500,
+            ))
+            .expect("recover committed state");
+        assert!(recovered.replayed_receipt);
+        assert_eq!(recovered.mutation_count, 0);
+        assert_eq!(recovered.backfilled_count, 1);
+        assert!(root.join("manifest.json").is_file());
+    }
+
+    #[test]
+    fn prepared_intent_fails_closed_on_mixed_or_drifted_index_state() {
+        let (_temp, store, workspace) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        let event = serde_json::to_string(&RuntimeEvent::RuntimeFinished {
+            finished_at: chrono::Utc::now(),
+            usage: None,
+        })
+        .expect("second terminal event");
+        store
+            .with_workspace_connection(Path::new(&workspace), |conn| {
+                conn.pragma_update(None, "foreign_keys", "OFF")?;
+                conn.execute(
+                    "INSERT INTO runtimes(runtime_id, session_id, revision,
+                     last_event_seq, terminal, lease_active)
+                     VALUES ('r2','s2',3,4,1,0)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO runtime_events(runtime_id,event_seq,revision,
+                     idempotency_key,event_json) VALUES ('r2',4,3,'e2',?1)",
+                    params![event],
+                )?;
+                Ok(())
+            })
+            .expect("second runtime fixture");
+        store
+            .with_index_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO runtime_locations(runtime_id,session_id,workspace_db_path)
+                     VALUES ('r2','s2',?1)",
+                    params![workspace],
+                )?;
+                Ok(())
+            })
+            .expect("second location fixture");
+        let intent = prepare_without_commit(&store);
+        store
+            .with_index_connection(|conn| {
+                conn.execute(
+                    "UPDATE runtime_locations SET terminal_proven = 1,
+                     terminal_revision = 7, terminal_event_seq = 9,
+                     terminal_evidence_id = 'e1' WHERE runtime_id = 'r1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("inject mixed state");
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(intent.canonical_input_sha256.clone()),
+                500,
+            ))
+            .expect_err("mixed state must fail closed");
+        assert!(error.to_string().contains("MIXED_OR_DRIFT"));
+        assert!(
+            !store
+                .receipt_root(&intent.canonical_input_sha256)
+                .join("manifest.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn tampered_prepared_intent_is_rejected_before_index_mutation() {
+        let (_temp, store, _) = fixture(
+            RuntimeEvent::RuntimeFinished {
+                finished_at: chrono::Utc::now(),
+                usage: None,
+            },
+            false,
+        );
+        let intent = prepare_without_commit(&store);
+        let path = store
+            .receipt_root(&intent.canonical_input_sha256)
+            .join("intent.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("intent bytes"))
+                .expect("intent json");
+        value["expected_receipt"]["mutation_count"] = serde_json::json!(99);
+        std::fs::write(&path, serde_json::to_vec(&value).expect("tampered json"))
+            .expect("tamper intent");
+        let error = store
+            .maintain_runtime_locations(request(
+                RuntimeLocationMaintenanceMode::Apply,
+                Some(intent.canonical_input_sha256),
+                500,
+            ))
+            .expect_err("tampered intent must fail");
+        assert!(error.to_string().contains("INTENT_IDENTITY_CONFLICT"));
+        assert!(!terminal_proven(&store));
+    }
+
+    #[test]
+    fn maintenance_lock_rejects_a_concurrent_instance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SessionLogStore::open(temp.path().join("db")).expect("store");
+        let _held = MaintenanceLock::acquire(&store.index_db_path).expect("first lock");
+        let error = store
+            .maintain_runtime_locations(request(RuntimeLocationMaintenanceMode::DryRun, None, 1))
+            .expect_err("second maintenance instance must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("RUNTIME_LOCATION_MAINTENANCE_LOCKED")
+        );
+    }
+
+    #[test]
+    fn immutable_member_publication_is_collision_safe_for_identical_concurrent_writers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("receipt.json");
+        let barrier = Arc::new(Barrier::new(2));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            let path = path.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                write_immutable(&path, br#"{"ok":true}"#)
+            }));
+        }
+        for join in joins {
+            join.join()
+                .expect("writer thread")
+                .expect("immutable write");
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("published member"),
+            br#"{"ok":true}"#
+        );
+        let leftovers = std::fs::read_dir(temp.path())
+            .expect("receipt root")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".receipt.json.tmp-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 }

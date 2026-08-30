@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::time::Instant;
 
 use crate::profile_timings;
@@ -222,6 +222,7 @@ fn session_log_command_name(command: &SessionLogCommand) -> &'static str {
         SessionLogCommand::ReplayRuntime(_) => "replay_runtime",
         SessionLogCommand::GetRuntimeLease(_) => "get_runtime_lease",
         SessionLogCommand::ListRuntimeLocations(_) => "list_runtime_locations",
+        SessionLogCommand::MaintainRuntimeLocations(_) => "maintain_runtime_locations",
         SessionLogCommand::RecoveryCloseRuntime(_) => "recovery_close_runtime",
         SessionLogCommand::PersistSessionDelta(_) => "persist_session_delta",
         SessionLogCommand::ReadContextSlice(_) => "read_context_slice",
@@ -260,6 +261,21 @@ fn call_session_service_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_location_maintenance_has_a_stable_profile_operation_name() {
+        let command = SessionLogCommand::MaintainRuntimeLocations(
+            session_log_contract::MaintainRuntimeLocationsRequest {
+                mode: session_log_contract::RuntimeLocationMaintenanceMode::DryRun,
+                page_size: 1,
+                expected_dry_run_sha256: None,
+            },
+        );
+        assert_eq!(
+            session_log_command_name(&command),
+            "maintain_runtime_locations"
+        );
+    }
 
     #[test]
     fn data_operation_invokes_exactly_one_transport_without_a_health_preflight() {
