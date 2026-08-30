@@ -34,6 +34,37 @@ async fn post_admission(parent_id: &str, payload: &Value) -> Result<(StatusCode,
     Ok((status, serde_json::from_slice(&body)?))
 }
 
+fn callback_ack_request() -> Value {
+    json!({
+        "parent_session_id": "parent-1",
+        "parent_mission_revision_sha256": "a".repeat(64),
+        "commander_thread_id": "commander-thread-1",
+        "child_session_id": "child-1",
+        "child_runtime_id": "runtime-1",
+        "child_lease_id": "lease-1",
+        "transaction_id": "callback-1",
+        "event_id": "event-1",
+        "callback_payload_sha256": "b".repeat(64),
+        "effect_identity": {"kind": "exact", "effect_id": "runtime-1.message"}
+    })
+}
+
+async fn post_callback_ack(
+    parent_id: &str,
+    child_id: &str,
+    payload: &Value,
+) -> Result<(StatusCode, Value)> {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/session/{parent_id}/children/{child_id}/callback/ack"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(payload)?))?;
+    let response = gateway::web::build_router().oneshot(request).await?;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await?;
+    Ok((status, serde_json::from_slice(&body)?))
+}
+
 #[tokio::test]
 async fn public_gateway_child_route_forwards_exact_contract_and_replay() -> Result<()> {
     let _guard = ENV_LOCK.lock().await;
@@ -99,6 +130,55 @@ async fn public_gateway_child_route_forwards_exact_contract_and_replay() -> Resu
     let (status, body) = post_admission("parent-1", &blank_commander_thread).await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
+    drop(router);
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_gateway_child_callback_ack_forwards_exact_contract_and_paths() -> Result<()> {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tempfile::tempdir().context("temp root")?;
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home)?;
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let _env = EnvGuard::new(&home, &source_root);
+    let response = json!({
+        "outcome": "acknowledged",
+        "parent_session_id": "parent-1",
+        "parent_mission_revision_sha256": "a".repeat(64),
+        "commander_thread_id": "commander-thread-1",
+        "child_session_id": "child-1",
+        "child_runtime_id": "runtime-1",
+        "child_lease_id": "lease-1",
+        "transaction_id": "callback-1",
+        "event_id": "event-1",
+        "callback_payload_sha256": "b".repeat(64),
+        "effect_identity": {"kind": "exact", "effect_id": "runtime-1.message"}
+    });
+    let mut replay_response = response.clone();
+    replay_response["outcome"] = Value::String("already_acknowledged".to_string());
+    let router = FakeRouter::start(
+        &home,
+        vec![RouterReply::Payload(response.clone()), RouterReply::Payload(replay_response.clone())],
+    )?;
+    let payload = callback_ack_request();
+
+    let (status, first_body) = post_callback_ack("parent-1", "child-1", &payload).await?;
+    assert_eq!(status, StatusCode::OK, "{first_body}");
+    assert_eq!(first_body, response);
+    let first = router.next_request(Duration::from_secs(10))?;
+    assert_eq!(first["method"], router_contract::METHOD_ACKNOWLEDGE_CHILD_CALLBACK);
+    assert_eq!(first["payload"], payload);
+
+    let (status, second_body) = post_callback_ack("parent-1", "child-1", &payload).await?;
+    assert_eq!(status, StatusCode::OK, "{second_body}");
+    assert_eq!(second_body, replay_response);
+    let second = router.next_request(Duration::from_secs(10))?;
+    assert_eq!(second["method"], first["method"]);
+    assert_eq!(second["payload"], first["payload"]);
+
+    assert_eq!(post_callback_ack("other-parent", "child-1", &payload).await?.0, StatusCode::CONFLICT);
+    assert_eq!(post_callback_ack("parent-1", "other-child", &payload).await?.0, StatusCode::CONFLICT);
     drop(router);
     Ok(())
 }

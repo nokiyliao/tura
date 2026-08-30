@@ -16,15 +16,17 @@ use crate::ipc_handlers::enqueue_turn_identity;
 use crate::services::runtime_workers::{MAX_QUEUED_RUNTIME_TURNS, runtime_worker_limit};
 use crate::{AppState, dispatch_run_agent_with_runtime_slot};
 use router_contract::{
-    CancelRuntimeRequest, EnqueueTurnRequest, IpcRequest, ProbeSessionsRequest,
-    RegisterChildSessionOutcome, RegisterChildSessionRequest, RegisterChildSessionResponse,
+    AcknowledgeChildCallbackEffectIdentity, AcknowledgeChildCallbackOutcome,
+    AcknowledgeChildCallbackRequest, AcknowledgeChildCallbackResponse, CancelRuntimeRequest,
+    EnqueueTurnRequest, IpcRequest, ProbeSessionsRequest, RegisterChildSessionOutcome,
+    RegisterChildSessionRequest, RegisterChildSessionResponse,
 };
 use runtime_contract::{
     CommanderContinuationBinding, CommanderConvergenceProof, LifecycleExecutionContext,
     RunAgentRequest,
 };
 use session_lifecycle::{
-    CallbackEffectIdentity, ChildAdmissionOutcome, ChildAdmissionRecord,
+    AckOutcome, CallbackEffectIdentity, ChildAdmissionOutcome, ChildAdmissionRecord,
     ContinuationDispatchRecord, ContinuationDispatchState, ContinuationWriteOutcome,
     DurableCallbackRecord, IntakeOutcome, LifecycleConfig, LiveEffectEvidence, ReclaimOutcome,
     SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity, TerminalState,
@@ -594,6 +596,13 @@ impl ExecutionService {
             SessionLogResponse::Error { error } => Err(anyhow!(error)),
             other => Err(anyhow!("unexpected get_runtime_lease response: {other:?}")),
         }
+    }
+
+    pub(crate) fn acknowledge_child_callback_request(&self, input: Value) -> Result<Value> {
+        let request: AcknowledgeChildCallbackRequest = serde_json::from_value(input)?;
+        request.validate().map_err(anyhow::Error::msg)?;
+        let store = lifecycle_store(&request.parent_session_id)?;
+        acknowledge_child_callback_from_store(&store, request)
     }
 
     pub(crate) fn reconcile_durable_terminal_callback(
@@ -3162,6 +3171,112 @@ fn register_child_session_response(
     .map_err(Into::into)
 }
 
+fn acknowledge_child_callback_from_store(
+    store: &SessionLifecycleStore,
+    request: AcknowledgeChildCallbackRequest,
+) -> Result<Value> {
+    let admission = store
+        .child_admission(&request.child_session_id)?
+        .ok_or_else(|| anyhow!("CHILD_CALLBACK_ACK_ADMISSION_NOT_FOUND:{}", request.child_session_id))?;
+    if admission.parent_session_id != request.parent_session_id
+        || admission.parent_mission_revision_sha256 != request.parent_mission_revision_sha256
+        || admission.commander_thread_id.as_deref() != Some(request.commander_thread_id.as_str())
+        || admission.child_session_id != request.child_session_id
+        || admission.child_runtime_id != request.child_runtime_id
+        || admission.child_transaction_id != request.transaction_id
+        || admission.child_lease_id != request.child_lease_id
+        || admission.callback_request_id != request.transaction_id
+    {
+        return Err(anyhow!(
+            "CHILD_CALLBACK_ACK_ADMISSION_IDENTITY_MISMATCH:{}",
+            request.child_session_id
+        ));
+    }
+
+    let effect_identity = callback_effect_identity(&request.effect_identity);
+    if let CallbackEffectIdentity::Exact { effect_id } = &effect_identity
+        && admission.effect_id != *effect_id
+    {
+        return Err(anyhow!(
+            "CHILD_CALLBACK_ACK_ADMISSION_EFFECT_IDENTITY_MISMATCH:{}",
+            request.child_session_id
+        ));
+    }
+
+    let callback = store
+        .intaken_callback(&request.transaction_id, &request.event_id)?
+        .ok_or_else(|| anyhow!(
+            "CHILD_CALLBACK_ACK_INTAKEN_CALLBACK_NOT_FOUND:{}:{}",
+            request.transaction_id,
+            request.event_id
+        ))?;
+    if callback.commander_session_id != request.parent_session_id
+        || callback.parent_mission_revision_sha256 != request.parent_mission_revision_sha256
+        || callback.commander_thread_id.as_deref() != Some(request.commander_thread_id.as_str())
+        || callback.child_session_id != request.child_session_id
+        || callback.runtime_id != request.child_runtime_id
+        || callback.lease_id != request.child_lease_id
+        || callback.transaction_id != request.transaction_id
+        || callback.event_id != request.event_id
+        || callback.callback_payload_sha256 != request.callback_payload_sha256
+        || callback.effect_identity != effect_identity
+    {
+        return Err(anyhow!(
+            "CHILD_CALLBACK_ACK_CALLBACK_IDENTITY_MISMATCH:{}:{}",
+            request.transaction_id,
+            request.event_id
+        ));
+    }
+
+    let outcome = match store.acknowledge_callback(
+        &request.transaction_id,
+        &request.event_id,
+        &request.callback_payload_sha256,
+        &effect_identity,
+    )? {
+        AckOutcome::Acknowledged => AcknowledgeChildCallbackOutcome::Acknowledged,
+        AckOutcome::AlreadyAcknowledged => AcknowledgeChildCallbackOutcome::AlreadyAcknowledged,
+    };
+    serde_json::to_value(AcknowledgeChildCallbackResponse {
+        outcome,
+        parent_session_id: request.parent_session_id,
+        parent_mission_revision_sha256: request.parent_mission_revision_sha256,
+        commander_thread_id: request.commander_thread_id,
+        child_session_id: request.child_session_id,
+        child_runtime_id: request.child_runtime_id,
+        child_lease_id: request.child_lease_id,
+        transaction_id: request.transaction_id,
+        event_id: request.event_id,
+        callback_payload_sha256: request.callback_payload_sha256,
+        effect_identity: request.effect_identity,
+    })
+    .map_err(Into::into)
+}
+
+fn callback_effect_identity(
+    identity: &AcknowledgeChildCallbackEffectIdentity,
+) -> CallbackEffectIdentity {
+    match identity {
+        AcknowledgeChildCallbackEffectIdentity::Exact { effect_id } => {
+            CallbackEffectIdentity::Exact { effect_id: effect_id.clone() }
+        }
+        AcknowledgeChildCallbackEffectIdentity::ProvenZeroEffect {
+            classification,
+            evidence_sha256,
+        } => CallbackEffectIdentity::ProvenZeroEffect {
+            classification: classification.clone(),
+            evidence_sha256: evidence_sha256.clone(),
+        },
+        AcknowledgeChildCallbackEffectIdentity::UnsettledEffect {
+            classification,
+            evidence_sha256,
+        } => CallbackEffectIdentity::UnsettledEffect {
+            classification: classification.clone(),
+            evidence_sha256: evidence_sha256.clone(),
+        },
+    }
+}
+
 fn validate_child_runtime_identity(
     runtime: &RuntimeLeaseSnapshot,
     request: &RegisterChildSessionRequest,
@@ -3620,6 +3735,7 @@ mod tests {
     use super::{
         EnqueueTurnRequest, ExecutionService, RetryRuntimeIdentity,
         RouterRecoveryCloseRuntimeRequest, RuntimeLease, TerminalDeliveryIdentity,
+        acknowledge_child_callback_from_store,
         callback_continuation_payload, commander_continuation_binding,
         commander_convergence_proof_from_runtime,
         complete_and_ack_callback_continuation,
@@ -3643,6 +3759,10 @@ mod tests {
         SessionProjection, SessionState, TaskPlan, ToolChoice,
     };
     use runtime_contract::{CommanderConvergenceProof, RunAgentRequest};
+    use router_contract::{
+        AcknowledgeChildCallbackEffectIdentity, AcknowledgeChildCallbackOutcome,
+        AcknowledgeChildCallbackRequest, AcknowledgeChildCallbackResponse,
+    };
     use serde_json::json;
     use session_lifecycle::{
         CallbackEffectIdentity, ChildAdmissionRecord, ContinuationDispatchRecord,
@@ -5100,6 +5220,166 @@ mod tests {
             .admit_child(&admission)
             .expect("durable child admission");
         admission
+    }
+
+    fn callback_ack_fixture(
+        root: &std::path::Path,
+        effect_identity: CallbackEffectIdentity,
+        intaken: bool,
+    ) -> (SessionLifecycleStore, AcknowledgeChildCallbackRequest) {
+        let (store, _) = durable_callback_fixture(root, TerminalState::Completed);
+        let admission = ChildAdmissionRecord::new(
+            "commander-callback", "a".repeat(64), Some("commander-thread-1".to_string()),
+            "child-callback", "runtime-callback", "transaction-callback", "lease-callback",
+            "transaction-callback", "runtime-callback.message",
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            session_lifecycle::canonical_value_sha256(&json!({"prompt": "delegated prompt"})),
+            "/tmp/child-callback", "delegated child callback", 1_786_845_600_000,
+        );
+        store.admit_child(&admission).expect("child admission");
+        let receipt = store
+            .terminal_receipt("transaction-callback", "event-callback")
+            .expect("terminal receipt");
+        let mut callback = DurableCallbackRecord::new(
+            &receipt,
+            json!("child result"),
+            json!({"kind": "gateway.callback"}),
+            "a".repeat(64),
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            effect_identity.clone(),
+        )
+        .expect("callback record");
+        callback.commander_thread_id = Some("commander-thread-1".to_string());
+        store.publish_callback(&callback).expect("callback publish");
+        if intaken {
+            store
+                .mark_callback_intaken(
+                    &callback.transaction_id,
+                    &callback.event_id,
+                    &callback.callback_payload_sha256,
+                )
+                .expect("callback intake");
+        }
+        let effect_identity = match effect_identity {
+            CallbackEffectIdentity::Exact { effect_id } => {
+                AcknowledgeChildCallbackEffectIdentity::Exact { effect_id }
+            }
+            CallbackEffectIdentity::ProvenZeroEffect { classification, evidence_sha256 } => {
+                AcknowledgeChildCallbackEffectIdentity::ProvenZeroEffect {
+                    classification, evidence_sha256,
+                }
+            }
+            CallbackEffectIdentity::UnsettledEffect { classification, evidence_sha256 } => {
+                AcknowledgeChildCallbackEffectIdentity::UnsettledEffect {
+                    classification, evidence_sha256,
+                }
+            }
+        };
+        let request = AcknowledgeChildCallbackRequest {
+            parent_session_id: "commander-callback".to_string(),
+            parent_mission_revision_sha256: "a".repeat(64),
+            commander_thread_id: "commander-thread-1".to_string(),
+            child_session_id: "child-callback".to_string(),
+            child_runtime_id: "runtime-callback".to_string(),
+            child_lease_id: "lease-callback".to_string(),
+            transaction_id: "transaction-callback".to_string(),
+            event_id: "event-callback".to_string(),
+            callback_payload_sha256: callback.callback_payload_sha256,
+            effect_identity,
+        };
+        (store, request)
+    }
+
+    #[test]
+    fn public_child_callback_ack_is_exactly_once_without_provider_continuation() {
+        let root = tempfile::tempdir().expect("callback ACK root");
+        let (store, request) = callback_ack_fixture(
+            root.path(),
+            CallbackEffectIdentity::Exact { effect_id: "runtime-callback.message".to_string() },
+            true,
+        );
+        let first: AcknowledgeChildCallbackResponse = serde_json::from_value(
+            acknowledge_child_callback_from_store(&store, request.clone()).expect("first ACK"),
+        ).expect("first ACK response");
+        let replay: AcknowledgeChildCallbackResponse = serde_json::from_value(
+            acknowledge_child_callback_from_store(&store, request).expect("ACK replay"),
+        ).expect("ACK replay response");
+        assert_eq!(first.outcome, AcknowledgeChildCallbackOutcome::Acknowledged);
+        assert_eq!(replay.outcome, AcknowledgeChildCallbackOutcome::AlreadyAcknowledged);
+        assert_eq!(store.readback().expect("readback").acknowledged_callbacks, 1);
+        assert!(store.callbacks_for_replay().expect("callbacks").is_empty());
+        assert!(store.callback_continuations_for_replay().expect("continuations").is_empty());
+    }
+
+    #[test]
+    fn public_child_callback_ack_rejects_changed_bound_identities() {
+        let root = tempfile::tempdir().expect("callback ACK root");
+        let (store, request) = callback_ack_fixture(
+            root.path(),
+            CallbackEffectIdentity::Exact { effect_id: "runtime-callback.message".to_string() },
+            true,
+        );
+        let mut variants = Vec::new();
+        let mut changed = request.clone(); changed.parent_session_id = "other-parent".into(); variants.push(changed);
+        let mut changed = request.clone(); changed.child_session_id = "other-child".into(); variants.push(changed);
+        let mut changed = request.clone(); changed.child_runtime_id = "other-runtime".into(); variants.push(changed);
+        let mut changed = request.clone(); changed.child_lease_id = "other-lease".into(); variants.push(changed);
+        let mut changed = request.clone(); changed.commander_thread_id = "other-thread".into(); variants.push(changed);
+        let mut changed = request.clone(); changed.parent_mission_revision_sha256 = "b".repeat(64); variants.push(changed);
+        let mut changed = request.clone(); changed.transaction_id = "other-transaction".into(); variants.push(changed);
+        let mut changed = request.clone(); changed.event_id = "other-event".into(); variants.push(changed);
+        let mut changed = request.clone(); changed.callback_payload_sha256 = "c".repeat(64); variants.push(changed);
+        let mut changed = request; changed.effect_identity = AcknowledgeChildCallbackEffectIdentity::Exact { effect_id: "other-effect".into() }; variants.push(changed);
+        for changed in variants {
+            assert!(acknowledge_child_callback_from_store(&store, changed).is_err());
+        }
+        assert_eq!(store.readback().expect("readback").acknowledged_callbacks, 0);
+    }
+
+    #[test]
+    fn public_child_callback_ack_requires_intaken_and_settled_effect() {
+        let pending_root = tempfile::tempdir().expect("pending callback root");
+        let (pending_store, pending_request) = callback_ack_fixture(
+            pending_root.path(),
+            CallbackEffectIdentity::Exact { effect_id: "runtime-callback.message".to_string() },
+            false,
+        );
+        assert!(acknowledge_child_callback_from_store(&pending_store, pending_request)
+            .expect_err("pending callback")
+            .to_string().contains("INTAKEN_CALLBACK_NOT_FOUND"));
+
+        let unsettled_root = tempfile::tempdir().expect("unsettled callback root");
+        let (unsettled_store, unsettled_request) = callback_ack_fixture(
+            unsettled_root.path(),
+            CallbackEffectIdentity::UnsettledEffect {
+                classification: "effect_receipt_incomplete".to_string(),
+                evidence_sha256: "d".repeat(64),
+            },
+            true,
+        );
+        assert!(acknowledge_child_callback_from_store(&unsettled_store, unsettled_request)
+            .expect_err("unsettled effect")
+            .to_string().contains("CALLBACK_UNSETTLED_EFFECT_ACK_BLOCKED"));
+        assert_eq!(unsettled_store.readback().expect("readback").acknowledged_callbacks, 0);
+    }
+
+    #[test]
+    fn public_child_zero_effect_callback_ack_replays_without_effect_execution() {
+        let root = tempfile::tempdir().expect("zero-effect callback root");
+        let (store, request) = callback_ack_fixture(
+            root.path(),
+            CallbackEffectIdentity::ProvenZeroEffect {
+                classification: "pre_provider_zero_effect".to_string(),
+                evidence_sha256: "e".repeat(64),
+            },
+            true,
+        );
+        acknowledge_child_callback_from_store(&store, request.clone()).expect("zero ACK");
+        let replay: AcknowledgeChildCallbackResponse = serde_json::from_value(
+            acknowledge_child_callback_from_store(&store, request).expect("zero ACK replay"),
+        ).expect("zero replay response");
+        assert_eq!(replay.outcome, AcknowledgeChildCallbackOutcome::AlreadyAcknowledged);
+        assert!(store.callback_continuations_for_replay().expect("continuations").is_empty());
     }
 
     #[test]

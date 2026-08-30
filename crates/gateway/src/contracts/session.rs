@@ -248,4 +248,4 @@ pub struct RuntimeSessionStatusRequest {
     pub status: String,
 }
 
-pub use router_contract::RegisterChildSessionRequest;
+pub use router_contract::{AcknowledgeChildCallbackRequest, RegisterChildSessionRequest};

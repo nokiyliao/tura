@@ -9,6 +9,7 @@ pub const IPC_KIND_HEALTH_CHECK: &str = "health_check";
 pub const METHOD_HEALTH_CHECK: &str = "health_check";
 pub const METHOD_ENQUEUE_TURN: &str = "execution.enqueue_turn";
 pub const METHOD_REGISTER_CHILD_SESSION: &str = "execution.register_child_session";
+pub const METHOD_ACKNOWLEDGE_CHILD_CALLBACK: &str = "execution.acknowledge_child_callback";
 pub const METHOD_LIST_COMMANDS: &str = "registry.commands.list";
 pub const METHOD_EXECUTE_COMMAND: &str = "registry.commands.execute";
 pub const METHOD_LIST_TOOLS: &str = "registry.tools.list";
@@ -212,6 +213,124 @@ pub struct RegisterChildSessionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AcknowledgeChildCallbackEffectIdentity {
+    Exact { effect_id: String },
+    ProvenZeroEffect {
+        classification: String,
+        evidence_sha256: String,
+    },
+    UnsettledEffect {
+        classification: String,
+        evidence_sha256: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcknowledgeChildCallbackRequest {
+    pub parent_session_id: String,
+    pub parent_mission_revision_sha256: String,
+    pub commander_thread_id: String,
+    pub child_session_id: String,
+    pub child_runtime_id: String,
+    pub child_lease_id: String,
+    pub transaction_id: String,
+    pub event_id: String,
+    pub callback_payload_sha256: String,
+    pub effect_identity: AcknowledgeChildCallbackEffectIdentity,
+}
+
+impl AcknowledgeChildCallbackRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("parent_session_id", self.parent_session_id.as_str()),
+            ("commander_thread_id", self.commander_thread_id.as_str()),
+            ("child_session_id", self.child_session_id.as_str()),
+            ("child_runtime_id", self.child_runtime_id.as_str()),
+            ("child_lease_id", self.child_lease_id.as_str()),
+            ("transaction_id", self.transaction_id.as_str()),
+            ("event_id", self.event_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("CHILD_CALLBACK_ACK_IDENTITY_MISSING:{name}"));
+            }
+        }
+        for (name, value) in [
+            (
+                "parent_mission_revision_sha256",
+                self.parent_mission_revision_sha256.as_str(),
+            ),
+            ("callback_payload_sha256", self.callback_payload_sha256.as_str()),
+        ] {
+            if !is_lower_hex_sha256(value) {
+                return Err(format!("CHILD_CALLBACK_ACK_IDENTITY_INVALID:{name}"));
+            }
+        }
+        if self.parent_session_id == self.child_session_id {
+            return Err("CHILD_CALLBACK_ACK_IDENTITY_CONFLICT:parent_equals_child".to_string());
+        }
+        match &self.effect_identity {
+            AcknowledgeChildCallbackEffectIdentity::Exact { effect_id } => {
+                if effect_id.trim().is_empty() {
+                    return Err("CHILD_CALLBACK_ACK_IDENTITY_MISSING:effect_id".to_string());
+                }
+            }
+            AcknowledgeChildCallbackEffectIdentity::ProvenZeroEffect {
+                classification,
+                evidence_sha256,
+            }
+            | AcknowledgeChildCallbackEffectIdentity::UnsettledEffect {
+                classification,
+                evidence_sha256,
+            } => {
+                if classification.trim().is_empty() {
+                    return Err(
+                        "CHILD_CALLBACK_ACK_IDENTITY_MISSING:effect_classification".to_string(),
+                    );
+                }
+                if !is_lower_hex_sha256(evidence_sha256) {
+                    return Err(
+                        "CHILD_CALLBACK_ACK_IDENTITY_INVALID:effect_evidence_sha256".to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcknowledgeChildCallbackOutcome {
+    Acknowledged,
+    AlreadyAcknowledged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcknowledgeChildCallbackResponse {
+    pub outcome: AcknowledgeChildCallbackOutcome,
+    pub parent_session_id: String,
+    pub parent_mission_revision_sha256: String,
+    pub commander_thread_id: String,
+    pub child_session_id: String,
+    pub child_runtime_id: String,
+    pub child_lease_id: String,
+    pub transaction_id: String,
+    pub event_id: String,
+    pub callback_payload_sha256: String,
+    pub effect_identity: AcknowledgeChildCallbackEffectIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CancelRuntimeRequest {
     pub session_id: String,
@@ -410,6 +529,23 @@ mod tests {
         }
     }
 
+    fn callback_ack_request() -> AcknowledgeChildCallbackRequest {
+        AcknowledgeChildCallbackRequest {
+            parent_session_id: "parent-1".to_string(),
+            parent_mission_revision_sha256: "a".repeat(64),
+            commander_thread_id: "commander-thread-1".to_string(),
+            child_session_id: "child-1".to_string(),
+            child_runtime_id: "runtime-1".to_string(),
+            child_lease_id: "lease-1".to_string(),
+            transaction_id: "callback-1".to_string(),
+            event_id: "event-1".to_string(),
+            callback_payload_sha256: "b".repeat(64),
+            effect_identity: AcknowledgeChildCallbackEffectIdentity::Exact {
+                effect_id: "runtime-1.message".to_string(),
+            },
+        }
+    }
+
     #[test]
     fn child_admission_contract_binds_all_required_identities() {
         let request = child_request();
@@ -476,6 +612,50 @@ mod tests {
         assert_eq!(
             uppercase_revision.validate().unwrap_err(),
             "CHILD_ADMISSION_IDENTITY_INVALID:parent_mission_revision_sha256"
+        );
+    }
+
+    #[test]
+    fn child_callback_ack_contract_binds_exact_and_zero_effect_identities() {
+        let exact = callback_ack_request();
+        exact.validate().expect("valid exact callback ack");
+        let decoded: AcknowledgeChildCallbackRequest = serde_json::from_value(
+            serde_json::to_value(&exact).expect("serialize exact callback ack"),
+        )
+        .expect("deserialize exact callback ack");
+        assert_eq!(decoded, exact);
+
+        let mut zero = callback_ack_request();
+        zero.effect_identity = AcknowledgeChildCallbackEffectIdentity::ProvenZeroEffect {
+            classification: "pre_provider_zero_effect".to_string(),
+            evidence_sha256: "c".repeat(64),
+        };
+        zero.validate().expect("valid zero-effect callback ack");
+    }
+
+    #[test]
+    fn child_callback_ack_contract_rejects_missing_or_malformed_identity() {
+        let mut missing_thread = callback_ack_request();
+        missing_thread.commander_thread_id = "   ".to_string();
+        assert_eq!(
+            missing_thread.validate().unwrap_err(),
+            "CHILD_CALLBACK_ACK_IDENTITY_MISSING:commander_thread_id"
+        );
+
+        let mut bad_payload_hash = callback_ack_request();
+        bad_payload_hash.callback_payload_sha256 = "B".repeat(64);
+        assert_eq!(
+            bad_payload_hash.validate().unwrap_err(),
+            "CHILD_CALLBACK_ACK_IDENTITY_INVALID:callback_payload_sha256"
+        );
+
+        let mut missing_effect = callback_ack_request();
+        missing_effect.effect_identity = AcknowledgeChildCallbackEffectIdentity::Exact {
+            effect_id: String::new(),
+        };
+        assert_eq!(
+            missing_effect.validate().unwrap_err(),
+            "CHILD_CALLBACK_ACK_IDENTITY_MISSING:effect_id"
         );
     }
 }

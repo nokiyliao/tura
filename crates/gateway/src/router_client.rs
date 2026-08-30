@@ -5,13 +5,14 @@
 
 use anyhow::{anyhow, Result};
 use router_contract::{
-    CancelRuntimeRequest, EnqueueTurnRequest, ExecuteCommandRequest, ExecuteCommandResponse,
+    AcknowledgeChildCallbackRequest, AcknowledgeChildCallbackResponse, CancelRuntimeRequest,
+    EnqueueTurnRequest, ExecuteCommandRequest, ExecuteCommandResponse,
     GetToolConfigResponse, GetToolResponse, ListCommandsRequest, ListCommandsResponse,
     ListToolsResponse, PatchToolConfigRequest, PatchToolRequest, ProbeSessionsRequest,
     RegisterChildSessionRequest, RegisterChildSessionResponse, ToolRegistryRequest, ToolRequest,
     METHOD_ENQUEUE_TURN, METHOD_EXECUTE_COMMAND, METHOD_GET_TOOL, METHOD_GET_TOOL_CONFIG,
     METHOD_LIST_COMMANDS, METHOD_LIST_TOOLS, METHOD_PATCH_TOOL, METHOD_PATCH_TOOL_CONFIG,
-    METHOD_REGISTER_CHILD_SESSION,
+    METHOD_ACKNOWLEDGE_CHILD_CALLBACK, METHOD_REGISTER_CHILD_SESSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -42,6 +43,13 @@ impl RouterClient {
         request: RegisterChildSessionRequest,
     ) -> Result<RegisterChildSessionResponse> {
         self.call_typed(METHOD_REGISTER_CHILD_SESSION, request)
+    }
+
+    pub fn acknowledge_child_callback(
+        &self,
+        request: AcknowledgeChildCallbackRequest,
+    ) -> Result<AcknowledgeChildCallbackResponse> {
+        self.call_typed(METHOD_ACKNOWLEDGE_CHILD_CALLBACK, request)
     }
 
     pub fn cancel_runtime(&self, session_id: &str, runtime_id: &str) -> Result<Value> {

@@ -114,6 +114,10 @@ pub fn build_router() -> Router {
             post(api::session::register_child_session),
         )
         .route(
+            "/session/{sessionID}/children/{childSessionID}/callback/ack",
+            post(api::session::acknowledge_child_callback),
+        )
+        .route(
             "/session/{sessionID}/task-management",
             patch(api::session::update_session_task_management),
         )

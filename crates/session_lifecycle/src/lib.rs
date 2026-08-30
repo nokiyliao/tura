@@ -894,6 +894,25 @@ impl SessionLifecycleStore {
         Ok(callbacks.into_values().collect())
     }
 
+    pub fn intaken_callback(
+        &self,
+        transaction_id: &str,
+        event_id: &str,
+    ) -> LifecycleResult<Option<DurableCallbackRecord>> {
+        require_identifier("transaction_id", transaction_id)?;
+        require_identifier("event_id", event_id)?;
+        let path = self
+            .root
+            .join("callbacks/intaken")
+            .join(receipt_key(transaction_id, event_id));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let record: DurableCallbackRecord = read_json(&path)?;
+        self.validate_callback(&record)?;
+        Ok(Some(record))
+    }
+
     pub fn mark_callback_intaken(
         &self,
         transaction_id: &str,

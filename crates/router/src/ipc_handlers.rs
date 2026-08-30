@@ -10,6 +10,7 @@ use router_contract::{
     ExecuteCommandRequest, GetToolConfigResponse, GetToolResponse, IpcRequest, IpcResponse,
     ListCommandsRequest, ListCommandsResponse, ListToolsResponse, PatchToolConfigRequest,
     PatchToolRequest, ToolRegistryRequest, ToolRequest, METHOD_ENQUEUE_TURN,
+    METHOD_ACKNOWLEDGE_CHILD_CALLBACK,
     METHOD_EXECUTE_COMMAND, METHOD_GET_TOOL, METHOD_GET_TOOL_CONFIG, METHOD_HEALTH_CHECK,
     METHOD_LIST_COMMANDS, METHOD_LIST_TOOLS, METHOD_PATCH_TOOL, METHOD_PATCH_TOOL_CONFIG,
     METHOD_REGISTER_CHILD_SESSION,
@@ -59,6 +60,9 @@ pub(crate) async fn handle_ipc_request(state: &AppState, request: IpcRequest) ->
                 .register_child_session_request(state, request.payload)
                 .await
         }
+        METHOD_ACKNOWLEDGE_CHILD_CALLBACK => state
+            .execution
+            .acknowledge_child_callback_request(request.payload),
         "execution.command_run" => {
             state
                 .execution
@@ -260,6 +264,26 @@ mod tests {
             .as_u64()
             .is_some());
         assert!(!endpoint_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn child_callback_ack_ipc_routes_to_typed_contract_before_store_access() -> anyhow::Result<()> {
+        let state = build_state();
+        let response = tokio_runtime()?.block_on(handle_ipc_request(
+            &state,
+            IpcRequest {
+                request_id: "callback-ack-invalid".to_string(),
+                kind: "call".to_string(),
+                method: METHOD_ACKNOWLEDGE_CHILD_CALLBACK.to_string(),
+                payload: json!({}),
+                deadline_ms: None,
+            },
+        ));
+        assert!(!response.ok);
+        assert!(response.error.as_deref().is_some_and(
+            |error| error.contains("missing field `parent_session_id`")
+        ));
         Ok(())
     }
 

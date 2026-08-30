@@ -722,6 +722,75 @@ pub async fn register_child_session(
     }
 }
 
+pub async fn acknowledge_child_callback(
+    Path((parent_session_id, child_session_id)): Path<(String, String)>,
+    Json(payload): Json<AcknowledgeChildCallbackRequest>,
+) -> impl IntoResponse {
+    if parent_session_id != payload.parent_session_id
+        || child_session_id != payload.child_session_id
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_callback_ack_path_conflict",
+            })),
+        )
+            .into_response();
+    }
+    if let Err(error) = payload.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_callback_ack_invalid",
+                "message": error,
+            })),
+        )
+            .into_response();
+    }
+    match tokio::task::spawn_blocking(move || {
+        RouterClient::global().acknowledge_child_callback(payload)
+    })
+    .await
+    {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            let status = if message.contains("_NOT_FOUND") {
+                StatusCode::NOT_FOUND
+            } else if message.contains("_MISMATCH")
+                || message.contains("_CONFLICT")
+                || message.contains("UNSETTLED_EFFECT_ACK_BLOCKED")
+            {
+                StatusCode::CONFLICT
+            } else if message.contains("_MISSING") || message.contains("_INVALID") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "child_callback_ack_failed",
+                    "message": message,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_callback_ack_failed",
+                "message": format!("router child callback ACK task failed: {error}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn update_session_status_for_runtime(
     Path(session_id): Path<String>,
     Json(payload): Json<RuntimeSessionStatusRequest>,
