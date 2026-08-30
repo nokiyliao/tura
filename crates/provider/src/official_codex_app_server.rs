@@ -1969,13 +1969,38 @@ async fn handle_server_request(
     };
     return match handled {
         Ok(result) => {
+            let mut result = result;
             if let (Some(effect_index), Some(context)) = (effect_index, turn_context.as_deref_mut())
             {
-                let command_evidence = extract_command_receipt_references(
+                let command_run_observation = context
+                    .execution_ledger
+                    .effects
+                    .get(effect_index)
+                    .and_then(|effect| effect.command_run_observation.clone());
+                let command_evidence = match extract_command_receipt_references(
                     context.session_directory,
                     effect_index,
                     &result,
-                )?;
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(OfficialCodexAppServerError::UncertainToolEffect { reason, .. })
+                        if reason.contains("omitted terminal_receipt")
+                            && command_run_observation.is_some() =>
+                    {
+                        result = normalize_command_run_response_from_batch_admission(
+                            context.session_directory,
+                            effect_index,
+                            command_run_observation.as_ref().expect("checked above"),
+                            &result,
+                        )?;
+                        extract_command_receipt_references(
+                            context.session_directory,
+                            effect_index,
+                            &result,
+                        )?
+                    }
+                    Err(error) => return Err(error),
+                };
                 let effect = context
                     .execution_ledger
                     .effects
@@ -2611,19 +2636,46 @@ fn reconcile_durable_command_run_effects(
             });
         }
 
+        let receipt_directory = command_receipt_directory(session_directory);
+        let needs_batch_admission = observation.commands.iter().any(|command| {
+            !receipt_directory
+                .join(format!(
+                    "{}.json",
+                    encode_command_receipt_identity(&command.claim_identity)
+                ))
+                .exists()
+        });
+        let admission = needs_batch_admission
+            .then(|| {
+                load_command_run_batch_admission(session_directory, effect_index, &observation)
+            })
+            .transpose()?;
         let mut results = Vec::with_capacity(observation.commands.len());
         let mut canonical_paths = HashSet::new();
         let mut receipt_digests = HashSet::new();
         for command in &observation.commands {
             let claim_identity = &command.claim_identity;
-            let receipt_path = session_directory
-                .join(".tura")
-                .join("run")
-                .join("command_receipts")
-                .join(format!(
-                    "{}.json",
-                    encode_command_receipt_identity(&claim_identity)
+            let encoded_identity = encode_command_receipt_identity(claim_identity);
+            let claim_path = receipt_directory.join(format!("{encoded_identity}.claim.json"));
+            let receipt_path = receipt_directory.join(format!("{encoded_identity}.json"));
+            if admission
+                .as_ref()
+                .is_some_and(|admission| !admission.accepted_call_ids.contains(claim_identity))
+            {
+                if claim_path.exists() || receipt_path.exists() {
+                    return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                        effect_index,
+                        reason: format!(
+                            "unaccepted command {claim_identity} unexpectedly acquired execution state"
+                        ),
+                    });
+                }
+                results.push(synthesize_unaccepted_command_run_result(
+                    command,
+                    admission.as_ref().expect("checked above"),
                 ));
+                continue;
+            }
             let absolute_path = std::fs::canonicalize(&receipt_path).map_err(|error| {
                 OfficialCodexAppServerError::UncertainToolEffect {
                     effect_index,
@@ -2696,7 +2748,16 @@ fn reconcile_durable_command_run_effects(
         });
         let evidence =
             extract_command_receipt_references(session_directory, effect_index, &response)?;
-        if !evidence.replayable || evidence.references.len() != observation.commands.len() {
+        let expected_reference_count =
+            admission
+                .as_ref()
+                .map_or(observation.commands.len(), |admission| {
+                    admission.accepted_call_ids.len()
+                        + usize::from(
+                            admission.accepted_call_ids.len() < observation.commands.len(),
+                        )
+                });
+        if !evidence.replayable || evidence.references.len() != expected_reference_count {
             return Err(OfficialCodexAppServerError::UncertainToolEffect {
                 effect_index,
                 reason: "durable command_run result was incomplete or unsettled".to_string(),
@@ -2841,9 +2902,242 @@ fn interrupted_recovery_items(
     Ok((items, replay_request_ids))
 }
 
+#[derive(Debug)]
 struct CommandReceiptEvidence {
     references: Vec<CodexCommandReceiptReference>,
     replayable: bool,
+}
+
+struct CommandRunBatchAdmission {
+    path: PathBuf,
+    value: Value,
+    accepted_call_ids: BTreeSet<String>,
+}
+
+fn command_receipt_directory(session_directory: &Path) -> PathBuf {
+    session_directory
+        .join(".tura")
+        .join("run")
+        .join("command_receipts")
+}
+
+fn load_command_run_batch_admission(
+    session_directory: &Path,
+    effect_index: usize,
+    observation: &CodexCommandRunEffectObservation,
+) -> Result<CommandRunBatchAdmission, OfficialCodexAppServerError> {
+    validate_command_run_observation(effect_index, observation)?;
+    let receipt_directory = command_receipt_directory(session_directory);
+    let marker_path = receipt_directory.join(format!(
+        "{}.batch-admission",
+        encode_command_receipt_identity(&observation.execution_id)
+    ));
+    let absolute_path = std::fs::canonicalize(&marker_path).map_err(|error| {
+        OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: format!(
+                "command_run batch admission is unavailable at {}: {error}",
+                marker_path.display()
+            ),
+        }
+    })?;
+    let absolute_receipt_directory =
+        std::fs::canonicalize(&receipt_directory).map_err(|error| {
+            OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: format!("command receipt directory is unavailable: {error}"),
+            }
+        })?;
+    if !absolute_path.starts_with(&absolute_receipt_directory) {
+        return Err(OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "command_run batch admission escaped the receipt directory".to_string(),
+        });
+    }
+    let bytes = std::fs::read(&absolute_path).map_err(|error| {
+        OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: format!("command_run batch admission read failed: {error}"),
+        }
+    })?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: format!("command_run batch admission is invalid JSON: {error}"),
+        }
+    })?;
+    let expected_call_ids = observation
+        .commands
+        .iter()
+        .map(|command| Value::String(command.claim_identity.clone()))
+        .collect::<Vec<_>>();
+    if value.get("schema_version").and_then(Value::as_str)
+        != Some("tura_command_run_batch_admission_v1")
+        || value.get("execution_id").and_then(Value::as_str)
+            != Some(observation.execution_id.as_str())
+        || value.get("call_ids").and_then(Value::as_array) != Some(&expected_call_ids)
+        || value.get("state").and_then(Value::as_str) != Some("finished")
+        || value
+            .get("terminal_at_unix_ms")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return Err(OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "command_run batch admission identity or terminal state changed".to_string(),
+        });
+    }
+    let accepted_values = value
+        .get("accepted_call_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "command_run batch admission omitted accepted_call_ids".to_string(),
+        })?;
+    let accepted_call_ids = accepted_values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: "command_run batch admission contains a non-string call id".to_string(),
+                }
+            })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if accepted_call_ids.len() != accepted_values.len()
+        || !accepted_call_ids.iter().all(|call_id| {
+            expected_call_ids
+                .iter()
+                .any(|value| value.as_str() == Some(call_id))
+        })
+    {
+        return Err(OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "command_run batch admission accepted identities are conflicting".to_string(),
+        });
+    }
+    Ok(CommandRunBatchAdmission {
+        path: absolute_path,
+        value,
+        accepted_call_ids,
+    })
+}
+
+fn synthesize_unaccepted_command_run_result(
+    command: &CodexCommandRunCommandObservation,
+    admission: &CommandRunBatchAdmission,
+) -> Value {
+    json!({
+        "command_type": command.command_type,
+        "command_id": command.claim_identity,
+        "step": command.effective_step,
+        "success": false,
+        "error": "command was not accepted by the durable batch admission",
+        "output": {
+            "schema_version": "tura_command_run_batch_admission_v1",
+            "terminal_state": "not_started",
+            "outcome": "known_zero_mutation",
+            "claim_state": "absent",
+            "claim_identity": command.claim_identity,
+            "process_state": "never_started",
+            "mutation_count": 0,
+            "authority_effect": "none",
+            "delivery_state": "reconstructed_from_durable_batch_admission",
+            "batch_admission": admission.value,
+            "batch_admission_path": admission.path,
+        }
+    })
+}
+
+fn command_result_terminal_receipt(result: &Value) -> Option<&Value> {
+    result
+        .get("output")
+        .unwrap_or(result)
+        .get("terminal_receipt")
+}
+
+fn normalize_command_run_response_from_batch_admission(
+    session_directory: &Path,
+    effect_index: usize,
+    observation: &CodexCommandRunEffectObservation,
+    response: &Value,
+) -> Result<Value, OfficialCodexAppServerError> {
+    let admission = load_command_run_batch_admission(session_directory, effect_index, observation)?;
+    let mut normalized = response.clone();
+    let text = normalized
+        .get_mut("contentItems")
+        .and_then(Value::as_array_mut)
+        .and_then(|items| {
+            items.iter_mut().find_map(|item| {
+                item.get_mut("text")
+                    .filter(|text| text.as_str().is_some_and(|text| !text.is_empty()))
+            })
+        })
+        .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "command_run response omitted contentItems text".to_string(),
+        })?;
+    let mut output: Value =
+        serde_json::from_str(text.as_str().unwrap_or_default()).map_err(|error| {
+            OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: format!("command_run response was not JSON: {error}"),
+            }
+        })?;
+    let results = output
+        .get_mut("results")
+        .and_then(Value::as_array_mut)
+        .filter(|results| results.len() == observation.commands.len())
+        .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "command_run response did not preserve its planned command count".to_string(),
+        })?;
+    let receipt_directory = command_receipt_directory(session_directory);
+    for (result, command) in results.iter_mut().zip(&observation.commands) {
+        if result.get("command_type").and_then(Value::as_str) != Some(command.command_type.as_str())
+            || command.binding_id.as_ref().is_some_and(|binding_id| {
+                result.get("id").and_then(Value::as_str) != Some(binding_id.as_str())
+            })
+        {
+            return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: "command_run response command identity changed".to_string(),
+            });
+        }
+        let accepted = admission
+            .accepted_call_ids
+            .contains(&command.claim_identity);
+        if command_result_terminal_receipt(result).is_some() {
+            if !accepted {
+                return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: "unaccepted command unexpectedly carried a terminal receipt"
+                        .to_string(),
+                });
+            }
+            continue;
+        }
+        if accepted {
+            continue;
+        }
+        let encoded_identity = encode_command_receipt_identity(&command.claim_identity);
+        if receipt_directory
+            .join(format!("{encoded_identity}.claim.json"))
+            .exists()
+            || receipt_directory
+                .join(format!("{encoded_identity}.json"))
+                .exists()
+        {
+            return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: "unaccepted command unexpectedly acquired execution state".to_string(),
+            });
+        }
+        *result = synthesize_unaccepted_command_run_result(command, &admission);
+    }
+    *text = Value::String(output.to_string());
+    Ok(normalized)
 }
 
 fn extract_command_receipt_references(
@@ -2900,6 +3194,14 @@ fn extract_command_receipt_references(
                 continue;
             }
             if deterministic_zero_effect_unclaimed_read_only(command_result) {
+                continue;
+            }
+            if let Some(reference) =
+                durable_unaccepted_batch_reference(session_directory, effect_index, command_result)?
+            {
+                if !references.iter().any(|existing| existing == &reference) {
+                    references.push(reference);
+                }
                 continue;
             }
             return Err(OfficialCodexAppServerError::UncertainToolEffect {
@@ -3035,6 +3337,147 @@ fn deterministic_zero_effect_unclaimed_read_only(command_result: &Value) -> bool
             .and_then(Value::as_str)
             == Some("none")
         && output.get("delivery_state").and_then(Value::as_str) == Some("synthetic_replay")
+}
+
+fn durable_unaccepted_batch_reference(
+    session_directory: &Path,
+    effect_index: usize,
+    command_result: &Value,
+) -> Result<Option<CodexCommandReceiptReference>, OfficialCodexAppServerError> {
+    let output = command_result.get("output").unwrap_or(command_result);
+    if output.get("schema_version").and_then(Value::as_str)
+        != Some("tura_command_run_batch_admission_v1")
+    {
+        return Ok(None);
+    }
+    let command_id = command_result
+        .get("command_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "batch-unaccepted command omitted its exact command identity".to_string(),
+        })?;
+    let admission = output.get("batch_admission").ok_or_else(|| {
+        OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "batch-unaccepted command omitted durable admission bytes".to_string(),
+        }
+    })?;
+    let execution_id = admission
+        .get("execution_id")
+        .and_then(Value::as_str)
+        .filter(|execution_id| {
+            command_id == *execution_id
+                || command_id
+                    .strip_prefix(*execution_id)
+                    .is_some_and(|suffix| suffix.starts_with(':'))
+        })
+        .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "batch-unaccepted command changed its execution identity".to_string(),
+        })?;
+    let expected_path = command_receipt_directory(session_directory).join(format!(
+        "{}.batch-admission",
+        encode_command_receipt_identity(execution_id)
+    ));
+    let reported_path = output
+        .get("batch_admission_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "batch-unaccepted command omitted an absolute admission path".to_string(),
+        })?;
+    let expected_path = std::fs::canonicalize(&expected_path).map_err(|error| {
+        OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: format!("batch admission cannot be canonicalized: {error}"),
+        }
+    })?;
+    let reported_path = std::fs::canonicalize(&reported_path).map_err(|error| {
+        OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: format!("reported batch admission cannot be canonicalized: {error}"),
+        }
+    })?;
+    let receipt_root = std::fs::canonicalize(command_receipt_directory(session_directory))
+        .map_err(|error| OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: format!("command receipt directory is unavailable: {error}"),
+        })?;
+    if expected_path != reported_path || !reported_path.starts_with(&receipt_root) {
+        return Err(OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "batch-unaccepted command admission path changed".to_string(),
+        });
+    }
+    let bytes = std::fs::read(&reported_path).map_err(|error| {
+        OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: format!("durable batch admission read failed: {error}"),
+        }
+    })?;
+    let durable: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: format!("durable batch admission is invalid JSON: {error}"),
+        }
+    })?;
+    let call_ids = durable.get("call_ids").and_then(Value::as_array);
+    let accepted_call_ids = durable.get("accepted_call_ids").and_then(Value::as_array);
+    if durable != *admission
+        || durable.get("schema_version").and_then(Value::as_str)
+            != Some("tura_command_run_batch_admission_v1")
+        || durable.get("state").and_then(Value::as_str) != Some("finished")
+        || durable
+            .get("terminal_at_unix_ms")
+            .and_then(Value::as_u64)
+            .is_none()
+        || !call_ids.is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str() == Some(command_id))
+        })
+        || !accepted_call_ids.is_some_and(|values| {
+            values
+                .iter()
+                .all(|value| value.as_str() != Some(command_id))
+        })
+        || command_result.get("success").and_then(Value::as_bool) != Some(false)
+        || output.get("terminal_state").and_then(Value::as_str) != Some("not_started")
+        || output.get("outcome").and_then(Value::as_str) != Some("known_zero_mutation")
+        || output.get("claim_state").and_then(Value::as_str) != Some("absent")
+        || output.get("claim_identity").and_then(Value::as_str) != Some(command_id)
+        || output.get("process_state").and_then(Value::as_str) != Some("never_started")
+        || output.get("mutation_count").and_then(Value::as_u64) != Some(0)
+        || output.get("authority_effect").and_then(Value::as_str) != Some("none")
+        || output.get("delivery_state").and_then(Value::as_str)
+            != Some("reconstructed_from_durable_batch_admission")
+    {
+        return Err(OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "batch-unaccepted command zero-effect proof is invalid".to_string(),
+        });
+    }
+    let encoded_identity = encode_command_receipt_identity(command_id);
+    if receipt_root
+        .join(format!("{encoded_identity}.claim.json"))
+        .exists()
+        || receipt_root
+            .join(format!("{encoded_identity}.json"))
+            .exists()
+    {
+        return Err(OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "batch-unaccepted command unexpectedly acquired execution state".to_string(),
+        });
+    }
+    Ok(Some(CodexCommandReceiptReference {
+        path: reported_path,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    }))
 }
 
 fn validate_terminal_receipt(
@@ -3718,6 +4161,185 @@ mod interrupted_read_only_reconciliation_tests {
             "reconcile_required": reconcile_required,
             "replay_semantics": "durable_failed_command_reconstruction"
         })
+    }
+
+    fn command_run_observation() -> CodexCommandRunEffectObservation {
+        let execution_id = "runtime-test:call-batch";
+        CodexCommandRunEffectObservation {
+            runtime_id: "runtime-test".to_string(),
+            tool_call_id: "call-batch".to_string(),
+            execution_id: execution_id.to_string(),
+            commands: vec![
+                CodexCommandRunCommandObservation {
+                    command_type: "zsh".to_string(),
+                    enumerated_index: 0,
+                    effective_step: 1,
+                    binding_id: Some("accepted".to_string()),
+                    claim_identity: format!("{execution_id}:accepted"),
+                },
+                CodexCommandRunCommandObservation {
+                    command_type: "zsh".to_string(),
+                    enumerated_index: 1,
+                    effective_step: 1,
+                    binding_id: Some("unaccepted".to_string()),
+                    claim_identity: format!("{execution_id}:unaccepted"),
+                },
+            ],
+        }
+    }
+
+    fn write_command_run_batch_fixture(
+        root: &Path,
+        observation: &CodexCommandRunEffectObservation,
+    ) -> (PathBuf, Value) {
+        let directory = command_receipt_directory(root);
+        std::fs::create_dir_all(&directory).expect("receipt directory");
+        let accepted = &observation.commands[0];
+        let receipt = completed_terminal_receipt(&accepted.claim_identity);
+        let receipt_path = directory.join(format!(
+            "{}.json",
+            encode_command_receipt_identity(&accepted.claim_identity)
+        ));
+        std::fs::write(
+            &receipt_path,
+            serde_json::to_vec(&receipt).expect("receipt encode"),
+        )
+        .expect("receipt write");
+        let marker = json!({
+            "schema_version": "tura_command_run_batch_admission_v1",
+            "execution_id": observation.execution_id,
+            "call_ids": observation
+                .commands
+                .iter()
+                .map(|command| command.claim_identity.clone())
+                .collect::<Vec<_>>(),
+            "accepted_call_ids": [accepted.claim_identity.clone()],
+            "state": "finished",
+            "accepted_claim_count": 0,
+            "zero_effect_proven": false,
+            "terminal_at_unix_ms": 12345,
+        });
+        let marker_path = directory.join(format!(
+            "{}.batch-admission",
+            encode_command_receipt_identity(&observation.execution_id)
+        ));
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker).expect("marker encode"),
+        )
+        .expect("marker write");
+        (receipt_path, receipt)
+    }
+
+    fn partial_command_run_response(receipt_path: &Path, receipt: &Value) -> Value {
+        json!({
+            "contentItems": [{
+                "type": "inputText",
+                "text": json!({"results": [{
+                    "command_type": "zsh",
+                    "id": "accepted",
+                    "step": 1,
+                    "success": true,
+                    "output": {
+                        "exit_code": 0,
+                        "terminal_receipt": receipt,
+                        "terminal_receipt_path": receipt_path,
+                    }
+                }, {
+                    "command_type": "zsh",
+                    "id": "unaccepted",
+                    "step": 1,
+                    "success": false,
+                    "error": "command was not admitted"
+                }]}).to_string()
+            }],
+            "success": true
+        })
+    }
+
+    #[test]
+    fn batch_unaccepted_command_replays_from_durable_admission_without_receipt() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let observation = command_run_observation();
+        let (receipt_path, receipt) = write_command_run_batch_fixture(root.path(), &observation);
+        let raw = partial_command_run_response(&receipt_path, &receipt);
+
+        let normalized =
+            normalize_command_run_response_from_batch_admission(root.path(), 0, &observation, &raw)
+                .expect("batch admission normalizes the unaccepted command");
+        let evidence = extract_command_receipt_references(root.path(), 0, &normalized)
+            .expect("normalized response is independently replayable");
+        assert!(evidence.replayable);
+        assert_eq!(evidence.references.len(), 2);
+        let text = normalized["contentItems"][0]["text"]
+            .as_str()
+            .expect("normalized response text");
+        let output: Value = serde_json::from_str(text).expect("normalized response JSON");
+        assert_eq!(
+            output["results"][1]["output"]["delivery_state"],
+            "reconstructed_from_durable_batch_admission"
+        );
+        assert_eq!(
+            output["results"][1]["output"]["terminal_state"],
+            "not_started"
+        );
+
+        let mut ledger = CodexExecutionLedger {
+            schema_version: CODEX_EXECUTION_LEDGER_SCHEMA_VERSION,
+            tura_session_id: "tura-test".to_string(),
+            canonical_input_sha256: "a".repeat(64),
+            runtime_ids: vec!["runtime-test".to_string()],
+            effects: vec![CodexObservedToolEffect {
+                request_sha256: "request-sha".to_string(),
+                runtime_id: Some("runtime-test".to_string()),
+                request_params: Some(json!({
+                    "callId": "call-batch",
+                    "tool": "command_run",
+                    "arguments": {"commands": []}
+                })),
+                original_request_id: json!("call-batch"),
+                state: CodexObservedToolEffectState::Observed,
+                response: None,
+                command_receipts: Vec::new(),
+                replay_request_id: None,
+                read_only_observation: None,
+                command_run_observation: Some(observation),
+            }],
+            interrupted_recovery: None,
+            terminal_status: None,
+            commander_convergence_proof: None,
+            commander_convergence_final_assistant: None,
+        };
+        let mut handler = IdentityOnlyVerifier::default();
+        let mut request_handler = Some(&mut handler as &mut dyn OfficialCodexServerRequestHandler);
+        reconcile_durable_command_run_effects(root.path(), &mut ledger, &mut request_handler)
+            .expect("interrupted command_run reconciles without reexecution");
+        assert_eq!(
+            ledger.effects[0].state,
+            CodexObservedToolEffectState::Reconciled
+        );
+        assert_eq!(ledger.effects[0].command_receipts.len(), 2);
+        assert_eq!(handler.handle_calls, 0);
+    }
+
+    #[test]
+    fn batch_accepted_command_without_terminal_receipt_remains_fail_closed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let observation = command_run_observation();
+        let (receipt_path, receipt) = write_command_run_batch_fixture(root.path(), &observation);
+        std::fs::remove_file(&receipt_path).expect("remove accepted receipt");
+        let raw = partial_command_run_response(&receipt_path, &receipt);
+        let error =
+            normalize_command_run_response_from_batch_admission(root.path(), 0, &observation, &raw)
+                .and_then(|normalized| {
+                    extract_command_receipt_references(root.path(), 0, &normalized)
+                })
+                .expect_err("accepted command without durable receipt must stay uncertain");
+        assert!(
+            error
+                .to_string()
+                .contains("terminal receipt is unavailable")
+        );
     }
 
     fn pre_execution_terminal_receipt(call_id: &str) -> Value {
