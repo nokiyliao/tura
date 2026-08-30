@@ -3960,7 +3960,7 @@ mod tests {
         let request = router_contract::RegisterChildSessionRequest {
             parent_session_id: "commander-exact".to_string(),
             parent_mission_revision_sha256: "a".repeat(64),
-            commander_thread_id: None,
+            commander_thread_id: Some("commander-thread-exact".to_string()),
             child_session_id: "child-exact".to_string(),
             child_runtime_id: "runtime-exact".to_string(),
             child_transaction_id: "transaction-exact".to_string(),

@@ -140,12 +140,14 @@ impl RegisterChildSessionRequest {
                 return Err(format!("CHILD_ADMISSION_IDENTITY_MISSING:{name}"));
             }
         }
-        if self
-            .commander_thread_id
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
-            return Err("CHILD_ADMISSION_IDENTITY_INVALID:commander_thread_id".to_string());
+        match self.commander_thread_id.as_deref() {
+            None => {
+                return Err("CHILD_ADMISSION_IDENTITY_MISSING:commander_thread_id".to_string());
+            }
+            Some(value) if value.trim().is_empty() => {
+                return Err("CHILD_ADMISSION_IDENTITY_INVALID:commander_thread_id".to_string());
+            }
+            Some(_) => {}
         }
         for (name, value) in [
             (
@@ -393,7 +395,7 @@ mod tests {
         RegisterChildSessionRequest {
             parent_session_id: "parent-1".to_string(),
             parent_mission_revision_sha256: "a".repeat(64),
-            commander_thread_id: None,
+            commander_thread_id: Some("commander-thread-1".to_string()),
             child_session_id: "child-1".to_string(),
             child_runtime_id: "runtime-1".to_string(),
             child_transaction_id: "callback-1".to_string(),
@@ -420,6 +422,20 @@ mod tests {
 
     #[test]
     fn child_admission_contract_rejects_missing_and_changed_callback_identity() {
+        let mut missing_commander_thread = child_request();
+        missing_commander_thread.commander_thread_id = None;
+        assert_eq!(
+            missing_commander_thread.validate().unwrap_err(),
+            "CHILD_ADMISSION_IDENTITY_MISSING:commander_thread_id"
+        );
+
+        let mut blank_commander_thread = child_request();
+        blank_commander_thread.commander_thread_id = Some("   ".to_string());
+        assert_eq!(
+            blank_commander_thread.validate().unwrap_err(),
+            "CHILD_ADMISSION_IDENTITY_INVALID:commander_thread_id"
+        );
+
         let mut missing_parent = child_request();
         missing_parent.parent_session_id.clear();
         assert_eq!(

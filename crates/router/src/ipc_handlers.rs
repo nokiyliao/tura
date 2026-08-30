@@ -319,6 +319,7 @@ mod tests {
             payload: json!({
                 "parent_session_id": "commander-1",
                 "parent_mission_revision_sha256": "a".repeat(64),
+                "commander_thread_id": "commander-thread-1",
                 "child_session_id": "child-1",
                 "child_runtime_id": "runtime-child-1",
                 "child_transaction_id": "transaction-child-1",
@@ -345,6 +346,15 @@ mod tests {
         let mut changed_effect = public_child;
         changed_effect.payload["effect_id"] = json!("foreign.message");
         assert_eq!(enqueue_turn_identity(&changed_effect), None);
+
+        let mut missing_commander_thread = changed_effect.clone();
+        missing_commander_thread.payload["effect_id"] = json!("runtime-child-1.message");
+        missing_commander_thread
+            .payload
+            .as_object_mut()
+            .expect("public child payload")
+            .remove("commander_thread_id");
+        assert_eq!(enqueue_turn_identity(&missing_commander_thread), None);
 
         let blank_session = IpcRequest {
             method: "execution.enqueue_turn".to_string(),

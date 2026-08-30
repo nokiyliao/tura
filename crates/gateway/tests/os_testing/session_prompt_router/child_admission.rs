@@ -7,6 +7,7 @@ fn admission_request() -> Value {
     json!({
         "parent_session_id": "parent-1",
         "parent_mission_revision_sha256": "a".repeat(64),
+        "commander_thread_id": "commander-thread-1",
         "child_session_id": "child-1",
         "child_runtime_id": "runtime-1",
         "child_transaction_id": "callback-1",
@@ -84,6 +85,19 @@ async fn public_gateway_child_route_forwards_exact_contract_and_replay() -> Resu
     missing_effect["effect_id"] = Value::String(String::new());
     let (status, _) = post_admission("parent-1", &missing_effect).await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let mut missing_commander_thread = admission_request();
+    missing_commander_thread
+        .as_object_mut()
+        .expect("admission object")
+        .remove("commander_thread_id");
+    let (status, body) = post_admission("parent-1", &missing_commander_thread).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let mut blank_commander_thread = admission_request();
+    blank_commander_thread["commander_thread_id"] = Value::String("   ".to_string());
+    let (status, body) = post_admission("parent-1", &blank_commander_thread).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
     drop(router);
     Ok(())
