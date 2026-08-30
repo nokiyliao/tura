@@ -4,8 +4,8 @@ use crate::{SessionLogStore, file_queue, ipc};
 use session_log_contract::client::{call_service, service_is_running};
 use session_log_contract::{
     DeleteSessionRequest, DeleteWorkspaceRequest, GetSessionRequest, ListRuntimeLocationsRequest,
-    ListSessionRecordsRequest, ListSessionsRequest, MarkSessionInterruptedRequest,
-    SessionLogCommand, SessionLogResponse,
+    ListSessionRecordsRequest, ListSessionsRequest, MaintainRuntimeLocationsRequest,
+    MarkSessionInterruptedRequest, SessionLogCommand, SessionLogResponse,
 };
 
 /// Developer query CLI for the session DB.
@@ -27,6 +27,9 @@ pub fn run() -> anyhow::Result<()> {
         "list-runtime-locations" => {
             SessionLogCommand::ListRuntimeLocations(read_json::<ListRuntimeLocationsRequest>()?)
         }
+        "maintain-runtime-locations" => SessionLogCommand::MaintainRuntimeLocations(read_json::<
+            MaintainRuntimeLocationsRequest,
+        >()?),
         "list-sessions" => SessionLogCommand::ListSessions(read_json::<ListSessionsRequest>()?),
         "list-session-records" => {
             SessionLogCommand::ListSessionRecords(read_json::<ListSessionRecordsRequest>()?)

@@ -220,6 +220,11 @@ pub(crate) fn execute_command_with_feed(
             let (page, locations) = store.list_runtime_locations(payload)?;
             SessionLogResponse::RuntimeLocations { page, locations }
         }
+        SessionLogCommand::MaintainRuntimeLocations(payload) => {
+            SessionLogResponse::RuntimeLocationsMaintained {
+                receipt: store.maintain_runtime_locations(payload)?,
+            }
+        }
         SessionLogCommand::ListSessions(payload) => {
             let (page, sessions) = store.list_sessions(payload)?;
             SessionLogResponse::Sessions { page, sessions }

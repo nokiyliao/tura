@@ -812,6 +812,40 @@ pub struct DeleteWorkspaceRequest {
     pub workspace: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeLocationMaintenanceMode {
+    DryRun,
+    Apply,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintainRuntimeLocationsRequest {
+    pub mode: RuntimeLocationMaintenanceMode,
+    #[serde(default = "default_page_size")]
+    pub page_size: u64,
+    #[serde(default)]
+    pub expected_dry_run_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLocationMaintenanceReceipt {
+    pub schema_version: String,
+    pub mode: RuntimeLocationMaintenanceMode,
+    pub canonical_input_sha256: String,
+    pub pre_incomplete_count: u64,
+    pub post_incomplete_count: u64,
+    pub backfilled_count: u64,
+    pub deleted_count: u64,
+    pub mutation_count: u64,
+    pub active_lease_count: u64,
+    pub dispositions: std::collections::BTreeMap<String, u64>,
+    pub replayed_receipt: bool,
+    pub manifest_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionLogCommand {
@@ -829,6 +863,7 @@ pub enum SessionLogCommand {
     ReplayRuntime(ReplayRuntimeRequest),
     GetRuntimeLease(GetRuntimeLeaseRequest),
     ListRuntimeLocations(ListRuntimeLocationsRequest),
+    MaintainRuntimeLocations(MaintainRuntimeLocationsRequest),
     RecoveryCloseRuntime(RecoveryCloseRuntimeRequest),
     PersistSessionDelta(Box<PersistSessionDeltaRequest>),
     ReadContextSlice(ReadContextSliceRequest),
@@ -887,6 +922,9 @@ pub enum SessionLogResponse {
     RuntimeLocations {
         page: Page,
         locations: Vec<RuntimeLocation>,
+    },
+    RuntimeLocationsMaintained {
+        receipt: RuntimeLocationMaintenanceReceipt,
     },
     RuntimeRecoveryClosed {
         result: RecoveryCloseRuntimeOutcome,

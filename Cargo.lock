@@ -4780,6 +4780,7 @@ dependencies = [
  "serde",
  "serde_json",
  "session_log_contract",
+ "sha2",
  "sysinfo",
  "tempfile",
  "tracing",

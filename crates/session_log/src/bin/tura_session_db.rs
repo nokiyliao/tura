@@ -5,6 +5,9 @@
 //! the embedded SQLite owner.
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args_os().len() > 1 {
+        return session_log::cli::run();
+    }
     tura_path::process_hardening::harden_current_process("session_db");
     // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
     #[allow(

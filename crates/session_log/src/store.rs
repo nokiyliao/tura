@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 mod connection;
 mod feed;
 mod helpers;
+mod maintenance;
 mod payload;
 mod read;
 mod runtime_events;
