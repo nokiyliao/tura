@@ -5,12 +5,15 @@ import { fileURLToPath } from "node:url";
 import { resolveGatewayUrl, gatewayUrlIsExplicit, resolveCwd } from "./gateway/directory.js";
 import { connectGatewayAvailable } from "./gateway/autostart.js";
 import {
+  ChildRequestAuthorityError,
+  ChildRequestValidationError,
   CliUsageError,
   type CliContext,
   type ColorMode,
   type DisplayMode,
   type OutputMode,
 } from "./types/common.js";
+import { registerChildSessionRequest } from "./types/session.js";
 import { runPrompt } from "./commands/run.js";
 import { resumeCommand } from "./commands/resume.js";
 import { sessionCommand } from "./commands/session.js";
@@ -227,6 +230,9 @@ export function parseRun(
   rootJson: boolean,
   commandRunShellOverride?: CommandRunShell,
 ): Parameters<typeof runPrompt>[1] {
+  if (args.some((arg) => arg === "--child-request" || arg.startsWith("--child-request="))) {
+    return parseChildRun(args, rootJson, commandRunShellOverride);
+  }
   let sessionID: string | undefined;
   let model: string | undefined;
   let agent: string | undefined;
@@ -278,7 +284,10 @@ export function parseRun(
     else if (arg === "--jspace-contract")
       jspaceContract = readJsonArgument(args[++index], "--jspace-contract");
     else if (arg.startsWith("--jspace-contract="))
-      jspaceContract = readJsonArgument(arg.slice("--jspace-contract=".length), "--jspace-contract");
+      jspaceContract = readJsonArgument(
+        arg.slice("--jspace-contract=".length),
+        "--jspace-contract",
+      );
     else if (arg === "--task-context-capsule")
       taskContextCapsule = readJsonArgument(args[++index], "--task-context-capsule");
     else if (arg.startsWith("--task-context-capsule="))
@@ -367,6 +376,54 @@ export function parseRun(
     lastMessageFile,
     source: "cli",
   };
+}
+
+function parseChildRun(
+  args: string[],
+  rootJson: boolean,
+  commandRunShellOverride?: CommandRunShell,
+): Parameters<typeof runPrompt>[1] {
+  if (commandRunShellOverride) throw new ChildRequestAuthorityError("command_run_shell");
+  let childRequest: ReturnType<typeof registerChildSessionRequest> | undefined;
+  let output: OutputMode = rootJson ? "json" : "text";
+  let stream = true;
+  let timeoutSec = 600;
+  let lastMessageFile: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--child-request" || arg.startsWith("--child-request=")) {
+      if (childRequest) throw new ChildRequestAuthorityError("duplicate_child_request");
+      const path = arg === "--child-request" ? args[++index] : arg.slice("--child-request=".length);
+      childRequest = readChildRequestArgument(path);
+    } else if (arg === "--output") output = parseOutput(args[++index]);
+    else if (arg === "--json") output = "json";
+    else if (arg === "--stream") stream = true;
+    else if (arg === "--no-stream") stream = false;
+    else if (arg === "--timeout") timeoutSec = Number(args[++index]);
+    else if (arg === "--last-message-file") lastMessageFile = args[++index];
+    else throw new ChildRequestAuthorityError(arg);
+  }
+  if (!childRequest) throw new ChildRequestValidationError("file_missing");
+  return {
+    childRequest,
+    output,
+    stream,
+    timeoutSec,
+    lastMessageFile,
+    source: "cli",
+  };
+}
+
+function readChildRequestArgument(
+  path: string | undefined,
+): ReturnType<typeof registerChildSessionRequest> {
+  if (!path) throw new ChildRequestValidationError("file_missing");
+  try {
+    return registerChildSessionRequest(JSON.parse(readFileSync(resolve(path), "utf8")));
+  } catch (error) {
+    if (error instanceof ChildRequestValidationError) throw error;
+    throw new ChildRequestValidationError(`json_file:${path}:${String(error)}`);
+  }
 }
 
 function readJsonArgument(path: string | undefined, flag: string): unknown {

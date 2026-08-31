@@ -41,3 +41,32 @@ export class RuntimeTerminalizationError extends Error {
     super(`TURA_RUNTIME_TERMINAL_FAILURE: session=${sessionID}`);
   }
 }
+
+export class ChildRequestValidationError extends CliUsageError {
+  code = "TURA_CHILD_REQUEST_INVALID";
+
+  constructor(detail: string) {
+    super(
+      `${detail.startsWith("TURA_CHILD_REQUEST_INVALID") ? detail : `TURA_CHILD_REQUEST_INVALID:${detail}`}`,
+    );
+  }
+}
+
+export class ChildRequestAuthorityError extends CliUsageError {
+  code = "TURA_CHILD_REQUEST_AUTHORITY_CONFLICT";
+
+  constructor(source: string) {
+    super(`TURA_CHILD_REQUEST_AUTHORITY_CONFLICT:${source}`);
+  }
+}
+
+export class ChildAdmissionIdentityError extends Error {
+  code = "TURA_CHILD_ADMISSION_IDENTITY_MISMATCH";
+  exitCode = 1;
+
+  constructor(field: string, expected: string, actual: unknown) {
+    super(
+      `TURA_CHILD_ADMISSION_IDENTITY_MISMATCH:${field}:expected=${expected},actual=${String(actual)}`,
+    );
+  }
+}

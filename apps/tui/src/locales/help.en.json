@@ -59,6 +59,7 @@
     "title": "Run a prompt",
     "usage": [
       "tura [OPTIONS] run [PROMPT...] [RUN_OPTIONS]",
+      "tura [OPTIONS] run --child-request FILE [RUN_OPTIONS]",
       "tura [OPTIONS] bash|zsh|shel [PROMPT...] [RUN_OPTIONS]"
     ],
     "options": [
@@ -73,6 +74,18 @@
       {
         "flags": "--bash, --zsh, --shel",
         "summary": "force the command-run shell surface for this prompt"
+      },
+      {
+        "flags": "--jspace-contract FILE",
+        "summary": "load the J-Space contract JSON for a normal prompt"
+      },
+      {
+        "flags": "--task-context-capsule FILE",
+        "summary": "load the task-context capsule JSON for a normal prompt"
+      },
+      {
+        "flags": "--child-request FILE",
+        "summary": "submit one exact RegisterChildSessionRequest JSON object; prompt and runtime overrides are forbidden"
       },
       { "flags": "--output text|json|ndjson", "summary": "output format" },
       {

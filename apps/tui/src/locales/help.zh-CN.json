@@ -56,6 +56,7 @@
     "title": "运行提示",
     "usage": [
       "tura [OPTIONS] run [PROMPT...] [RUN_OPTIONS]",
+      "tura [OPTIONS] run --child-request FILE [RUN_OPTIONS]",
       "tura [OPTIONS] bash|zsh|shel [PROMPT...] [RUN_OPTIONS]"
     ],
     "options": [
@@ -68,6 +69,12 @@
       { "flags": "--model-acceleration", "summary": "启用优先模式路由" },
       { "flags": "--no-model-acceleration", "summary": "禁用优先模式路由" },
       { "flags": "--bash, --zsh, --shel", "summary": "覆盖本次提示使用的命令运行 shell 入口" },
+      { "flags": "--jspace-contract FILE", "summary": "为一般提示加载 J-Space contract JSON" },
+      { "flags": "--task-context-capsule FILE", "summary": "为一般提示加载 task-context capsule JSON" },
+      {
+        "flags": "--child-request FILE",
+        "summary": "提交一个精确的 RegisterChildSessionRequest JSON；禁止同时提供提示或运行时覆盖"
+      },
       { "flags": "--output text|json|ndjson", "summary": "输出格式" },
       { "flags": "--stream, --no-stream", "summary": "流式监听网关事件或轮询完成" },
       { "flags": "--timeout SEC", "summary": "轮次中止前的超时秒数（默认 600）" },

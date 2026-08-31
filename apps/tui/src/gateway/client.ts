@@ -39,6 +39,8 @@ import type {
   ForkSessionRequest,
   Message,
   PromptPayload,
+  RegisterChildSessionRequest,
+  RegisterChildSessionResponse,
   Session,
 } from "../types/session.js";
 import { defaultGatewayUrl } from "./active-url.js";
@@ -180,6 +182,13 @@ export class GatewayClient {
       copy_context: true,
       ...payload,
     });
+  }
+
+  async registerChildSession(
+    parentSessionID: string,
+    request: RegisterChildSessionRequest,
+  ): Promise<RegisterChildSessionResponse> {
+    return this.post(`/session/${encodeURIComponent(parentSessionID)}/children`, request);
   }
 
   async getSession(sessionID: string): Promise<Session> {

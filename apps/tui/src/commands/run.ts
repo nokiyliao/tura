@@ -5,6 +5,7 @@ import { sameDirectory } from "../gateway/directory.js";
 import { normalizeEvent } from "../gateway/events.js";
 import {
   GatewayUnavailableError,
+  ChildAdmissionIdentityError,
   RuntimeTerminalizationError,
   type CliContext,
   type OutputMode,
@@ -12,7 +13,10 @@ import {
 import {
   hasUserFacingAssistantText,
   sessionStatusText,
+  type ChildAdmissionReceipt,
   type PromptPayload,
+  type RegisterChildSessionRequest,
+  type RegisterChildSessionResponse,
   type RunResult,
   type Session,
 } from "../types/session.js";
@@ -26,7 +30,8 @@ import type { CommandRunShell } from "./config-values.js";
 const RUN_COMPLETION_STABLE_MS = 1000;
 
 export interface RunOptions {
-  prompt: string;
+  prompt?: string;
+  childRequest?: RegisterChildSessionRequest;
   sessionID?: string;
   model?: string;
   agent?: string;
@@ -47,6 +52,7 @@ export interface RunOptions {
 }
 
 export async function runPrompt(context: CliContext, options: RunOptions): Promise<RunResult> {
+  if (options.childRequest) return runChildRequest(context, options, options.childRequest);
   return withCommandRunShellEnv(options.commandRunShell, () =>
     runPromptWithShellEnv(context, options),
   );
@@ -84,7 +90,8 @@ async function runPromptWithShellEnv(context: CliContext, options: RunOptions): 
       });
   const initialMessages = await client.listMessages(session.id).catch(() => []);
   const initialCount = initialMessages.length;
-  const payload = promptPayload(options.prompt, {
+  const prompt = options.prompt ?? "";
+  const payload = promptPayload(prompt, {
     source: options.source,
     model: options.model ?? session.model ?? undefined,
     agent: options.agent ?? session.agent ?? undefined,
@@ -99,7 +106,7 @@ async function runPromptWithShellEnv(context: CliContext, options: RunOptions): 
   const human = options.output === "text" ? new HumanOutput(context.color) : undefined;
   const ndjson = options.output === "ndjson" ? new NdjsonOutput() : undefined;
   human?.header(session, context.cwd);
-  ndjson?.started({ sessionID: session.id, prompt: options.prompt });
+  ndjson?.started({ sessionID: session.id, prompt });
   await client.sendPromptAsync(session.id, payload);
 
   let result: RunResult;
@@ -118,6 +125,83 @@ async function runPromptWithShellEnv(context: CliContext, options: RunOptions): 
   if (options.output === "text") human?.final(result);
   throwIfCliRunFailed(result, options.source);
   return result;
+}
+
+async function runChildRequest(
+  context: CliContext,
+  options: RunOptions,
+  request: RegisterChildSessionRequest,
+): Promise<RunResult> {
+  const client = new GatewayClient({
+    baseUrl: context.gatewayUrl,
+    directory: request.session_directory,
+    verbose: context.verbose,
+  });
+  try {
+    await client.health();
+    await client.syncWorkspace();
+  } catch (error) {
+    throw new GatewayUnavailableError(userFacingError(error));
+  }
+
+  const response = await client.registerChildSession(request.parent_session_id, request);
+  const receipt = childAdmissionReceipt(request, response);
+  const session = await client.getSession(response.child_session_id);
+  const human = options.output === "text" ? new HumanOutput(context.color) : undefined;
+  const ndjson = options.output === "ndjson" ? new NdjsonOutput() : undefined;
+  human?.header(session, session.directory ?? request.session_directory);
+  ndjson?.childAdmitted(receipt);
+
+  let result: RunResult;
+  try {
+    result = options.stream
+      ? await waitWithEvents(client, session, 0, options.timeoutSec, human, ndjson)
+      : await waitByPolling(client, session, 0, options.timeoutSec);
+  } catch (error) {
+    ndjson?.failed(session.id, error);
+    throw error;
+  }
+  result = { ...result, childAdmission: receipt };
+  await writeLastMessage(options.lastMessageFile, result.finalText);
+  if (options.output === "json") printRunJson(result);
+  if (options.output === "ndjson") ndjson?.completed(result);
+  if (options.output === "text") human?.final(result);
+  throwIfCliRunFailed(result, options.source);
+  return result;
+}
+
+export function childAdmissionReceipt(
+  request: RegisterChildSessionRequest,
+  response: RegisterChildSessionResponse,
+): ChildAdmissionReceipt {
+  if (response.outcome !== "admitted" && response.outcome !== "already_admitted") {
+    throw new ChildAdmissionIdentityError("outcome", "admitted|already_admitted", response.outcome);
+  }
+  const matches = {
+    parent_session_id: request.parent_session_id,
+    child_session_id: request.child_session_id,
+    child_runtime_id: request.child_runtime_id,
+    child_transaction_id: request.child_transaction_id,
+    callback_request_id: request.callback_request_id,
+    effect_id: request.effect_id,
+  } as const;
+  for (const [field, expected] of Object.entries(matches)) {
+    const actual = response[field as keyof RegisterChildSessionResponse];
+    if (actual !== expected) throw new ChildAdmissionIdentityError(field, expected, actual);
+  }
+  return {
+    outcome: response.outcome,
+    parent_session_id: response.parent_session_id,
+    parent_mission_revision_sha256: request.parent_mission_revision_sha256,
+    commander_thread_id: request.commander_thread_id,
+    child_session_id: response.child_session_id,
+    child_runtime_id: response.child_runtime_id,
+    child_lease_id: request.child_lease_id,
+    child_transaction_id: response.child_transaction_id,
+    callback_request_id: response.callback_request_id,
+    effect_id: response.effect_id,
+    delegated_input_sha256: request.delegated_input_sha256,
+  };
 }
 
 export function throwIfCliRunFailed(result: RunResult, source: RunOptions["source"]): void {

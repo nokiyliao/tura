@@ -1,13 +1,26 @@
 import assert from "node:assert/strict";
+import http from "node:http";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { GatewayClient } from "../../../src/gateway/client.js";
 import {
+  childAdmissionReceipt,
   resolveExistingRunSession,
+  runPrompt,
   throwIfCliRunFailed,
   waitByPolling,
   waitWithEvents,
 } from "../../../src/commands/run.js";
-import type { Message, RunResult, Session } from "../../../src/types/session.js";
+import type { CliContext } from "../../../src/types/common.js";
+import type {
+  Message,
+  RegisterChildSessionRequest,
+  RegisterChildSessionResponse,
+  RunResult,
+  Session,
+} from "../../../src/types/session.js";
 
 function runResult(status: RunResult["status"]): RunResult {
   return {
@@ -210,3 +223,192 @@ test("CLI surfaces durable terminal failures as a typed nonzero result", () => {
   assert.doesNotThrow(() => throwIfCliRunFailed(runResult("detached"), "cli"));
   assert.doesNotThrow(() => throwIfCliRunFailed(runResult("failed"), "tui"));
 });
+
+test("child run performs one admission mutation and preserves terminal JSON semantics", async () => {
+  const request = childRequest();
+  const response = childResponse(request);
+  const mutations = { child: 0, create: 0, fork: 0, prompt: 0 };
+  const bodies: unknown[] = [];
+  const directory = await mkdtemp(join(tmpdir(), "tura-child-run-"));
+  const lastMessageFile = join(directory, "last.txt");
+
+  await withServer(
+    async (req, res) => {
+      const path = new URL(req.url ?? "/", "http://gateway").pathname;
+      if (req.method === "GET" && path === "/global/health") {
+        return sendJson(res, { healthy: true, version: "test" });
+      }
+      if (req.method === "GET" && path === "/project/current") return sendJson(res, {});
+      if (req.method === "POST" && path === "/session/parent%2Fsession/children") {
+        mutations.child += 1;
+        bodies.push(await readBody(req));
+        return sendJson(res, response);
+      }
+      if (req.method === "POST" && path === "/session") mutations.create += 1;
+      if (req.method === "POST" && path.endsWith("/fork")) mutations.fork += 1;
+      if (req.method === "POST" && path.endsWith("/prompt_async")) mutations.prompt += 1;
+      if (req.method === "GET" && path === "/session/child-1") {
+        return sendJson(res, {
+          id: "child-1",
+          status: "idle",
+          directory: request.session_directory,
+        });
+      }
+      if (req.method === "GET" && path === "/session/child-1/message") {
+        return sendJson(res, [
+          {
+            id: "assistant-final",
+            role: "assistant",
+            updated_at: 2,
+            parts: [{ id: "part-final", type: "text", text: "CHILD_FINAL" }],
+          },
+        ]);
+      }
+      sendJson(res, { unexpected: `${req.method} ${path}` }, 404);
+    },
+    async (baseUrl) => {
+      const output = await captureStdout(async () =>
+        runPrompt(cliContext(baseUrl), {
+          childRequest: request,
+          output: "json",
+          stream: false,
+          timeoutSec: 3,
+          lastMessageFile,
+          source: "cli",
+        }),
+      );
+      const result = JSON.parse(output) as RunResult;
+      assert.equal(result.status, "completed");
+      assert.equal(result.sessionID, request.child_session_id);
+      assert.equal(result.finalText, "CHILD_FINAL");
+      assert.deepEqual(result.childAdmission, childAdmissionReceipt(request, response));
+    },
+  );
+
+  assert.deepEqual(mutations, { child: 1, create: 0, fork: 0, prompt: 0 });
+  assert.deepEqual(bodies, [request]);
+  assert.equal(await readFile(lastMessageFile, "utf8"), "CHILD_FINAL");
+});
+
+test("child admission response identity drift fails closed", () => {
+  const request = childRequest();
+  for (const field of [
+    "parent_session_id",
+    "child_session_id",
+    "child_runtime_id",
+    "child_transaction_id",
+    "callback_request_id",
+    "effect_id",
+  ] as const) {
+    const response = childResponse(request);
+    response[field] = "drift";
+    assert.throws(
+      () => childAdmissionReceipt(request, response),
+      new RegExp(`TURA_CHILD_ADMISSION_IDENTITY_MISMATCH:${field}`),
+    );
+  }
+});
+
+function childRequest(): RegisterChildSessionRequest {
+  return {
+    parent_session_id: "parent/session",
+    parent_mission_revision_sha256: "a".repeat(64),
+    commander_thread_id: "thread-1",
+    child_session_id: "child-1",
+    child_runtime_id: "runtime-1",
+    child_transaction_id: "transaction-1",
+    child_lease_id: "lease-1",
+    callback_request_id: "transaction-1",
+    effect_id: "runtime-1.message",
+    delegated_input_sha256: "b".repeat(64),
+    session_directory: "/workspace",
+    session_name: "Delegated child",
+    created_at_ms: 1,
+    execution_payload: {
+      prompt: "delegated work",
+      model: "openai/gpt-test",
+      agent: "balanced",
+      jspace_contract: { semantic_sha256: "c".repeat(64) },
+      task_context_capsule: { semantic_sha256: "d".repeat(64) },
+    },
+  };
+}
+
+function childResponse(request: RegisterChildSessionRequest): RegisterChildSessionResponse {
+  return {
+    outcome: "admitted",
+    parent_session_id: request.parent_session_id,
+    child_session_id: request.child_session_id,
+    child_runtime_id: request.child_runtime_id,
+    child_transaction_id: request.child_transaction_id,
+    callback_request_id: request.callback_request_id,
+    effect_id: request.effect_id,
+  };
+}
+
+function cliContext(gatewayUrl: string): CliContext {
+  return {
+    gatewayUrl,
+    gatewayUrlExplicit: true,
+    cwd: "/ignored-by-child-mode",
+    json: false,
+    color: "never",
+    display: "plain",
+    verbose: false,
+    mock: false,
+    dev: false,
+  };
+}
+
+async function withServer(
+  handler: (req: http.IncomingMessage, res: http.ServerResponse) => void | Promise<void>,
+  callback: (baseUrl: string) => Promise<void>,
+): Promise<void> {
+  const server = http.createServer((req, res) => void handler(req, res));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    await callback(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+}
+
+function sendJson(res: http.ServerResponse, value: unknown, status = 200): void {
+  const body = JSON.stringify(value);
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function readBody(req: http.IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("error", reject);
+    req.on("end", () => resolve(body ? JSON.parse(body) : undefined));
+  });
+}
+
+async function captureStdout(callback: () => Promise<unknown>): Promise<string> {
+  const original = process.stdout.write;
+  let output = "";
+  process.stdout.write = ((chunk: Uint8Array | string) => {
+    output += chunk.toString();
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    await callback();
+    return output;
+  } finally {
+    process.stdout.write = original;
+  }
+}

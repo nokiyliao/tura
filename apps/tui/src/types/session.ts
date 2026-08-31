@@ -1,4 +1,4 @@
-import type { JsonObject } from "./common.js";
+import { ChildRequestValidationError, type JsonObject } from "./common.js";
 import { t } from "../i18n.js";
 
 export type SessionStatusValue = "idle" | "busy" | "error";
@@ -94,6 +94,47 @@ export interface ForkSessionRequest {
   copy_context?: boolean;
 }
 
+export interface RegisterChildSessionRequest {
+  parent_session_id: string;
+  parent_mission_revision_sha256: string;
+  commander_thread_id: string;
+  child_session_id: string;
+  child_runtime_id: string;
+  child_transaction_id: string;
+  child_lease_id: string;
+  callback_request_id: string;
+  effect_id: string;
+  delegated_input_sha256: string;
+  session_directory: string;
+  session_name: string;
+  created_at_ms: number;
+  execution_payload: JsonObject;
+}
+
+export interface RegisterChildSessionResponse {
+  outcome: "admitted" | "already_admitted";
+  parent_session_id: string;
+  child_session_id: string;
+  child_runtime_id: string;
+  child_transaction_id: string;
+  callback_request_id: string;
+  effect_id: string;
+}
+
+export interface ChildAdmissionReceipt {
+  outcome: RegisterChildSessionResponse["outcome"];
+  parent_session_id: string;
+  parent_mission_revision_sha256: string;
+  commander_thread_id: string;
+  child_session_id: string;
+  child_runtime_id: string;
+  child_lease_id: string;
+  child_transaction_id: string;
+  callback_request_id: string;
+  effect_id: string;
+  delegated_input_sha256: string;
+}
+
 export interface PromptPayload {
   messageID: string;
   parts: Array<{ id: string; type: "text"; text: string }>;
@@ -114,6 +155,7 @@ export interface RunResult {
   messages: Message[];
   usage: unknown | null;
   metadata: RunResultMetadata;
+  childAdmission?: ChildAdmissionReceipt;
 }
 
 export interface RunResultMetadata {
@@ -125,6 +167,63 @@ export interface RunResultMetadata {
   failed_commands: number;
   tps: number;
   turns: number;
+}
+
+const CHILD_REQUEST_FIELDS = [
+  "parent_session_id",
+  "parent_mission_revision_sha256",
+  "commander_thread_id",
+  "child_session_id",
+  "child_runtime_id",
+  "child_transaction_id",
+  "child_lease_id",
+  "callback_request_id",
+  "effect_id",
+  "delegated_input_sha256",
+  "session_directory",
+  "session_name",
+  "created_at_ms",
+  "execution_payload",
+] as const;
+
+export function registerChildSessionRequest(value: unknown): RegisterChildSessionRequest {
+  const request = objectValue(value);
+  if (Object.keys(request).length === 0) throw new ChildRequestValidationError("wire_object");
+  const unknown = Object.keys(request).find(
+    (field) => !CHILD_REQUEST_FIELDS.includes(field as (typeof CHILD_REQUEST_FIELDS)[number]),
+  );
+  if (unknown) throw new ChildRequestValidationError(`unknown_field:${unknown}`);
+
+  for (const field of CHILD_REQUEST_FIELDS.slice(0, 12)) {
+    if (typeof request[field] !== "string" || !request[field].trim()) {
+      throw new ChildRequestValidationError(`identity_missing:${field}`);
+    }
+  }
+  for (const field of ["parent_mission_revision_sha256", "delegated_input_sha256"] as const) {
+    if (!/^[0-9a-f]{64}$/.test(request[field] as string)) {
+      throw new ChildRequestValidationError(`identity_invalid:${field}`);
+    }
+  }
+  if (request.parent_session_id === request.child_session_id) {
+    throw new ChildRequestValidationError("identity_conflict:parent_equals_child");
+  }
+  if (request.callback_request_id !== request.child_transaction_id) {
+    throw new ChildRequestValidationError("callback_identity_conflict:callback_request_id");
+  }
+  if (request.effect_id !== `${request.child_runtime_id}.message`) {
+    throw new ChildRequestValidationError("effect_identity_conflict:effect_id");
+  }
+  if (!Number.isSafeInteger(request.created_at_ms) || (request.created_at_ms as number) <= 0) {
+    throw new ChildRequestValidationError("identity_invalid:created_at_ms");
+  }
+  if (!isObject(request.execution_payload)) {
+    throw new ChildRequestValidationError("payload_invalid:execution_payload");
+  }
+  return request as unknown as RegisterChildSessionRequest;
+}
+
+function isObject(value: unknown): value is JsonObject {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 export function sessionTitle(session: Session): string {

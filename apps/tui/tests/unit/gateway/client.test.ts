@@ -3,7 +3,7 @@ import http from "node:http";
 import test from "node:test";
 import { GatewayClient } from "../../../src/gateway/client.js";
 import { GatewayHttpError } from "../../../src/gateway/errors.js";
-import type { Message, Session } from "../../../src/types/session.js";
+import type { Message, RegisterChildSessionRequest, Session } from "../../../src/types/session.js";
 
 test("GatewayClient sends workspace directory through query and header", async () => {
   const seen: Array<{ url?: string; directoryHeader?: string; body?: unknown }> = [];
@@ -105,6 +105,38 @@ test("GatewayClient deletes and forks sessions through session endpoints", async
   assert.equal(seen[1].method, "POST");
   assert.equal(seen[1].url, "/session/sess-1/fork");
   assert.deepEqual(seen[1].body, { directory: "C:/repo", copy_context: true });
+});
+
+test("GatewayClient registers a child on the encoded parent path with the exact wire object", async () => {
+  const seen: Array<{ method?: string; url?: string; body?: unknown }> = [];
+  const request = childRequest();
+  await withServer(
+    async (req, res) => {
+      seen.push({ method: req.method, url: req.url, body: await readBody(req) });
+      sendJson(res, {
+        outcome: "admitted",
+        parent_session_id: request.parent_session_id,
+        child_session_id: request.child_session_id,
+        child_runtime_id: request.child_runtime_id,
+        child_transaction_id: request.child_transaction_id,
+        callback_request_id: request.callback_request_id,
+        effect_id: request.effect_id,
+      });
+    },
+    async (baseUrl) => {
+      const client = new GatewayClient({ baseUrl, directory: "C:/repo" });
+      const response = await client.registerChildSession(request.parent_session_id, request);
+      assert.equal(response.outcome, "admitted");
+    },
+  );
+
+  assert.deepEqual(seen, [
+    {
+      method: "POST",
+      url: "/session/parent%2Fsession/children",
+      body: request,
+    },
+  ]);
 });
 
 test("GatewayClient fork/delete flow observes gateway session state", async () => {
@@ -358,5 +390,24 @@ function message(sessionID: string, id: string, role: Message["role"], text: str
     created_at: 1,
     updated_at: 1,
     time: { created: 1, updated: 1 },
+  };
+}
+
+function childRequest(): RegisterChildSessionRequest {
+  return {
+    parent_session_id: "parent/session",
+    parent_mission_revision_sha256: "a".repeat(64),
+    commander_thread_id: "thread-1",
+    child_session_id: "child-1",
+    child_runtime_id: "runtime-1",
+    child_transaction_id: "transaction-1",
+    child_lease_id: "lease-1",
+    callback_request_id: "transaction-1",
+    effect_id: "runtime-1.message",
+    delegated_input_sha256: "b".repeat(64),
+    session_directory: "C:/repo",
+    session_name: "Delegated child",
+    created_at_ms: 1,
+    execution_payload: { prompt: "delegated work" },
   };
 }
