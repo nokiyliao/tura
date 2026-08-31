@@ -23,7 +23,7 @@ use router_contract::{
 };
 use runtime_contract::{
     CommanderContinuationBinding, CommanderConvergenceProof, LifecycleExecutionContext,
-    RunAgentRequest,
+    RunAgentRequest, TaskContextCapsule,
 };
 use session_lifecycle::{
     AckOutcome, CallbackEffectIdentity, ChildAdmissionOutcome, ChildAdmissionRecord,
@@ -138,6 +138,7 @@ impl ExecutionService {
     ) -> Result<Value> {
         let request: RegisterChildSessionRequest = serde_json::from_value(input)?;
         request.validate().map_err(anyhow::Error::msg)?;
+        let payload = validated_child_execution_payload(&request)?;
         state.session_db.start()?;
 
         let replay_store = lifecycle_store(&request.parent_session_id)?;
@@ -186,7 +187,6 @@ impl ExecutionService {
         }
 
         if !child_runtime_is_registered(&request)? {
-            let payload = child_execution_payload(&request)?;
             let response = self
                 .enqueue_turn_request_with_identity(
                     state,
@@ -724,8 +724,7 @@ impl ExecutionService {
         }
 
         state.session_db.start()?;
-        let convergence_recovery = if request.reason
-            == RecoveryCloseRuntimeReason::OrphanedRuntime
+        let convergence_recovery = if request.reason == RecoveryCloseRuntimeReason::OrphanedRuntime
         {
             let matching = lifecycle_store_if_exists(&request.session_id)?
                 .map(|store| store.callback_continuations_for_replay())
@@ -778,8 +777,7 @@ impl ExecutionService {
             } else {
                 request.reason
             },
-            convergence_proof_sha256: convergence_recovery
-                .map(|evidence| evidence.proof_sha256),
+            convergence_proof_sha256: convergence_recovery.map(|evidence| evidence.proof_sha256),
             quiescence: proof,
         };
         match session_log_contract::client::call_service(&SessionLogCommand::RecoveryCloseRuntime(
@@ -2261,15 +2259,18 @@ fn commander_convergence_fallback_request(
     let runtime_id = format!("callback-continuation-recovery-runtime-{recovery_digest}");
     let lease_id = format!("callback-continuation-recovery-lease-{recovery_digest}");
     let mut payload = callback_continuation_payload(record, &snapshot.metadata, Some(&binding))?;
-    payload.as_object_mut().ok_or_else(|| {
-        anyhow!(
-            "CALLBACK_CONTINUATION_PAYLOAD_NOT_OBJECT:{}",
-            record.request_id
-        )
-    })?.insert(
-        "fallback_from_id".to_string(),
-        Value::String(attempt.runtime_id.clone()),
-    );
+    payload
+        .as_object_mut()
+        .ok_or_else(|| {
+            anyhow!(
+                "CALLBACK_CONTINUATION_PAYLOAD_NOT_OBJECT:{}",
+                record.request_id
+            )
+        })?
+        .insert(
+            "fallback_from_id".to_string(),
+            Value::String(attempt.runtime_id.clone()),
+        );
     let input = json!({
         "runtime_id": runtime_id,
         "session_id": record.commander_session_id,
@@ -3177,7 +3178,12 @@ fn acknowledge_child_callback_from_store(
 ) -> Result<Value> {
     let admission = store
         .child_admission(&request.child_session_id)?
-        .ok_or_else(|| anyhow!("CHILD_CALLBACK_ACK_ADMISSION_NOT_FOUND:{}", request.child_session_id))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "CHILD_CALLBACK_ACK_ADMISSION_NOT_FOUND:{}",
+                request.child_session_id
+            )
+        })?;
     if admission.parent_session_id != request.parent_session_id
         || admission.parent_mission_revision_sha256 != request.parent_mission_revision_sha256
         || admission.commander_thread_id.as_deref() != Some(request.commander_thread_id.as_str())
@@ -3205,11 +3211,13 @@ fn acknowledge_child_callback_from_store(
 
     let callback = store
         .intaken_callback(&request.transaction_id, &request.event_id)?
-        .ok_or_else(|| anyhow!(
-            "CHILD_CALLBACK_ACK_INTAKEN_CALLBACK_NOT_FOUND:{}:{}",
-            request.transaction_id,
-            request.event_id
-        ))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "CHILD_CALLBACK_ACK_INTAKEN_CALLBACK_NOT_FOUND:{}:{}",
+                request.transaction_id,
+                request.event_id
+            )
+        })?;
     if callback.commander_session_id != request.parent_session_id
         || callback.parent_mission_revision_sha256 != request.parent_mission_revision_sha256
         || callback.commander_thread_id.as_deref() != Some(request.commander_thread_id.as_str())
@@ -3258,7 +3266,9 @@ fn callback_effect_identity(
 ) -> CallbackEffectIdentity {
     match identity {
         AcknowledgeChildCallbackEffectIdentity::Exact { effect_id } => {
-            CallbackEffectIdentity::Exact { effect_id: effect_id.clone() }
+            CallbackEffectIdentity::Exact {
+                effect_id: effect_id.clone(),
+            }
         }
         AcknowledgeChildCallbackEffectIdentity::ProvenZeroEffect {
             classification,
@@ -3353,6 +3363,34 @@ fn child_execution_payload(request: &RegisterChildSessionRequest) -> Result<Valu
             "operator_override": false,
         }),
     );
+    Ok(payload)
+}
+
+fn validated_child_execution_payload(request: &RegisterChildSessionRequest) -> Result<Value> {
+    let payload = child_execution_payload(request)?;
+    let enqueue = EnqueueTurnRequest {
+        runtime_id: request.child_runtime_id.clone(),
+        session_id: request.child_session_id.clone(),
+        payload: payload.clone(),
+    };
+    let mut run_request = payload_to_run_agent_request(&enqueue, &request.child_lease_id, None)?;
+    run_request
+        .validate_delegated_identity()
+        .map_err(anyhow::Error::msg)?;
+    validate_delegated_input_digest(&mut run_request, true)?;
+
+    if run_request.runtime_context.is_some() && run_request.task_context_capsule.is_some() {
+        return Err(anyhow!(
+            "TASK_CONTEXT_CAPSULE_CONFLICT: runtime_context and task_context_capsule are mutually exclusive"
+        ));
+    }
+    if let Some(value) = run_request.task_context_capsule.as_ref() {
+        let capsule = TaskContextCapsule::from_value(value.clone()).map_err(anyhow::Error::msg)?;
+        capsule
+            .bind_jspace(run_request.jspace_contract.as_ref())
+            .map_err(anyhow::Error::msg)?;
+    }
+
     Ok(payload)
 }
 
@@ -3558,7 +3596,11 @@ fn validate_continuation_fallback_source(session_id: &str, fallback_from_id: &st
             session: Some(session),
         } if session.lifecycle_projection.state == SessionState::Failed
             && session.lifecycle_projection.active_runtime_id.is_none()
-            && session.lifecycle_projection.runtime_ids.last().map(String::as_str)
+            && session
+                .lifecycle_projection
+                .runtime_ids
+                .last()
+                .map(String::as_str)
                 == Some(fallback_from_id) =>
         {
             Ok(())
@@ -3735,22 +3777,21 @@ mod tests {
     use super::{
         EnqueueTurnRequest, ExecutionService, RetryRuntimeIdentity,
         RouterRecoveryCloseRuntimeRequest, RuntimeLease, TerminalDeliveryIdentity,
-        acknowledge_child_callback_from_store,
-        callback_continuation_payload, commander_continuation_binding,
-        commander_convergence_proof_from_runtime,
-        complete_and_ack_callback_continuation,
-        failed_session_retry_root, failed_session_runtime_fallback, intake_terminal_receipt,
-        is_historical_terminal_runtime, payload_to_run_agent_request,
+        acknowledge_child_callback_from_store, callback_continuation_payload,
+        commander_continuation_binding, commander_convergence_proof_from_runtime,
+        complete_and_ack_callback_continuation, failed_session_retry_root,
+        failed_session_runtime_fallback, intake_terminal_receipt, is_historical_terminal_runtime,
+        lifecycle_store, payload_to_run_agent_request,
         pre_provider_commander_active_writer_evidence,
         pre_provider_commander_binding_recovery_evidence,
-        pre_provider_commander_ledger_chain_evidence,
-        pre_provider_zero_effect_failure_evidence,
-        lifecycle_store, publish_terminal_failure_callback_from_store, read_session_snapshot,
+        pre_provider_commander_ledger_chain_evidence, pre_provider_zero_effect_failure_evidence,
+        publish_terminal_failure_callback_from_store, read_session_snapshot,
         register_and_activate_runtime, replay_terminal_callbacks_from_store,
         require_successful_runtime_dispatch, runtime_lease_from_snapshot,
-        runtime_terminal_state_from_snapshot, terminal_runtime_is_current,
-        validate_child_runtime_identity, validate_delegated_input_digest,
-        terminal_commander_convergence_recovery_evidence, validate_terminalization_identity,
+        runtime_terminal_state_from_snapshot, terminal_commander_convergence_recovery_evidence,
+        terminal_runtime_is_current, validate_child_runtime_identity,
+        validate_delegated_input_digest, validate_terminalization_identity,
+        validated_child_execution_payload,
     };
     use crate::{build_state, services::manager::ServiceManager};
     use chrono::Utc;
@@ -3758,17 +3799,17 @@ mod tests {
         ProviderConfig, RuntimeAggregate, RuntimeError, RuntimeProviderConfig, RuntimeState,
         SessionProjection, SessionState, TaskPlan, ToolChoice,
     };
-    use runtime_contract::{CommanderConvergenceProof, RunAgentRequest};
     use router_contract::{
         AcknowledgeChildCallbackEffectIdentity, AcknowledgeChildCallbackOutcome,
         AcknowledgeChildCallbackRequest, AcknowledgeChildCallbackResponse,
+        RegisterChildSessionRequest,
     };
+    use runtime_contract::{CommanderConvergenceProof, RunAgentRequest};
     use serde_json::json;
     use session_lifecycle::{
         CallbackEffectIdentity, ChildAdmissionRecord, ContinuationDispatchRecord,
-        ContinuationDispatchState,
-        DurableCallbackRecord, LifecycleConfig, SessionLifecycleStore, TerminalReceipt,
-        TerminalReceiptIdentity, TerminalState, commander_store_path,
+        ContinuationDispatchState, DurableCallbackRecord, LifecycleConfig, SessionLifecycleStore,
+        TerminalReceipt, TerminalReceiptIdentity, TerminalState, commander_store_path,
     };
     use session_log_contract::{
         RuntimeLeaseSnapshot, RuntimeLifecycleIdentity, SessionFeedEntry, SessionFeedEvent,
@@ -5229,12 +5270,20 @@ mod tests {
     ) -> (SessionLifecycleStore, AcknowledgeChildCallbackRequest) {
         let (store, _) = durable_callback_fixture(root, TerminalState::Completed);
         let admission = ChildAdmissionRecord::new(
-            "commander-callback", "a".repeat(64), Some("commander-thread-1".to_string()),
-            "child-callback", "runtime-callback", "transaction-callback", "lease-callback",
-            "transaction-callback", "runtime-callback.message",
+            "commander-callback",
+            "a".repeat(64),
+            Some("commander-thread-1".to_string()),
+            "child-callback",
+            "runtime-callback",
+            "transaction-callback",
+            "lease-callback",
+            "transaction-callback",
+            "runtime-callback.message",
             session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
             session_lifecycle::canonical_value_sha256(&json!({"prompt": "delegated prompt"})),
-            "/tmp/child-callback", "delegated child callback", 1_786_845_600_000,
+            "/tmp/child-callback",
+            "delegated child callback",
+            1_786_845_600_000,
         );
         store.admit_child(&admission).expect("child admission");
         let receipt = store
@@ -5264,16 +5313,20 @@ mod tests {
             CallbackEffectIdentity::Exact { effect_id } => {
                 AcknowledgeChildCallbackEffectIdentity::Exact { effect_id }
             }
-            CallbackEffectIdentity::ProvenZeroEffect { classification, evidence_sha256 } => {
-                AcknowledgeChildCallbackEffectIdentity::ProvenZeroEffect {
-                    classification, evidence_sha256,
-                }
-            }
-            CallbackEffectIdentity::UnsettledEffect { classification, evidence_sha256 } => {
-                AcknowledgeChildCallbackEffectIdentity::UnsettledEffect {
-                    classification, evidence_sha256,
-                }
-            }
+            CallbackEffectIdentity::ProvenZeroEffect {
+                classification,
+                evidence_sha256,
+            } => AcknowledgeChildCallbackEffectIdentity::ProvenZeroEffect {
+                classification,
+                evidence_sha256,
+            },
+            CallbackEffectIdentity::UnsettledEffect {
+                classification,
+                evidence_sha256,
+            } => AcknowledgeChildCallbackEffectIdentity::UnsettledEffect {
+                classification,
+                evidence_sha256,
+            },
         };
         let request = AcknowledgeChildCallbackRequest {
             parent_session_id: "commander-callback".to_string(),
@@ -5295,20 +5348,35 @@ mod tests {
         let root = tempfile::tempdir().expect("callback ACK root");
         let (store, request) = callback_ack_fixture(
             root.path(),
-            CallbackEffectIdentity::Exact { effect_id: "runtime-callback.message".to_string() },
+            CallbackEffectIdentity::Exact {
+                effect_id: "runtime-callback.message".to_string(),
+            },
             true,
         );
         let first: AcknowledgeChildCallbackResponse = serde_json::from_value(
             acknowledge_child_callback_from_store(&store, request.clone()).expect("first ACK"),
-        ).expect("first ACK response");
+        )
+        .expect("first ACK response");
         let replay: AcknowledgeChildCallbackResponse = serde_json::from_value(
             acknowledge_child_callback_from_store(&store, request).expect("ACK replay"),
-        ).expect("ACK replay response");
+        )
+        .expect("ACK replay response");
         assert_eq!(first.outcome, AcknowledgeChildCallbackOutcome::Acknowledged);
-        assert_eq!(replay.outcome, AcknowledgeChildCallbackOutcome::AlreadyAcknowledged);
-        assert_eq!(store.readback().expect("readback").acknowledged_callbacks, 1);
+        assert_eq!(
+            replay.outcome,
+            AcknowledgeChildCallbackOutcome::AlreadyAcknowledged
+        );
+        assert_eq!(
+            store.readback().expect("readback").acknowledged_callbacks,
+            1
+        );
         assert!(store.callbacks_for_replay().expect("callbacks").is_empty());
-        assert!(store.callback_continuations_for_replay().expect("continuations").is_empty());
+        assert!(
+            store
+                .callback_continuations_for_replay()
+                .expect("continuations")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5316,24 +5384,51 @@ mod tests {
         let root = tempfile::tempdir().expect("callback ACK root");
         let (store, request) = callback_ack_fixture(
             root.path(),
-            CallbackEffectIdentity::Exact { effect_id: "runtime-callback.message".to_string() },
+            CallbackEffectIdentity::Exact {
+                effect_id: "runtime-callback.message".to_string(),
+            },
             true,
         );
         let mut variants = Vec::new();
-        let mut changed = request.clone(); changed.parent_session_id = "other-parent".into(); variants.push(changed);
-        let mut changed = request.clone(); changed.child_session_id = "other-child".into(); variants.push(changed);
-        let mut changed = request.clone(); changed.child_runtime_id = "other-runtime".into(); variants.push(changed);
-        let mut changed = request.clone(); changed.child_lease_id = "other-lease".into(); variants.push(changed);
-        let mut changed = request.clone(); changed.commander_thread_id = "other-thread".into(); variants.push(changed);
-        let mut changed = request.clone(); changed.parent_mission_revision_sha256 = "b".repeat(64); variants.push(changed);
-        let mut changed = request.clone(); changed.transaction_id = "other-transaction".into(); variants.push(changed);
-        let mut changed = request.clone(); changed.event_id = "other-event".into(); variants.push(changed);
-        let mut changed = request.clone(); changed.callback_payload_sha256 = "c".repeat(64); variants.push(changed);
-        let mut changed = request; changed.effect_identity = AcknowledgeChildCallbackEffectIdentity::Exact { effect_id: "other-effect".into() }; variants.push(changed);
+        let mut changed = request.clone();
+        changed.parent_session_id = "other-parent".into();
+        variants.push(changed);
+        let mut changed = request.clone();
+        changed.child_session_id = "other-child".into();
+        variants.push(changed);
+        let mut changed = request.clone();
+        changed.child_runtime_id = "other-runtime".into();
+        variants.push(changed);
+        let mut changed = request.clone();
+        changed.child_lease_id = "other-lease".into();
+        variants.push(changed);
+        let mut changed = request.clone();
+        changed.commander_thread_id = "other-thread".into();
+        variants.push(changed);
+        let mut changed = request.clone();
+        changed.parent_mission_revision_sha256 = "b".repeat(64);
+        variants.push(changed);
+        let mut changed = request.clone();
+        changed.transaction_id = "other-transaction".into();
+        variants.push(changed);
+        let mut changed = request.clone();
+        changed.event_id = "other-event".into();
+        variants.push(changed);
+        let mut changed = request.clone();
+        changed.callback_payload_sha256 = "c".repeat(64);
+        variants.push(changed);
+        let mut changed = request;
+        changed.effect_identity = AcknowledgeChildCallbackEffectIdentity::Exact {
+            effect_id: "other-effect".into(),
+        };
+        variants.push(changed);
         for changed in variants {
             assert!(acknowledge_child_callback_from_store(&store, changed).is_err());
         }
-        assert_eq!(store.readback().expect("readback").acknowledged_callbacks, 0);
+        assert_eq!(
+            store.readback().expect("readback").acknowledged_callbacks,
+            0
+        );
     }
 
     #[test]
@@ -5341,12 +5436,17 @@ mod tests {
         let pending_root = tempfile::tempdir().expect("pending callback root");
         let (pending_store, pending_request) = callback_ack_fixture(
             pending_root.path(),
-            CallbackEffectIdentity::Exact { effect_id: "runtime-callback.message".to_string() },
+            CallbackEffectIdentity::Exact {
+                effect_id: "runtime-callback.message".to_string(),
+            },
             false,
         );
-        assert!(acknowledge_child_callback_from_store(&pending_store, pending_request)
-            .expect_err("pending callback")
-            .to_string().contains("INTAKEN_CALLBACK_NOT_FOUND"));
+        assert!(
+            acknowledge_child_callback_from_store(&pending_store, pending_request)
+                .expect_err("pending callback")
+                .to_string()
+                .contains("INTAKEN_CALLBACK_NOT_FOUND")
+        );
 
         let unsettled_root = tempfile::tempdir().expect("unsettled callback root");
         let (unsettled_store, unsettled_request) = callback_ack_fixture(
@@ -5357,10 +5457,19 @@ mod tests {
             },
             true,
         );
-        assert!(acknowledge_child_callback_from_store(&unsettled_store, unsettled_request)
-            .expect_err("unsettled effect")
-            .to_string().contains("CALLBACK_UNSETTLED_EFFECT_ACK_BLOCKED"));
-        assert_eq!(unsettled_store.readback().expect("readback").acknowledged_callbacks, 0);
+        assert!(
+            acknowledge_child_callback_from_store(&unsettled_store, unsettled_request)
+                .expect_err("unsettled effect")
+                .to_string()
+                .contains("CALLBACK_UNSETTLED_EFFECT_ACK_BLOCKED")
+        );
+        assert_eq!(
+            unsettled_store
+                .readback()
+                .expect("readback")
+                .acknowledged_callbacks,
+            0
+        );
     }
 
     #[test]
@@ -5377,9 +5486,18 @@ mod tests {
         acknowledge_child_callback_from_store(&store, request.clone()).expect("zero ACK");
         let replay: AcknowledgeChildCallbackResponse = serde_json::from_value(
             acknowledge_child_callback_from_store(&store, request).expect("zero ACK replay"),
-        ).expect("zero replay response");
-        assert_eq!(replay.outcome, AcknowledgeChildCallbackOutcome::AlreadyAcknowledged);
-        assert!(store.callback_continuations_for_replay().expect("continuations").is_empty());
+        )
+        .expect("zero replay response");
+        assert_eq!(
+            replay.outcome,
+            AcknowledgeChildCallbackOutcome::AlreadyAcknowledged
+        );
+        assert!(
+            store
+                .callback_continuations_for_replay()
+                .expect("continuations")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5925,7 +6043,9 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let root = tempfile::tempdir().expect("isolated recovery root");
         let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().and_then(std::path::Path::parent).expect("project root");
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("project root");
         let state = build_state();
         let _env = RecoveryTestEnvGuard::install(state.session_db.clone(), root.path(), project);
         state.session_db.start().expect("isolated session db");
@@ -5935,56 +6055,121 @@ mod tests {
         let created = session_log_contract::client::call_service(
             &session_log_contract::SessionLogCommand::CreateSession(Box::new(
                 session_log_contract::CreateSessionRequest {
-                    command_id: "create-callsite".into(), session_id: session_id.into(),
-                    creation_command: lifecycle::SessionCommand::CreateSession { task_plan: lifecycle::TaskPlan::default() },
-                    copy_context: false, workspace: directory.display().to_string(),
-                    session_directory: directory.display().to_string(), name: "callsite".into(),
-                    created_at: 1, model: None, agent: None, session_type: "coding".into(),
-                    kill_processes_on_start: false, validator_enabled: false, force_planning: false,
-                    model_variant: None, model_acceleration_enabled: false,
-                    disable_permission_restrictions: true, use_last_tool_call_response: false,
-                    auto_session_name: false, initial_task_plan_patch: None,
+                    command_id: "create-callsite".into(),
+                    session_id: session_id.into(),
+                    creation_command: lifecycle::SessionCommand::CreateSession {
+                        task_plan: lifecycle::TaskPlan::default(),
+                    },
+                    copy_context: false,
+                    workspace: directory.display().to_string(),
+                    session_directory: directory.display().to_string(),
+                    name: "callsite".into(),
+                    created_at: 1,
+                    model: None,
+                    agent: None,
+                    session_type: "coding".into(),
+                    kill_processes_on_start: false,
+                    validator_enabled: false,
+                    force_planning: false,
+                    model_variant: None,
+                    model_acceleration_enabled: false,
+                    disable_permission_restrictions: true,
+                    use_last_tool_call_response: false,
+                    auto_session_name: false,
+                    initial_task_plan_patch: None,
                 },
             )),
-        ).expect("create session");
-        assert!(matches!(created, session_log_contract::SessionLogResponse::SessionCommandApplied { .. }));
+        )
+        .expect("create session");
+        assert!(matches!(
+            created,
+            session_log_contract::SessionLogResponse::SessionCommandApplied { .. }
+        ));
 
         let receipt = callback_receipt(TerminalState::Completed);
         let mut callback = DurableCallbackRecord::new(
-            &receipt, json!("child result"), json!({"kind": "gateway.callback"}),
-            "a".repeat(64), session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
-            CallbackEffectIdentity::Exact { effect_id: "message-1".into() },
-        ).expect("callback");
+            &receipt,
+            json!("child result"),
+            json!({"kind": "gateway.callback"}),
+            "a".repeat(64),
+            session_lifecycle::canonical_value_sha256(&json!("delegated prompt")),
+            CallbackEffectIdentity::Exact {
+                effect_id: "message-1".into(),
+            },
+        )
+        .expect("callback");
         callback.commander_thread_id = Some("commander-thread-1".into());
-        let mut continuation = ContinuationDispatchRecord::from_callback(&callback).expect("continuation");
+        let mut continuation =
+            ContinuationDispatchRecord::from_callback(&callback).expect("continuation");
         continuation.state = ContinuationDispatchState::Dispatched;
         let runtime_id = continuation.runtime_id.clone();
         let lease_id = continuation.lease_id.clone();
         let store = lifecycle_store(session_id).expect("lifecycle store");
         store.write_terminal_receipt(&receipt).expect("receipt");
-        store.intake(&receipt.transaction_id, &receipt.event_id).expect("receipt intake");
+        store
+            .intake(&receipt.transaction_id, &receipt.event_id)
+            .expect("receipt intake");
         store.publish_callback(&callback).expect("callback publish");
-        store.mark_callback_intaken(&callback.transaction_id, &callback.event_id, &callback.callback_payload_sha256).expect("callback intake");
-        store.prepare_callback_continuation(&continuation).expect("prepare continuation");
-        store.mark_callback_continuation_dispatched(&continuation).expect("dispatch continuation");
-        register_and_activate_runtime(session_id, &runtime_id, &lease_id, None, Some(RuntimeLifecycleIdentity {
-            commander_session_id: session_id.into(), transaction_id: continuation.request_id.clone(),
-            parent_mission_revision_sha256: Some(continuation.parent_mission_revision_sha256.clone()),
-            delegated_input_sha256: Some(continuation.delegated_input_sha256.clone()), task_id: None,
-            goal_id: None, operator_override: false, dispatch_runtime_id: runtime_id.clone(),
-            dispatch_lease_id: lease_id.clone(), receipt_event_seq: 0,
-        })).expect("register runtime");
-        let snapshot = match session_log_contract::client::call_service(
-            &session_log_contract::SessionLogCommand::GetRuntimeLease(session_log_contract::GetRuntimeLeaseRequest {
-                runtime_id: runtime_id.clone(), database_path: None,
+        store
+            .mark_callback_intaken(
+                &callback.transaction_id,
+                &callback.event_id,
+                &callback.callback_payload_sha256,
+            )
+            .expect("callback intake");
+        store
+            .prepare_callback_continuation(&continuation)
+            .expect("prepare continuation");
+        store
+            .mark_callback_continuation_dispatched(&continuation)
+            .expect("dispatch continuation");
+        register_and_activate_runtime(
+            session_id,
+            &runtime_id,
+            &lease_id,
+            None,
+            Some(RuntimeLifecycleIdentity {
+                commander_session_id: session_id.into(),
+                transaction_id: continuation.request_id.clone(),
+                parent_mission_revision_sha256: Some(
+                    continuation.parent_mission_revision_sha256.clone(),
+                ),
+                delegated_input_sha256: Some(continuation.delegated_input_sha256.clone()),
+                task_id: None,
+                goal_id: None,
+                operator_override: false,
+                dispatch_runtime_id: runtime_id.clone(),
+                dispatch_lease_id: lease_id.clone(),
+                receipt_event_seq: 0,
             }),
-        ).expect("lease") {
-            session_log_contract::SessionLogResponse::RuntimeLeaseRead { runtime: Some(runtime) } => runtime,
+        )
+        .expect("register runtime");
+        let snapshot = match session_log_contract::client::call_service(
+            &session_log_contract::SessionLogCommand::GetRuntimeLease(
+                session_log_contract::GetRuntimeLeaseRequest {
+                    runtime_id: runtime_id.clone(),
+                    database_path: None,
+                },
+            ),
+        )
+        .expect("lease")
+        {
+            session_log_contract::SessionLogResponse::RuntimeLeaseRead {
+                runtime: Some(runtime),
+            } => runtime,
             other => panic!("unexpected lease {other:?}"),
         };
-        let before_runtime = serde_json::to_value(session_log_contract::client::call_service(
-            &session_log_contract::SessionLogCommand::ReplayRuntime(session_log_contract::ReplayRuntimeRequest { runtime_id: runtime_id.clone() }),
-        ).expect("runtime before")).expect("serialize runtime");
+        let before_runtime = serde_json::to_value(
+            session_log_contract::client::call_service(
+                &session_log_contract::SessionLogCommand::ReplayRuntime(
+                    session_log_contract::ReplayRuntimeRequest {
+                        runtime_id: runtime_id.clone(),
+                    },
+                ),
+            )
+            .expect("runtime before"),
+        )
+        .expect("serialize runtime");
         let before_session = read_session_snapshot(session_id).expect("session before");
         let lifecycle_before = store.readback().expect("lifecycle before");
         let ledgers = directory.join(".tura/run/effect_ledgers");
@@ -5998,12 +6183,24 @@ mod tests {
             "expected_session_event_seq": snapshot.session_event_seq,
             "expected_session_state": snapshot.session_state, "reason": "orphaned_runtime"
         })).await.expect_err("malformed evidence must fail closed");
-        assert!(error.to_string().contains("invalid execution ledger"), "{error}");
-        let after_runtime = serde_json::to_value(session_log_contract::client::call_service(
-            &session_log_contract::SessionLogCommand::ReplayRuntime(session_log_contract::ReplayRuntimeRequest { runtime_id }),
-        ).expect("runtime after")).expect("serialize runtime");
+        assert!(
+            error.to_string().contains("invalid execution ledger"),
+            "{error}"
+        );
+        let after_runtime = serde_json::to_value(
+            session_log_contract::client::call_service(
+                &session_log_contract::SessionLogCommand::ReplayRuntime(
+                    session_log_contract::ReplayRuntimeRequest { runtime_id },
+                ),
+            )
+            .expect("runtime after"),
+        )
+        .expect("serialize runtime");
         assert_eq!(before_runtime, after_runtime);
-        assert_eq!(before_session, read_session_snapshot(session_id).expect("session after"));
+        assert_eq!(
+            before_session,
+            read_session_snapshot(session_id).expect("session after")
+        );
         assert_eq!(lifecycle_before, store.readback().expect("lifecycle after"));
     }
 
@@ -6370,6 +6567,75 @@ mod tests {
             request.delegated_input_sha256,
             request.effective_prompt_sha256()
         );
+    }
+
+    fn child_pre_admission_request() -> RegisterChildSessionRequest {
+        let prompt = "exact delegated prompt";
+        RegisterChildSessionRequest {
+            parent_session_id: "commander-pre-admission".to_string(),
+            parent_mission_revision_sha256: "a".repeat(64),
+            commander_thread_id: Some("thread-pre-admission".to_string()),
+            child_session_id: "child-pre-admission".to_string(),
+            child_runtime_id: "runtime-pre-admission".to_string(),
+            child_transaction_id: "transaction-pre-admission".to_string(),
+            child_lease_id: "lease-pre-admission".to_string(),
+            callback_request_id: "transaction-pre-admission".to_string(),
+            effect_id: "runtime-pre-admission.message".to_string(),
+            delegated_input_sha256: session_lifecycle::canonical_value_sha256(&json!(prompt)),
+            session_directory: "/tmp/child-pre-admission".to_string(),
+            session_name: "child pre-admission".to_string(),
+            created_at_ms: 1,
+            execution_payload: json!({"prompt": prompt}),
+        }
+    }
+
+    #[test]
+    fn child_execution_contract_is_validated_before_durable_admission() {
+        let valid = child_pre_admission_request();
+        let payload = validated_child_execution_payload(&valid).expect("valid exact request");
+        assert_eq!(payload["parent_session_id"], valid.parent_session_id);
+        assert_eq!(
+            payload["delegated_input_sha256"],
+            valid.delegated_input_sha256
+        );
+
+        let mut malformed = Vec::new();
+
+        let mut invalid_execution = valid.clone();
+        invalid_execution.execution_payload = json!({"worker_env": "invalid"});
+        malformed.push(invalid_execution);
+
+        let mut invalid_digest = valid.clone();
+        invalid_digest.delegated_input_sha256 = "b".repeat(64);
+        malformed.push(invalid_digest);
+
+        let mut invalid_capsule = valid.clone();
+        invalid_capsule.execution_payload = json!({
+            "prompt": "exact delegated prompt",
+            "task_context_capsule": {"schema_version": "invalid"},
+            "jspace_contract": {"semantic_sha256": "c".repeat(64)}
+        });
+        malformed.push(invalid_capsule);
+
+        let mut missing_jspace = valid.clone();
+        missing_jspace.execution_payload = json!({
+            "prompt": "exact delegated prompt",
+            "task_context_capsule": {"schema_version": "invalid"}
+        });
+        malformed.push(missing_jspace);
+
+        let mut conflicting_context = valid.clone();
+        conflicting_context.execution_payload = json!({
+            "prompt": "exact delegated prompt",
+            "runtime_context": "raw",
+            "task_context_capsule": {"schema_version": "invalid"}
+        });
+        malformed.push(conflicting_context);
+
+        for request in malformed {
+            validated_child_execution_payload(&request)
+                .expect_err("malformed request must fail before durable admission");
+        }
     }
 
     #[test]
