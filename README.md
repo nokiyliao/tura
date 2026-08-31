@@ -12,6 +12,13 @@
 
 <p align="center"><strong>English</strong> | <a href="README.zh-CN.md">简体中文</a></p>
 
+> **Modified collaboration-runtime branch.** This branch contains substantial
+> AGPL-3.0-or-later modifications maintained by
+> [@nokiyliao](https://github.com/nokiyliao). The upstream source, exact base,
+> modification lineage, validation boundaries, and corresponding-source notice
+> are documented in [MODIFICATIONS.md](MODIFICATIONS.md) and
+> [SOURCE_OFFER.md](SOURCE_OFFER.md).
+
 <h1 align="center">Tura: 16.7% better performance, 77.5% fewer tokens. </h1>
 
 Tura is an open-source agent runtime harness that delivers better results with fewer tokens.
